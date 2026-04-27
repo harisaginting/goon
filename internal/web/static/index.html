@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>goon — autonomous engineer</title>
+<script src="/htmx.min.js"></script>
+<style>
+:root {
+  --bg: #0e1116; --fg: #d8dee4; --muted: #888; --accent: #6cf;
+  --card: #161b22; --border: #2a313a;
+  --running: #5cdb85; --stopped: #ff6868;
+  --done: #5cdb85; --failed: #ff6868; --running-state: #ffaa44; --planning: #6cf;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 0;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: var(--bg); color: var(--fg);
+}
+header {
+  background: var(--card); border-bottom: 1px solid var(--border);
+  padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
+}
+h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
+h1 .robot { color: var(--accent); }
+.subtitle { color: var(--muted); font-size: 13px; }
+main { padding: 20px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+section.card {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 14px 16px; min-height: 80px;
+}
+section.card h2 { margin: 0 0 10px 0; font-size: 13px; font-weight: 600; letter-spacing: 0.6px; color: var(--accent); text-transform: uppercase; }
+.kv { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); }
+.kv:last-child { border-bottom: 0; }
+.kv .k { color: var(--muted); }
+.kv .v { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+.kv .v.running { color: var(--running); }
+.kv .v.stopped { color: var(--stopped); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+table th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); padding: 6px 8px; }
+table td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; }
+table a { color: var(--accent); text-decoration: none; }
+table a:hover { text-decoration: underline; }
+.empty { color: var(--muted); font-style: italic; padding: 4px 0; }
+.ok { color: var(--running); }
+.qrow {
+  display: grid; gap: 6px 10px;
+  grid-template-columns: 1fr auto auto; grid-template-rows: auto auto;
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px;
+  background: rgba(255,255,255,0.02);
+}
+.qrow .q { grid-column: 1 / -1; font-weight: 500; }
+.qrow .ticket { color: var(--muted); font-size: 12px; grid-column: 1 / -1; }
+.qrow input[type=text] { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
+.qrow button {
+  background: var(--accent); color: var(--bg); border: 0; border-radius: 4px;
+  padding: 6px 14px; cursor: pointer; font-weight: 600;
+}
+.qrow button:hover { filter: brightness(1.15); }
+.state { padding: 2px 8px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+.state-done { background: rgba(92,219,133,0.18); color: var(--done); }
+.state-failed { background: rgba(255,104,104,0.18); color: var(--failed); }
+.state-executing, .state-testing, .state-verifying, .state-opening_pr, .state-notifying { background: rgba(255,170,68,0.18); color: var(--running-state); }
+.state-triaging, .state-planning { background: rgba(102,204,255,0.18); color: var(--planning); }
+.state-blocked { background: rgba(255,104,104,0.10); color: var(--failed); }
+footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="robot">🤖</span> goon</h1>
+  <span class="subtitle">autonomous AI engineer</span>
+</header>
+<main>
+  <section class="card">
+    <h2>Daemon status</h2>
+    <div hx-get="/fragments/status" hx-trigger="load, every 3s">loading…</div>
+  </section>
+  <section class="card">
+    <h2>Pending questions</h2>
+    <div hx-get="/fragments/questions" hx-trigger="load, every 5s, questionsChanged from:body">loading…</div>
+  </section>
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Workflows</h2>
+    <div hx-get="/fragments/workflows" hx-trigger="load, every 4s">loading…</div>
+  </section>
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Recent tickets</h2>
+    <div hx-get="/fragments/tickets" hx-trigger="load, every 6s">loading…</div>
+  </section>
+</main>
+<footer>goon · same memory as the CLI · all data lives at <code>~/.goon/memory.json</code></footer>
+</body>
+</html>
