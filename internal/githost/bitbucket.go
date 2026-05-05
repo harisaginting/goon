@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // Bitbucket opens pull requests against Bitbucket Cloud (REST API v2).
@@ -53,7 +55,7 @@ func NewBitbucketFromEnv() (*Bitbucket, error) {
 		Token:       tok,
 		Username:    user,
 		AppPassword: pw,
-		HTTP:        &http.Client{Timeout: 30 * time.Second},
+		HTTP:        logx.InstrumentClient("bitbucket", &http.Client{Timeout: 30 * time.Second}),
 	}, nil
 }
 

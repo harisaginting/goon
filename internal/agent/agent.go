@@ -19,10 +19,11 @@ import (
 	"strconv"
 	"strings"
 
-	"goon/internal/executor"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/llm"
+	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // MaxSteps is the hard upper bound on agent turns. Override with
@@ -92,14 +93,19 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 			})
 		}
 
+		logx.Debug("agent.prompt", "step", step, "provider", a.opts.LLM.Name(),
+			"messages", len(chat), "task", task)
 		raw, err := a.opts.LLM.Generate(ctx, chat, llm.Options{
 			Temperature: 0.1,
 			MaxTokens:   1024,
 			JSONMode:    true,
 		})
 		if err != nil {
+			logx.Error("agent.llm_error", "step", step, "err", err.Error())
 			return fmt.Errorf("llm: %w", err)
 		}
+		logx.Debug("agent.response", "step", step, "raw_bytes", len(raw),
+			"raw", logTruncate(raw, 4096))
 		if a.opts.Debug {
 			fmt.Fprintf(a.opts.Stderr, "[debug] step=%d raw=%s\n", step, raw)
 		}
@@ -137,6 +143,8 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 		if call.Rationale != "" && a.opts.Debug {
 			fmt.Fprintf(a.opts.Stderr, "  [rationale] %s\n", call.Rationale)
 		}
+		logx.Info("agent.tool_call", "step", step, "tool", call.Tool,
+			"args", call.Args, "rationale", call.Rationale)
 
 		// Finish short-circuits.
 		if call.Tool == "finish" {
@@ -228,3 +236,8 @@ func truncateForMem(s string, max int) string {
 	}
 	return s[:max] + "…"
 }
+
+// logTruncate is the version used in structured-log attributes; identical
+// to truncateForMem but expressed separately so the intent at call sites
+// is obvious ("this is for the log").
+func logTruncate(s string, max int) string { return truncateForMem(s, max) }

@@ -107,9 +107,10 @@ type DaemonStatus struct {
 
 // Memory is the persistent store on disk + a slice of recent in-memory items.
 type Memory struct {
-	mu    sync.Mutex
-	path  string
-	store storeFile
+	mu          sync.Mutex
+	path        string
+	store       storeFile
+	lockWarnOnce sync.Once
 }
 
 type storeFile struct {
@@ -491,6 +492,18 @@ func (m *Memory) flush() {
 	unlock, err := lockFile(m.path + ".lock")
 	if err == nil {
 		defer unlock()
+	} else {
+		// Lock acquisition failed (NFS, permission, locked-out FS, etc.).
+		// Warn ONCE per Memory instance so users on unsupported filesystems
+		// know they've lost multi-process safety. Then proceed — the
+		// single-process case still works correctly because m.mu serializes
+		// in-process writers.
+		m.lockWarnOnce.Do(func() {
+			fmt.Fprintf(os.Stderr,
+				"goon: warning: could not lock %s.lock: %v\n"+
+					"goon: concurrent writers from a second goon process may interleave writes.\n",
+				m.path, err)
+		})
 	}
 	// Re-read the file under the lock to pick up external mutations.
 	if data, err := os.ReadFile(m.path); err == nil {

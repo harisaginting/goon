@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 func TestDryRun_DoesNotExecute(t *testing.T) {

@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // GitHub is the GitHub.com / GitHub Enterprise PR creator.
@@ -33,7 +35,7 @@ func NewGitHubFromEnv() (*GitHub, error) {
 	return &GitHub{
 		Token:  tok,
 		APIURL: strings.TrimRight(api, "/"),
-		HTTP:   &http.Client{Timeout: 30 * time.Second},
+		HTTP:   logx.InstrumentClient("github-host", &http.Client{Timeout: 30 * time.Second}),
 	}, nil
 }
 

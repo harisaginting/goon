@@ -13,16 +13,20 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/atlassian"
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // Jira reads tickets from Atlassian Cloud's REST API v3.
 //
-// Configure via env:
+// Configure via env. Either set the per-product vars (JIRA_*) OR the shared
+// Atlassian vars (ATLASSIAN_*) — the per-product vars win when both are set.
 //
-//	JIRA_BASE_URL    e.g. https://acme.atlassian.net
-//	JIRA_EMAIL       e.g. you@acme.com
-//	JIRA_API_TOKEN   token from id.atlassian.com/manage-profile/security/api-tokens
-//	JIRA_JQL         JQL filter (default: "assignee=currentUser() AND statusCategory!=Done ORDER BY updated DESC")
+//	JIRA_BASE_URL or ATLASSIAN_BASE_URL    e.g. https://acme.atlassian.net
+//	JIRA_EMAIL    or ATLASSIAN_EMAIL       e.g. you@acme.com
+//	JIRA_API_TOKEN or ATLASSIAN_API_TOKEN  id.atlassian.com/manage-profile/security/api-tokens
+//	JIRA_JQL                                JQL filter (defaults to assigned + open)
 type Jira struct {
 	BaseURL  string
 	Email    string
@@ -33,30 +37,37 @@ type Jira struct {
 
 // NewJiraFromEnv reads config from env and returns a Jira board.
 func NewJiraFromEnv() (*Jira, error) {
-	base := strings.TrimRight(os.Getenv("JIRA_BASE_URL"), "/")
-	email := os.Getenv("JIRA_EMAIL")
-	tok := os.Getenv("JIRA_API_TOKEN")
+	c := atlassian.Jira()
 	jql := os.Getenv("JIRA_JQL")
 	if jql == "" {
 		jql = `assignee=currentUser() AND statusCategory!=Done ORDER BY updated DESC`
 	}
-	if base == "" || email == "" || tok == "" {
-		return nil, errors.New("jira: set JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN")
+	if !c.Filled() {
+		return nil, errors.New("jira: set JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN (or shared ATLASSIAN_BASE_URL/ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN)")
 	}
 	return &Jira{
-		BaseURL:  base,
-		Email:    email,
-		APIToken: tok,
+		BaseURL:  c.BaseURL,
+		Email:    c.Email,
+		APIToken: c.APIToken,
 		JQL:      jql,
-		HTTP:     &http.Client{Timeout: 20 * time.Second},
+		HTTP:     logx.InstrumentClient("jira", &http.Client{Timeout: 20 * time.Second}),
 	}, nil
 }
 
 // Name returns "jira".
 func (*Jira) Name() string { return "jira" }
 
+// jiraSearchResponse matches the shape of /rest/api/3/search/jql.
+//
+// The new endpoint replaced /rest/api/3/search (which Atlassian removed,
+// returns 410 GONE — see CHANGE-2046). Pagination is now cursor-based:
+// `nextPageToken` carries forward to fetch the next page; `isLast` tells you
+// when there are no more results. The legacy `total`/`startAt`/`maxResults`
+// fields are gone.
 type jiraSearchResponse struct {
-	Issues []jiraIssue `json:"issues"`
+	Issues        []jiraIssue `json:"issues"`
+	IsLast        bool        `json:"isLast"`
+	NextPageToken string      `json:"nextPageToken,omitempty"`
 }
 
 type jiraIssue struct {
@@ -79,13 +90,28 @@ type jiraIssue struct {
 	} `json:"fields"`
 }
 
-// List runs the configured JQL and returns matching tickets.
+// jiraPageSize is the per-page cap. The /rest/api/3/search/jql endpoint
+// allows up to 5000 but we keep it at 100 to stay polite and predictable.
+const jiraPageSize = 10
+
+// List runs the configured JQL and returns matching tickets. Caps at
+// jiraPageSize results per page; logs a warning to stderr if the result was
+// truncated (more pages exist) so users notice their backlog overflows the
+// poll window.
+//
+// Note: we deliberately do NOT auto-paginate. The daemon polls every 5
+// minutes and only picks one ticket per poll, so fetching every page on
+// every tick wastes API quota. Users who want broader coverage should
+// tighten JIRA_JQL.
 func (j *Jira) List(ctx context.Context) ([]Ticket, error) {
 	q := url.Values{}
 	q.Set("jql", j.JQL)
 	q.Set("fields", "summary,description,status,labels,project,assignee,updated")
-	q.Set("maxResults", "50")
-	u := j.BaseURL + "/rest/api/3/search?" + q.Encode()
+	q.Set("maxResults", fmt.Sprintf("%d", jiraPageSize))
+	// /rest/api/3/search was removed by Atlassian (returns 410 GONE).
+	// /rest/api/3/search/jql is the replacement; same JQL, same fields,
+	// cursor-based pagination via isLast / nextPageToken.
+	u := j.BaseURL + "/rest/api/3/search/jql?" + q.Encode()
 	body, err := j.do(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -93,6 +119,14 @@ func (j *Jira) List(ctx context.Context) ([]Ticket, error) {
 	var sr jiraSearchResponse
 	if err := json.Unmarshal(body, &sr); err != nil {
 		return nil, fmt.Errorf("jira decode: %w", err)
+	}
+	// Truncated set? The new API signals this via isLast=false (or a
+	// non-empty nextPageToken). Either is enough to warn.
+	if !sr.IsLast || sr.NextPageToken != "" {
+		fmt.Fprintf(os.Stderr,
+			"jira: warning: matched more than %d issues — older tickets may never be picked. "+
+				"Tighten JIRA_JQL.\n",
+			len(sr.Issues))
 	}
 	out := make([]Ticket, 0, len(sr.Issues))
 	for _, is := range sr.Issues {
@@ -213,6 +247,7 @@ func (j *Jira) do(ctx context.Context, method, url string, body io.Reader) ([]by
 	req.Header.Set("Authorization", "Basic "+
 		base64.StdEncoding.EncodeToString([]byte(j.Email+":"+j.APIToken)))
 	resp, err := j.HTTP.Do(req)
+
 	if err != nil {
 		return nil, err
 	}

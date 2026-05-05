@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // SystemPrompt builds the strict-JSON system prompt the model must obey.

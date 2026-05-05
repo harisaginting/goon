@@ -8,13 +8,13 @@ import (
 	"testing"
 	"time"
 
-	"goon/internal/boards"
-	"goon/internal/executor"
-	"goon/internal/githost"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/boards"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/githost"
+	"github.com/harisaginting/goon/internal/llm"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 func TestDaemon_PollPicksAndRunsWorkflow(t *testing.T) {

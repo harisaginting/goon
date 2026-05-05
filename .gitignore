@@ -23,5 +23,38 @@ tmp/
 .air.toml
 run
 .claude
+.claude-logs
+.claude-logs/
 .vscode
+.idea
 goon
+goon-backup-*.tar.gz
+
+# Local secrets — keep .env.example tracked, never the real .env
+.env
+.env.local
+*.env.local
+
+# Local goon state — overrides should live outside the repo
+.goon/
+
+# Editor / OS noise
+*.swp
+*.swo
+*~
+.#*
+\#*\#
+*.bak
+*.orig
+*.rej
+
+# FUSE-mounted filesystem leftovers (created when an open file is renamed
+# or unlinked while still held by another process — e.g. when sync clients,
+# IDEs, or Cowork-style sandboxes touch a file that's currently open).
+.fuse_hidden*
+
+# Go test / cover artifacts
+*.test
+*.out
+coverage.txt
+profile.cov

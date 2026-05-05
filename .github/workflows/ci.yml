@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    name: build + vet + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          check-latest: true
+          cache: true
+
+      - name: go mod tidy (no diff)
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "❌ gofmt would change:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go build
+        run: go build -trimpath -ldflags='-s -w' -o /tmp/goon .
+
+      - name: go test
+        run: go test -race -count=1 -timeout 5m ./...
+
+      - name: smoke test (--version)
+        run: /tmp/goon --version
+
+      - name: smoke test (mock provider end-to-end)
+        env:
+          GOON_LLM_PROVIDER: mock
+          GOON_MOCK_REPLIES: '{"tool":"finish","args":{"message":"ok"}}'
+        run: /tmp/goon "smoke test" --auto
+
+  lint-examples:
+    name: validate example workflow JSONs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: jq parse + minimal schema
+        run: |
+          for f in examples/workflows/*.json workflow.json.sample; do
+            echo "=== $f ==="
+            jq empty "$f"
+            jq -e '.stages | length > 0' "$f" > /dev/null
+            jq -e 'all(.stages[]; .name and .type and (.type == "llm" or .type == "agent"))' "$f" > /dev/null
+          done

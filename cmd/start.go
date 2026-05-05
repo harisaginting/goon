@@ -10,20 +10,22 @@ import (
 	"strings"
 	"time"
 
-	"goon/internal/boards"
-	"goon/internal/daemon"
-	"goon/internal/executor"
-	"goon/internal/githost"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/safety"
-	"goon/internal/tools"
-	"goon/internal/web"
+	"github.com/harisaginting/goon/internal/daemon"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
+	"github.com/harisaginting/goon/internal/web"
 )
 
 // runStart launches the autonomous daemon. Blocks until ctx is cancelled.
 //
 //	goon start [--web=:8080] [--once] [--poll=5m] [--no-pr] [--debug]
+//
+// The daemon now starts even when LLM / board / git host config is missing,
+// so the user can configure goon entirely from the web UI. Polling stays
+// idle ("waiting for config") until the daemon's hot-reload picks up a
+// valid configuration.
 func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	fs := flag.NewFlagSet("start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -46,25 +48,15 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		return fmt.Errorf("goon already running (pid %d). Use 'goon stop' first", pid)
 	}
 
-	// LLM provider.
-	prov, err := llm.NewFromEnv()
-	if err != nil {
-		return fmt.Errorf("llm provider: %w", err)
-	}
-
-	// Board (required).
-	board, err := boards.NewFromEnv()
-	if err != nil {
-		return fmt.Errorf("board: %w (set GOON_BOARD=jira|github|mock)", err)
-	}
-
-	// Memory.
+	// Memory is the only thing genuinely required — the web UI and the CLI
+	// both read+write here, and the daemon parks its status here.
 	mem, err := memory.New(os.Getenv("GOON_MEMORY_PATH"))
 	if err != nil {
 		return fmt.Errorf("memory: %w", err)
 	}
 
-	// Tools — register ask_user with memory bound.
+	// Tools registry. ask_user is bound to memory so the agent can queue
+	// questions when the daemon is running headless.
 	reg := tools.DefaultRegistry()
 	reg.Register(tools.NewAskUser(mem))
 
@@ -76,28 +68,22 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		Stdin: stdin,
 	})
 
-	// Optional git host. --no-pr forces nil.
-	var host githost.Host
-	if !*noPR {
-		host, err = githost.NewFromEnv()
-		if err != nil && !errors.Is(err, githost.ErrNoHost) {
-			return fmt.Errorf("git host: %w", err)
-		}
-	}
-
 	d := daemon.New(daemon.Options{
-		LLM: prov, Tools: reg, Executor: exec,
-		Memory: mem, Board: board, Host: host,
+		Tools: reg, Executor: exec, Memory: mem,
 		Stdout: stdout, Stderr: stderr,
 		Debug:        *debug,
 		PollInterval: *pollFlag,
+		PRDisabled:   *noPR,
 	})
+	// First reconfigure pass: read current env, build providers if possible.
+	d.Reconfigure()
 
-	// Optional web server.
+	// Optional web server. The web UI is the primary onboarding surface,
+	// so we always pass it the daemon — POST /api/config calls Reconfigure().
 	var srv *web.Server
 	if *webAddr != "" {
 		srv = web.NewServer(web.Options{
-			Addr: *webAddr, Memory: mem, Board: board,
+			Addr: *webAddr, Memory: mem,
 			Daemon: d, Stdout: stdout, Stderr: stderr,
 		})
 		go func() {
@@ -105,7 +91,8 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 				fmt.Fprintf(stderr, "web: %v\n", err)
 			}
 		}()
-		fmt.Fprintf(stdout, "→ web UI at http://%s\n", strings.TrimPrefix(*webAddr, ":"))
+		fmt.Fprintf(stdout, "→ web UI at http://%s — open it to configure goon\n",
+			strings.TrimPrefix(*webAddr, ":"))
 	}
 
 	if err := writePIDFile(pidPath); err != nil {

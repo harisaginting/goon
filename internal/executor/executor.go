@@ -16,9 +16,11 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // Mode controls execution behavior.
@@ -122,7 +124,39 @@ func (e *Executor) Execute(ctx context.Context, t tools.Tool, call tools.ToolCal
 		}
 	}
 
-	return t.Run(ctx, call.Args)
+	start := time.Now()
+	res, runErr := t.Run(ctx, call.Args)
+	logx.Info("executor.tool",
+		"tool", call.Tool,
+		"args", call.Args,
+		"latency_ms", time.Since(start).Milliseconds(),
+		"ok", runErr == nil,
+		"stdout_bytes", len(res.Stdout),
+		"stderr_bytes", len(res.Stderr),
+		"err", errString(runErr),
+	)
+	logx.Debug("executor.tool_output",
+		"tool", call.Tool,
+		"stdout", logTruncate(res.Stdout, 4096),
+		"stderr", logTruncate(res.Stderr, 4096),
+	)
+	return res, runErr
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// logTruncate caps a string for log attributes — keeps log lines bounded
+// even when a tool spits out a 1MB stdout.
+func logTruncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 // isMutating returns true for tools the user typically wants to confirm.

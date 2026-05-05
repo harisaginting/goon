@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 func TestAskUser_QueuesQuestion(t *testing.T) {

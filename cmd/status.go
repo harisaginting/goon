@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 // runStatus prints the current daemon status and a quick summary of pending

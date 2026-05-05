@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 // AskUser is the tool the agent calls when it cannot proceed without user

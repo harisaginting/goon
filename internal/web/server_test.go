@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 func TestIndex_Served(t *testing.T) {

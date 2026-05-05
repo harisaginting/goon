@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"os"
 
-	"goon/cmd"
+	"github.com/harisaginting/goon/cmd"
 )
 
 func main() {

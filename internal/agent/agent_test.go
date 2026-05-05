@@ -6,11 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"goon/internal/executor"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/llm"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // Builds an agent wired against the mock LLM.

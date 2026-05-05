@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "branch_prefix": "lead/",
+  "pr_title_template": "",
+  "pr_body_template": "",
+  "stages": [
+    {
+      "name": "qualify",
+      "type": "llm",
+      "json_mode": true,
+      "temperature": 0.0,
+      "prompt": "Qualify this inbound lead. Score 1-10 on fit and intent. Reply JSON {\"fit\":N,\"intent\":N,\"reasoning\":\"...\",\"tier\":\"hot|warm|cold\"}.\n\nLEAD:\nname: {{.Title}}\ndetails: {{.Description}}"
+    },
+    {
+      "name": "draft",
+      "type": "llm",
+      "if": "{{ne (get .Stages.qualify \"tier\") \"cold\"}}",
+      "json_mode": true,
+      "temperature": 0.5,
+      "prompt": "Draft a 3-paragraph outreach email for a {{get .Stages.qualify \"tier\"}} lead. Reply JSON {\"subject\":\"...\",\"body\":\"...\"}.\n\nLead context: {{.Description}}\nReasoning so far: {{get .Stages.qualify \"reasoning\"}}"
+    },
+    {
+      "name": "push_to_crm",
+      "type": "agent",
+      "if": "{{ne (get .Stages.qualify \"tier\") \"cold\"}}",
+      "task": "Save lead {{.Key}} to the CRM with tier={{get .Stages.qualify \"tier\"}}, fit={{get .Stages.qualify \"fit\"}}, intent={{get .Stages.qualify \"intent\"}}, and queue email subject \"{{get .Stages.draft \"subject\"}}\" for review."
+    }
+  ],
+  "hooks": {
+    "on_failure": ["echo 'lead {{.Key}} failed' >> ~/.goon/leads-failed.log"]
+  }
+}

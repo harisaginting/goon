@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // GitHub uses GitHub Issues as the ticket board.
@@ -57,7 +59,7 @@ func NewGitHubFromEnv() (*GitHub, error) {
 		Label:    os.Getenv("GITHUB_LABEL"),
 		Assignee: os.Getenv("GITHUB_ASSIGNEE"),
 		APIURL:   strings.TrimRight(api, "/"),
-		HTTP:     &http.Client{Timeout: 20 * time.Second},
+		HTTP:     logx.InstrumentClient("github-board", &http.Client{Timeout: 20 * time.Second}),
 	}, nil
 }
 
@@ -81,13 +83,21 @@ type ghIssue struct {
 	RepositoryURL string    `json:"repository_url,omitempty"`
 }
 
+// ghPageSize is the per-repo page size; bumped to GitHub's max-100 from
+// the previous 30. Pagination via Link header is not implemented yet —
+// we log a warning when a repo returns exactly the page size, since
+// that's the signal that more results exist.
+const ghPageSize = 100
+
 // List queries each configured repo for open issues matching the filters.
+// Caps each repo at ghPageSize results; logs a warning when truncated so
+// users notice their backlog is bigger than one page.
 func (g *GitHub) List(ctx context.Context) ([]Ticket, error) {
 	var all []Ticket
 	for _, repo := range g.Repos {
 		q := url.Values{}
 		q.Set("state", "open")
-		q.Set("per_page", "30")
+		q.Set("per_page", fmt.Sprintf("%d", ghPageSize))
 		if g.Label != "" {
 			q.Set("labels", g.Label)
 		}
@@ -103,12 +113,21 @@ func (g *GitHub) List(ctx context.Context) ([]Ticket, error) {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, fmt.Errorf("github decode %s: %w", repo, err)
 		}
+		var kept int
 		for _, is := range raw {
 			if is.PullRequest != nil {
 				continue // /issues includes PRs; skip them
 			}
 			all = append(all, g.toTicket(repo, is))
+			kept++
 		}
+		if len(raw) >= ghPageSize {
+			fmt.Fprintf(os.Stderr,
+				"github: warning: %s returned %d issues (page size %d) — more pages exist. "+
+					"Tighten GITHUB_LABEL or GITHUB_ASSIGNEE.\n",
+				repo, len(raw), ghPageSize)
+		}
+		_ = kept
 	}
 	return all, nil
 }

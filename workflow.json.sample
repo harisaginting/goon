@@ -1,0 +1,64 @@
+{
+  "version": 2,
+
+  "branch_prefix": "goon/",
+  "test_command": "make test",
+  "verify_runs": 3,
+  "extra_labels": ["auto"],
+
+  "pr_title_template": "[{{.Key}}] {{.Title}}",
+  "pr_body_template": "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
+
+  "stages": [
+    {
+      "name": "triage",
+      "type": "llm",
+      "json_mode": true,
+      "temperature": 0.1,
+      "max_tokens": 800,
+      "prompt": "You are GOON's planner. Break this ticket into 3-7 ordered, atomic engineering steps that an autonomous agent can execute one-by-one. Each step MUST finish in <= 5 tool calls.\n\nReply with EXACTLY ONE JSON object: {\"steps\":[{\"title\":\"...\"}]}.\nNo prose, no fences, no comments.\n\nTICKET:\nkey: {{.Key}}\ntitle: {{.Title}}\nproject: {{.Project}}"
+    },
+
+    {
+      "name": "execute",
+      "type": "agent",
+      "task": "Implement ticket {{.Key}} ({{.Title}}). Plan:\n{{range .Stages.triage.steps}}- {{.title}}\n{{end}}\nWork through the steps in order. Call finish when every step is done."
+    },
+
+    {
+      "name": "test",
+      "type": "agent",
+      "on_error": "continue",
+      "task": "Run the project's tests for ticket {{.Key}} and report any failures. If tests pass, finish with \"green\"; if they fail, finish with the failing output."
+    },
+
+    {
+      "name": "verify",
+      "type": "agent",
+      "repeat": 3,
+      "task": "Verification pass {{.Attempt}}/3 for ticket {{.Key}} ({{.Title}}). Re-read the implementation, look for defects, edge cases, regressions. List any problems via finish; if everything looks correct, finish with \"verified\"."
+    },
+
+    {
+      "name": "summarize",
+      "type": "llm",
+      "json_mode": true,
+      "temperature": 0.0,
+      "max_tokens": 400,
+      "prompt": "Summarize the work done for {{.Key}} in 1-2 sentences for the PR description.\n\nReply JSON: {\"summary\":\"...\"}.\n\nPlan executed:\n{{range .Stages.triage.steps}}- {{.title}}\n{{end}}\n\nVerification result: {{.Stages.verify}}"
+    }
+  ],
+
+  "hooks": {
+    "before_triage": [],
+    "before_execute": ["echo 'goon picked up {{.Key}}: {{.Title}}'"],
+    "after_execute": [],
+    "before_test": [],
+    "after_test": [],
+    "before_verify": [],
+    "after_verify": [],
+    "before_pr": ["go fmt ./...", "go vet ./..."],
+    "after_pr": ["echo 'PR opened for {{.Key}} on branch {{.Branch}}'"],
+    "on_failure": ["echo 'goon failed on {{.Key}}: $(date)' >> ~/.goon/failures.log"]
+  }
+}

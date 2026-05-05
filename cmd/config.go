@@ -46,6 +46,12 @@ var knownConfigKeys = []configKey{
 	{Name: "OLLAMA_BASE_URL", Default: "http://localhost:11434", Group: "ollama"},
 	{Name: "OLLAMA_MODEL", Default: "llama3", Group: "ollama"},
 
+	// Shared Atlassian credentials. Used as fallback by both Jira and
+	// Confluence so a typical Cloud user only fills these three.
+	{Name: "ATLASSIAN_BASE_URL", Group: "atlassian"},
+	{Name: "ATLASSIAN_EMAIL", Group: "atlassian"},
+	{Name: "ATLASSIAN_API_TOKEN", Sensitive: true, Group: "atlassian"},
+
 	{Name: "JIRA_BASE_URL", Group: "jira"},
 	{Name: "JIRA_EMAIL", Group: "jira"},
 	{Name: "JIRA_API_TOKEN", Sensitive: true, Group: "jira"},
@@ -149,11 +155,8 @@ func configShow(args []string, stdout, stderr io.Writer) error {
 			if k.Sensitive && !*reveal {
 				display = mask(value)
 			}
-			if value == "" {
+			if display == "" {
 				display = "(unset)"
-				if k.Default != "" {
-					display = fmt.Sprintf("(default: %s)", k.Default)
-				}
 			}
 			fmt.Fprintf(stdout, "  %-22s = %s    [%s]\n", k.Name, display, source)
 		}
@@ -241,19 +244,24 @@ func configEdit(ctx context.Context, stdout, stderr io.Writer) error {
 }
 
 // configFilePath returns ~/.config/goon/.env (or $XDG_CONFIG_HOME/goon/.env).
+// Falls back to ./.goon/.env when the home directory can't be resolved
+// (e.g. running in a stripped-down container) so config commands keep
+// working instead of writing to the empty path.
 func configFilePath() string {
 	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
 		return filepath.Join(xdg, "goon", ".env")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ""
+		return filepath.Join(".goon", ".env")
 	}
 	return filepath.Join(home, ".config", "goon", ".env")
 }
 
 // resolveValue returns (value, source) for a known key. Source is one of
-// "shell", "config-file", "default", or "unset".
+// "shell", "config-file", "default", or "unset". When falling back to the
+// built-in default, the value is the default itself (not "") so callers
+// don't need a separate lookup just for display.
 func resolveValue(k configKey, fileVals map[string]string) (string, string) {
 	if v := os.Getenv(k.Name); v != "" {
 		// Differentiate between shell-set and config-file-set when the file
@@ -267,7 +275,7 @@ func resolveValue(k configKey, fileVals map[string]string) (string, string) {
 		return v, "config-file"
 	}
 	if k.Default != "" {
-		return "", "default"
+		return k.Default, "default"
 	}
 	return "", "unset"
 }

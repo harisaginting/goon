@@ -99,6 +99,46 @@ func TestJira_ADF(t *testing.T) {
 	}
 }
 
+// TestJira_List_UsesNewSearchEndpoint confirms we hit the post-deprecation
+// path /rest/api/3/search/jql, not the removed /rest/api/3/search.
+// (Atlassian CHANGE-2046 returned 410 GONE on the old URL.)
+func TestJira_List_UsesNewSearchEndpoint(t *testing.T) {
+	var hitPath string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPath = r.URL.Path
+		_, _ = w.Write([]byte(`{"issues":[],"isLast":true}`))
+	}))
+	defer ts.Close()
+	j := &Jira{BaseURL: ts.URL, Email: "u", APIToken: "t", JQL: "x", HTTP: ts.Client()}
+	if _, err := j.List(context.Background()); err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if hitPath != "/rest/api/3/search/jql" {
+		t.Errorf("expected /rest/api/3/search/jql, got %s", hitPath)
+	}
+}
+
+// TestJira_List_TruncationWarning verifies we warn (don't error) when the
+// new endpoint signals more pages exist via isLast=false.
+func TestJira_List_TruncationWarning(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+		  "issues":[{"id":"1","key":"X-1","fields":{"summary":"a","status":{"name":"Open"},"project":{"key":"X"},"updated":"2026-01-01T00:00:00.000+0000"}}],
+		  "isLast":false,
+		  "nextPageToken":"abc"
+		}`))
+	}))
+	defer ts.Close()
+	j := &Jira{BaseURL: ts.URL, Email: "u", APIToken: "t", JQL: "x", HTTP: ts.Client()}
+	got, err := j.List(context.Background())
+	if err != nil {
+		t.Fatalf("truncation should warn, not error: %v", err)
+	}
+	if len(got) != 1 {
+		t.Errorf("want 1 ticket from page, got %d", len(got))
+	}
+}
+
 func TestJira_Comment(t *testing.T) {
 	var posted map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

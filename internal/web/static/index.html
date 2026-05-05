@@ -65,6 +65,62 @@ table a:hover { text-decoration: underline; }
 .state-executing, .state-testing, .state-verifying, .state-opening_pr, .state-notifying { background: rgba(255,170,68,0.18); color: var(--running-state); }
 .state-triaging, .state-planning { background: rgba(102,204,255,0.18); color: var(--planning); }
 .state-blocked { background: rgba(255,104,104,0.10); color: var(--failed); }
+
+/* setup banner */
+.setup-banner {
+  background: linear-gradient(90deg, rgba(102,204,255,0.18), rgba(102,204,255,0.06));
+  border: 1px solid rgba(102,204,255,0.4); border-radius: 8px;
+  padding: 14px 18px; margin: 0 24px 0 24px; color: var(--fg);
+}
+.setup-banner strong { color: var(--accent); }
+
+/* config form */
+form.cfg fieldset {
+  border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px;
+  margin-bottom: 12px;
+}
+form.cfg legend {
+  color: var(--accent); font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.6px; padding: 0 6px;
+}
+form.cfg label {
+  display: grid; grid-template-columns: 220px 1fr; align-items: center;
+  gap: 10px; padding: 4px 0;
+}
+form.cfg .lbl {
+  color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px;
+}
+form.cfg input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, monospace;
+}
+form.cfg input:focus { border-color: var(--accent); outline: none; }
+form.cfg .hint {
+  grid-column: 2 / 3; font-size: 11px; color: var(--muted); margin-top: -2px;
+}
+form.cfg .cfg-actions {
+  display: flex; gap: 10px; align-items: center; margin-top: 12px;
+}
+form.cfg button {
+  background: var(--accent); color: var(--bg); border: 0; border-radius: 4px;
+  padding: 8px 18px; cursor: pointer; font-weight: 600;
+}
+form.cfg button:hover { filter: brightness(1.15); }
+form.cfg button.btn-verify {
+  background: transparent; color: var(--accent);
+  border: 1px solid var(--accent);
+}
+form.cfg button.btn-verify:hover { background: rgba(102,204,255,0.10); }
+.htmx-indicator { display: none; color: var(--muted); font-size: 12px; }
+.htmx-request .htmx-indicator,
+.htmx-request.htmx-indicator { display: inline; }
+ul.notes { margin: 8px 0 0 0; padding: 0; list-style: none; font-size: 12px; }
+ul.notes li { padding: 2px 0; font-family: ui-monospace, monospace; }
+ul.notes .note-ok { color: var(--running); }
+ul.notes .note-err { color: var(--failed); }
+ul.notes .note-skip { color: var(--muted); }
+.err { color: var(--failed); font-weight: 600; }
+
 footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px; }
 </style>
 </head>
@@ -73,10 +129,13 @@ footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px
   <h1><span class="robot">🤖</span> goon</h1>
   <span class="subtitle">autonomous AI engineer</span>
 </header>
+
+<div hx-get="/fragments/setup" hx-trigger="load, every 5s, configChanged from:body" hx-swap="innerHTML"></div>
+
 <main>
   <section class="card">
     <h2>Daemon status</h2>
-    <div hx-get="/fragments/status" hx-trigger="load, every 3s">loading…</div>
+    <div hx-get="/fragments/status" hx-trigger="load, every 3s, configChanged from:body">loading…</div>
   </section>
   <section class="card">
     <h2>Pending questions</h2>
@@ -89,6 +148,14 @@ footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px
   <section class="card" style="grid-column: 1 / -1;">
     <h2>Recent tickets</h2>
     <div hx-get="/fragments/tickets" hx-trigger="load, every 6s">loading…</div>
+  </section>
+  <section class="card" style="grid-column: 1 / -1;">
+    <h2>Configuration</h2>
+    <p style="color: var(--muted); font-size: 12px; margin: 0 0 12px 0;">
+      All values are persisted to <code>~/.config/goon/.env</code>. Hitting "save" hot-reloads the daemon.
+      Sensitive fields display as masked placeholders when set; leave them blank to keep, or type a new value to replace.
+    </p>
+    <div hx-get="/fragments/config" hx-trigger="load, configChanged from:body">loading config…</div>
   </section>
 </main>
 <footer>goon · same memory as the CLI · all data lives at <code>~/.goon/memory.json</code></footer>

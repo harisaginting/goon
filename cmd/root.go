@@ -19,12 +19,13 @@ import (
 	"strings"
 	"syscall"
 
-	"goon/internal/agent"
-	"goon/internal/executor"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/agent"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/llm"
+	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // Execute is the entry point used by main.go.
@@ -39,6 +40,23 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	if home, err := os.UserHomeDir(); err == nil {
 		loadDotEnv(home + "/.config/goon/.env")
 		loadDotEnv(home + "/.goon/.env")
+	}
+
+	// Initialize the structured logger as early as possible so even early
+	// failures (missing API keys, bad config) get captured to disk.
+	if lg, err := logx.New(logx.Config{}); err == nil {
+		logx.SetDefault(lg)
+	}
+	logx.Info("cli.start", "argv", argv)
+
+	// Tolerate users typing the program name twice. Common when invoked via
+	// `go run . goon workflow init` — the user's mental model is "I'm typing
+	// the full command", but `go run .` is already goon, so the leading
+	// "goon" becomes argv[0] and shadows the real subcommand. Strip it and
+	// drop a one-line hint so they learn the right form.
+	if len(argv) > 1 && argv[0] == "goon" {
+		fmt.Fprintln(stderr, "hint: you don't need the leading 'goon' — `goon "+strings.Join(argv[1:], " ")+"` is the correct form.")
+		argv = argv[1:]
 	}
 
 	// Subcommand dispatch — runs BEFORE flag parsing so the LLM agent isn't
@@ -61,6 +79,12 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runStatus(ctx, sargs, stdout, stderr)
 		case "train":
 			return runTrain(ctx, sargs, stdout, stderr, stdin)
+		case "doctor":
+			return runDoctor(ctx, sargs, stdout, stderr)
+		case "workflow":
+			return runWorkflow(ctx, sargs, stdout, stderr)
+		case "logs":
+			return runLogs(ctx, sargs, stdout, stderr)
 		}
 	}
 
@@ -81,6 +105,8 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 		fmt.Fprintf(stderr, "  goon stop                                 stop the running daemon\n")
 		fmt.Fprintf(stderr, "  goon status                               daemon status, pending questions, recent workflows\n")
 		fmt.Fprintf(stderr, "  goon train [--list|--all|answer <id> <a>] answer questions queued by the agent\n")
+		fmt.Fprintf(stderr, "  goon doctor [--json] [--quiet]            verify every provider with a live probe\n")
+		fmt.Fprintf(stderr, "  goon workflow <show|path|init|edit|hooks> manage the per-workflow customization file\n")
 		fmt.Fprintf(stderr, "  goon update [<ref>]                       self-update from upstream master, branch, tag, or commit\n")
 		fmt.Fprintf(stderr, "  goon uninstall [--yes] [--purge]          remove the binary (and optionally state)\n")
 		fmt.Fprintf(stderr, "  goon config <action> [args]               show / get / set / unset / path / edit\n\n")
@@ -123,7 +149,7 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	// Build provider.
 	prov, err := llm.NewFromEnv()
 	if err != nil {
-		return fmt.Errorf("llm provider: %w", err)
+		return onboardingError(err)
 	}
 
 	// Build tool registry.
@@ -178,7 +204,7 @@ func splitSubcommand(argv []string) (string, []string) {
 		return "", nil
 	}
 	switch first {
-	case "update", "uninstall", "config", "start", "stop", "status", "train":
+	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs":
 		return first, argv[1:]
 	}
 	return "", nil
@@ -256,4 +282,26 @@ func loadDotEnv(path string) {
 			_ = os.Setenv(k, v)
 		}
 	}
+}
+
+// onboardingError wraps an llm.NewFromEnv failure with a copy-pasteable
+// hint for new users. Hits on the most common first-run failure: no API
+// key set anywhere.
+func onboardingError(cause error) error {
+	msg := cause.Error()
+	hint := ""
+	switch {
+	case strings.Contains(msg, "OPENAI_API_KEY"):
+		hint = "\n\nFirst run? Pick one:\n" +
+			"  1. Use OpenAI:    export OPENAI_API_KEY=sk-... (or `goon config set OPENAI_API_KEY sk-...`)\n" +
+			"  2. Use Anthropic: export GOON_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-...\n" +
+			"  3. Use a local model via Ollama: export GOON_LLM_PROVIDER=ollama (then `ollama serve`)\n" +
+			"  4. Just try it offline: export GOON_LLM_PROVIDER=mock GOON_MOCK_REPLIES='{\"tool\":\"finish\",\"args\":{\"message\":\"hi\"}}'\n" +
+			"\nFull config reference: copy .env.example to ~/.config/goon/.env and edit. Run `goon doctor` to verify."
+	case strings.Contains(msg, "ANTHROPIC_API_KEY"):
+		hint = "\n\nSet it with: `export ANTHROPIC_API_KEY=sk-...` or `goon config set ANTHROPIC_API_KEY sk-...`"
+	case strings.Contains(msg, "unknown GOON_LLM_PROVIDER"):
+		hint = "\n\nValid values: openai, anthropic, ollama, mock"
+	}
+	return fmt.Errorf("%w%s", cause, hint)
 }

@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 // runTrain walks pending questions and prompts the user for an answer per

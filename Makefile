@@ -11,6 +11,7 @@ GO_BIN       := $(shell go env GOPATH)/bin
 endif
 
 .PHONY: all build test vet fmt clean tidy check \
+        run run-auto run-explain \
         install install-system install-user install-go \
         uninstall uninstall-system uninstall-user uninstall-go
 
@@ -18,6 +19,20 @@ all: check build
 
 build:
 	go build -trimpath -ldflags='-s -w' -o $(BIN) .
+
+# --- Run on the fly (no build, no install) ----------------------------------
+# Pass the task in the TASK variable. Examples:
+#   make run TASK='list every .go file under internal'
+#   make run-auto TASK='tidy go.mod'
+#   make run-explain TASK='delete every .log older than 30 days'
+run:
+	@go run . $(if $(TASK),"$(TASK)",) $(ARGS)
+
+run-auto:
+	@go run . $(if $(TASK),"$(TASK)",) --auto $(ARGS)
+
+run-explain:
+	@go run . $(if $(TASK),"$(TASK)",) --explain $(ARGS)
 
 test:
 	go test -race -count=1 $(PKGS)

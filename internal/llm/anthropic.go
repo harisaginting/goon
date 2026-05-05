@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // AnthropicConfig configures the Anthropic Messages API client.
@@ -29,7 +31,7 @@ type Anthropic struct {
 func NewAnthropic(cfg AnthropicConfig) *Anthropic {
 	hc := cfg.HTTP
 	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+		hc = logx.InstrumentClient("anthropic", &http.Client{Timeout: 30 * time.Second})
 	}
 	return &Anthropic{cfg: cfg, http: hc}
 }
@@ -38,10 +40,11 @@ func NewAnthropic(cfg AnthropicConfig) *Anthropic {
 func (a *Anthropic) Name() string { return "anthropic" }
 
 type anthropicMessageRequest struct {
-	Model     string             `json:"model"`
-	System    string             `json:"system,omitempty"`
-	Messages  []anthropicMessage `json:"messages"`
-	MaxTokens int                `json:"max_tokens"`
+	Model       string             `json:"model"`
+	System      string             `json:"system,omitempty"`
+	Messages    []anthropicMessage `json:"messages"`
+	MaxTokens   int                `json:"max_tokens"`
+	Temperature float64            `json:"temperature,omitempty"`
 }
 
 type anthropicMessage struct {
@@ -64,10 +67,11 @@ type anthropicMessageResponse struct {
 func (a *Anthropic) Generate(ctx context.Context, messages []Message, opts Options) (string, error) {
 	system, msgs := splitSystem(messages)
 	body := anthropicMessageRequest{
-		Model:     a.cfg.Model,
-		System:    system,
-		Messages:  msgs,
-		MaxTokens: opts.MaxTokens,
+		Model:       a.cfg.Model,
+		System:      system,
+		Messages:    msgs,
+		MaxTokens:   opts.MaxTokens,
+		Temperature: opts.Temperature,
 	}
 	if body.MaxTokens == 0 {
 		body.MaxTokens = 1024

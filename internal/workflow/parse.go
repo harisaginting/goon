@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"goon/internal/memory"
+	"github.com/harisaginting/goon/internal/memory"
 )
 
 // parseTriage extracts a plan + repo from the LLM's triage reply.

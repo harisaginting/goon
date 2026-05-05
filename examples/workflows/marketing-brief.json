@@ -1,0 +1,31 @@
+{
+  "version": 2,
+  "branch_prefix": "campaign/",
+  "pr_title_template": "",
+  "pr_body_template": "",
+  "stages": [
+    {
+      "name": "brief",
+      "type": "llm",
+      "json_mode": true,
+      "temperature": 0.4,
+      "max_tokens": 1200,
+      "prompt": "You are a marketing strategist. Turn this campaign request into a structured brief.\n\nReply with EXACTLY ONE JSON object:\n{\n  \"audience\": \"...\",\n  \"value_prop\": \"...\",\n  \"channels\": [\"...\"],\n  \"messages\": [{\"channel\":\"...\",\"hook\":\"...\",\"body\":\"...\"}]\n}\n\nREQUEST:\ntitle: {{.Title}}\ndescription: {{.Description}}"
+    },
+    {
+      "name": "review",
+      "type": "llm",
+      "json_mode": true,
+      "temperature": 0.0,
+      "prompt": "You are a brand-voice reviewer. The proposed brief is below. Reply JSON {\"approved\": true|false, \"notes\":\"...\"}.\n\nBRIEF:\n{{json .Stages.brief}}"
+    },
+    {
+      "name": "publish",
+      "type": "agent",
+      "task": "Publish the approved campaign for {{.Key}}.\n\nBrief: {{json .Stages.brief}}\nReviewer notes: {{get .Stages.review \"notes\"}}\nApproved: {{get .Stages.review \"approved\"}}\n\nSave the final assets to ./campaigns/{{.Key}}/ and call finish when done. If review was not approved, revise the body and try once more before finishing."
+    }
+  ],
+  "hooks": {
+    "after_execute": ["echo 'campaign {{.Key}} published' >> ~/.goon/campaigns.log"]
+  }
+}

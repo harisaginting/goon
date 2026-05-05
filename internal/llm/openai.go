@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // OpenAIConfig configures the OpenAI Chat Completions client.
@@ -31,7 +33,7 @@ type OpenAI struct {
 func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 	hc := cfg.HTTP
 	if hc == nil {
-		hc = &http.Client{Timeout: 30 * time.Second}
+		hc = logx.InstrumentClient("openai", &http.Client{Timeout: 30 * time.Second})
 	}
 	return &OpenAI{cfg: cfg, http: hc}
 }

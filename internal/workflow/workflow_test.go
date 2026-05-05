@@ -3,16 +3,17 @@ package workflow
 import (
 	"bytes"
 	"context"
+	"os"
 	"strings"
 	"testing"
 
-	"goon/internal/boards"
-	"goon/internal/executor"
-	"goon/internal/githost"
-	"goon/internal/llm"
-	"goon/internal/memory"
-	"goon/internal/safety"
-	"goon/internal/tools"
+	"github.com/harisaginting/goon/internal/boards"
+	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/githost"
+	"github.com/harisaginting/goon/internal/llm"
+	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 func newEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githost.Mock, *boards.Mock, *memory.Memory) {
@@ -156,6 +157,164 @@ func TestParseTriage(t *testing.T) {
 		if len(plan) != tc.wantLen || repo != tc.wantRepo {
 			t.Errorf("parseTriage(%q): %d/%q want %d/%q", tc.in, len(plan), repo, tc.wantLen, tc.wantRepo)
 		}
+	}
+}
+
+func TestEngine_RunsHooksAtEachPhase(t *testing.T) {
+	dir := t.TempDir()
+	// Each hook writes a marker file so we can verify ordering.
+	cfg := WorkflowConfig{
+		Version:      1,
+		BranchPrefix: "feature/",
+		Hooks: map[string][]string{
+			HookBeforeExecute: {"echo {{.Key}} > " + dir + "/before_execute"},
+			HookAfterExecute:  {"echo {{.Key}} > " + dir + "/after_execute"},
+			HookBeforeTest:    {"echo {{.Key}} > " + dir + "/before_test"},
+			HookAfterTest:     {"echo {{.Key}} > " + dir + "/after_test"},
+			HookBeforePR:      {"echo {{.Key}} > " + dir + "/before_pr"},
+			HookAfterPR:       {"echo {{.Key}} > " + dir + "/after_pr"},
+		},
+	}
+	replies := []string{
+		`{"steps":[{"title":"x"}]}`,
+		`{"tool":"finish","args":{"message":"done"}}`,
+		`{"tool":"finish","args":{"message":"verify"}}`,
+	}
+	e, _, host, _, _ := newEngine(t, replies)
+	e.VerifyRunsOverride = 1
+	e.Config = cfg
+
+	wf, err := e.Run(context.Background(), boards.Ticket{
+		ID: "ENG-1", Source: "jira", Key: "ENG-1",
+		Title: "Add login", Project: "ENG",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if wf.State != memory.WFDone {
+		t.Fatalf("state: %v err=%q", wf.State, wf.Error)
+	}
+	for _, name := range []string{"before_execute", "after_execute", "before_test", "before_pr", "after_pr"} {
+		if _, err := os.Stat(dir + "/" + name); err != nil {
+			t.Errorf("hook %s did not run: %v", name, err)
+		}
+	}
+	// Branch should use the custom prefix.
+	if len(host.Opened) != 1 || host.Opened[0].Head != "feature/eng-1" {
+		t.Errorf("branch prefix: %+v", host.Opened)
+	}
+}
+
+func TestEngine_HookFailureFailsWorkflow(t *testing.T) {
+	cfg := WorkflowConfig{
+		Version: 1,
+		Hooks:   map[string][]string{HookBeforeExecute: {"false"}},
+	}
+	e, _, _, _, _ := newEngine(t, []string{
+		`{"steps":[{"title":"x"}]}`,
+	})
+	e.Config = cfg
+	wf, err := e.Run(context.Background(), boards.Ticket{ID: "X-1", Title: "t", Project: "X"})
+	if err == nil {
+		t.Fatal("expected hook failure to fail workflow")
+	}
+	if wf.State != memory.WFFailed {
+		t.Errorf("state: %v", wf.State)
+	}
+	if !strings.Contains(wf.Error, "before_execute") {
+		t.Errorf("error: %q", wf.Error)
+	}
+}
+
+func TestEngine_OnFailureRunsOnAnyFailure(t *testing.T) {
+	dir := t.TempDir()
+	marker := dir + "/on_failure"
+	cfg := WorkflowConfig{
+		Version: 1,
+		Hooks: map[string][]string{
+			HookBeforeExecute: {"false"},
+			HookOnFailure:     {"touch " + marker},
+		},
+	}
+	e, _, _, _, _ := newEngine(t, []string{
+		`{"steps":[{"title":"x"}]}`,
+	})
+	e.Config = cfg
+	_, _ = e.Run(context.Background(), boards.Ticket{ID: "X-1", Title: "t", Project: "X"})
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("on_failure hook did not run: %v", err)
+	}
+}
+
+func TestEngine_TestCommandOverride(t *testing.T) {
+	dir := t.TempDir()
+	marker := dir + "/test_was_run"
+	cfg := WorkflowConfig{
+		Version:     1,
+		TestCommand: "touch " + marker,
+	}
+	replies := []string{
+		`{"steps":[{"title":"x"}]}`,
+		`{"tool":"finish","args":{"message":"done"}}`,
+		`{"tool":"finish","args":{"message":"verify"}}`,
+	}
+	e, _, _, _, _ := newEngine(t, replies)
+	e.VerifyRunsOverride = 1
+	e.Config = cfg
+
+	// Use the temp dir as the repo so runTests does anything at all.
+	t.Setenv("GOON_REPO_MAP", "X="+dir)
+
+	_, err := e.Run(context.Background(), boards.Ticket{ID: "X-1", Title: "t", Project: "X"})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("custom test command did not run: %v", err)
+	}
+}
+
+func TestEngine_PRTitleAndBodyTemplates(t *testing.T) {
+	cfg := WorkflowConfig{
+		Version:         1,
+		PRTitleTemplate: "FIX({{.Key}}): {{.Title}}",
+		PRBodyTemplate:  "Branch: {{.Branch}}\nProject: {{.Project}}",
+		ExtraLabels:     []string{"customer-x"},
+	}
+	replies := []string{
+		`{"steps":[{"title":"x"}]}`,
+		`{"tool":"finish","args":{"message":"done"}}`,
+		`{"tool":"finish","args":{"message":"verify"}}`,
+	}
+	e, _, host, _, _ := newEngine(t, replies)
+	e.VerifyRunsOverride = 1
+	e.Config = cfg
+
+	_, err := e.Run(context.Background(), boards.Ticket{
+		ID: "ENG-1", Source: "jira", Key: "ENG-1",
+		Title: "Add login", Project: "ENG",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(host.Opened) != 1 {
+		t.Fatalf("expected 1 PR")
+	}
+	got := host.Opened[0]
+	if got.Title != "FIX(ENG-1): Add login" {
+		t.Errorf("title: %q", got.Title)
+	}
+	if !strings.Contains(got.Body, "Branch: goon/eng-1") || !strings.Contains(got.Body, "Project: ENG") {
+		t.Errorf("body: %q", got.Body)
+	}
+	hasLabel := false
+	for _, l := range got.Labels {
+		if l == "customer-x" {
+			hasLabel = true
+		}
+	}
+	if !hasLabel {
+		t.Errorf("extra label missing: %v", got.Labels)
 	}
 }
 

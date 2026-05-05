@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // OllamaConfig configures the Ollama HTTP client.
@@ -31,7 +33,7 @@ func NewOllama(cfg OllamaConfig) *Ollama {
 	hc := cfg.HTTP
 	if hc == nil {
 		// Local models can be slow on first inference — give them headroom.
-		hc = &http.Client{Timeout: 120 * time.Second}
+		hc = logx.InstrumentClient("ollama", &http.Client{Timeout: 120 * time.Second})
 	}
 	return &Ollama{cfg: cfg, http: hc}
 }

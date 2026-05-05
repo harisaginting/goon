@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // GitLab opens merge requests via the GitLab REST API.
@@ -34,7 +36,7 @@ func NewGitLabFromEnv() (*GitLab, error) {
 	return &GitLab{
 		Token:  tok,
 		APIURL: strings.TrimRight(api, "/"),
-		HTTP:   &http.Client{Timeout: 30 * time.Second},
+		HTTP:   logx.InstrumentClient("gitlab", &http.Client{Timeout: 30 * time.Second}),
 	}, nil
 }
 

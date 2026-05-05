@@ -9,9 +9,11 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/atlassian"
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // Confluence is a thin tool over Atlassian Cloud's Confluence REST API.
@@ -21,8 +23,9 @@ import (
 //   - "search":    op=search, query=<CQL or text>, limit=<int>
 //   - "get_page":  op=get_page, page_id=<id>
 //
-// Authentication uses CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN as Basic auth.
-// CONFLUENCE_BASE_URL must end with /wiki for cloud installs.
+// Auth: CONFLUENCE_EMAIL + CONFLUENCE_API_TOKEN, falling back to the shared
+// ATLASSIAN_EMAIL + ATLASSIAN_API_TOKEN. The base URL falls back to
+// ATLASSIAN_BASE_URL with "/wiki" appended (the standard Cloud layout).
 type Confluence struct {
 	BaseURL  string
 	Email    string
@@ -33,11 +36,12 @@ type Confluence struct {
 // NewConfluenceFromEnv reads config from env. The tool is registered even if
 // not fully configured — it errors at Run time instead of at startup.
 func NewConfluenceFromEnv() *Confluence {
+	c := atlassian.Confluence()
 	return &Confluence{
-		BaseURL:  strings.TrimRight(os.Getenv("CONFLUENCE_BASE_URL"), "/"),
-		Email:    os.Getenv("CONFLUENCE_EMAIL"),
-		APIToken: os.Getenv("CONFLUENCE_API_TOKEN"),
-		HTTP:     &http.Client{Timeout: 20 * time.Second},
+		BaseURL:  c.BaseURL,
+		Email:    c.Email,
+		APIToken: c.APIToken,
+		HTTP:     logx.InstrumentClient("confluence", &http.Client{Timeout: 20 * time.Second}),
 	}
 }
 
@@ -57,7 +61,7 @@ func (*Confluence) Schema() map[string]string {
 func (c *Confluence) Run(ctx context.Context, args map[string]string) (Result, error) {
 	if c.BaseURL == "" || c.Email == "" || c.APIToken == "" {
 		return Result{ToolName: "confluence"},
-			errors.New("confluence: set CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, CONFLUENCE_API_TOKEN")
+			errors.New("confluence: set CONFLUENCE_BASE_URL/CONFLUENCE_EMAIL/CONFLUENCE_API_TOKEN (or shared ATLASSIAN_BASE_URL/ATLASSIAN_EMAIL/ATLASSIAN_API_TOKEN)")
 	}
 	op := strings.ToLower(strings.TrimSpace(args["op"]))
 	switch op {

@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // Telegram sends messages through a Telegram Bot via the Bot API.
@@ -37,7 +39,7 @@ func NewTelegramFromEnv() *Telegram {
 	return &Telegram{
 		Token:      os.Getenv("TELEGRAM_BOT_TOKEN"),
 		DefaultTo:  os.Getenv("TELEGRAM_CHAT_ID"),
-		HTTP:       &http.Client{Timeout: 15 * time.Second},
+		HTTP:       logx.InstrumentClient("telegram", &http.Client{Timeout: 15 * time.Second}),
 		APIBaseURL: base,
 	}
 }
