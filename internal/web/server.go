@@ -57,6 +57,7 @@ func NewServer(opts Options) *Server {
 func (s *Server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.HandleFunc("/docs", s.handleDocs)
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/tickets", s.handleAPITickets)
 	mux.HandleFunc("/api/workflows", s.handleAPIWorkflows)
@@ -75,12 +76,21 @@ func (s *Server) mux() *http.ServeMux {
 }
 
 // Start begins serving. Blocks until ListenAndServe returns.
+//
+// Timeouts are tuned to defend against slowloris-style hold-opens while
+// still permitting the longer-running endpoints (e.g. /api/config/verify
+// hits provider HTTPS endpoints). If you need to stream a long response,
+// use a different surface — the web UI is short-poll htmx, not SSE.
 func (s *Server) Start() error {
 	s.mu.Lock()
 	s.srv = &http.Server{
 		Addr:              s.opts.Addr,
 		Handler:           s.mux(),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10, // 32 KB — tiny since htmx requests are small.
 	}
 	srv := s.srv
 	s.mu.Unlock()
@@ -116,9 +126,23 @@ var indexHTML string
 //go:embed static/htmx.min.js
 var htmxJS []byte
 
+//go:embed static/docs.html
+var docsHTML string
+
 func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, indexHTML)
+}
+
+// handleDocs serves the embedded, self-contained documentation page. It's
+// the same content as the README but rendered as a styled, sectioned web
+// page so a brand-new user can find everything without leaving the UI.
+// Keeping it embedded means it ships with every binary — no internet
+// required to read the manual.
+func (s *Server) handleDocs(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = io.WriteString(w, docsHTML)
 }
 
 func (s *Server) handleHTMX(w http.ResponseWriter, _ *http.Request) {

@@ -105,7 +105,14 @@ func (r *Registry) Manifest() string {
 	return b.String()
 }
 
-// DefaultRegistry returns the built-in tools without memory-bound tools.
+// DefaultRegistry returns the built-in tools.
+//
+// "memory-bound" here historically meant tools that need a *memory.Memory
+// reference (passive runtime store). Those are still registered separately
+// by callers (see cmd/start.go: r.Register(tools.NewAskUser(mem))).
+//
+// The memory_* tools added here are different — they're the *active*
+// markdown notes store (internal/notes), which is self-contained.
 func DefaultRegistry() *Registry {
 	r := NewRegistry()
 	r.Register(&RunCommand{})
@@ -114,6 +121,7 @@ func DefaultRegistry() *Registry {
 	r.Register(&Finish{})
 	r.Register(NewConfluenceFromEnv())
 	r.Register(NewTelegramFromEnv())
+	RegisterMemoryTools(r)
 	return r
 }
 

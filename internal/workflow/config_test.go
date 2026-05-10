@@ -28,6 +28,13 @@ func TestLoadConfig_NoFile_ReturnsDefaults(t *testing.T) {
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("GOON_WORKFLOW_FILE", "")
+	// Chdir into an empty tmp dir so the new ./workflow.json default
+	// can't accidentally pick up a real file from the test's CWD.
+	cwd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
 	cfg, src, err := LoadConfig("")
 	if err != nil {
 		t.Fatal(err)
@@ -37,6 +44,55 @@ func TestLoadConfig_NoFile_ReturnsDefaults(t *testing.T) {
 	}
 	if cfg.BranchPrefix != "goon/" {
 		t.Errorf("expected default branch prefix, got %q", cfg.BranchPrefix)
+	}
+}
+
+// TestLoadConfig_RepoRootWins covers the new resolution priority: a
+// workflow.json sitting in the repo root takes precedence over legacy
+// .goon/workflow.json paths. This is the path `goon workflow init`
+// writes to, so it must be the path goon reads from first.
+func TestLoadConfig_RepoRootWins(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GOON_WORKFLOW_FILE", "")
+	cwd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	// Both repo-root and legacy .goon/ contain configs; repo-root must win.
+	_ = os.WriteFile(filepath.Join(dir, "workflow.json"),
+		[]byte(`{"branch_prefix":"root/"}`), 0o644)
+	_ = os.MkdirAll(filepath.Join(dir, ".goon"), 0o755)
+	_ = os.WriteFile(filepath.Join(dir, ".goon", "workflow.json"),
+		[]byte(`{"branch_prefix":"legacy/"}`), 0o644)
+
+	cfg, src, err := LoadConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BranchPrefix != "root/" {
+		t.Errorf("repo root should win; got branch_prefix=%q", cfg.BranchPrefix)
+	}
+	if !strings.HasSuffix(src, "/workflow.json") || strings.Contains(src, ".goon") {
+		t.Errorf("source should be repo-root workflow.json, got %q", src)
+	}
+}
+
+// TestDefaultConfigFilePath_RepoRoot guards against silently regressing
+// the new default — `goon workflow init` must write to ./workflow.json,
+// not back into ~/.config/goon/.
+func TestDefaultConfigFilePath_RepoRoot(t *testing.T) {
+	t.Setenv("GOON_WORKFLOW_FILE", "")
+	t.Setenv("XDG_CONFIG_HOME", "/should-not-be-consulted")
+	t.Setenv("HOME", "/also-should-not-be-consulted")
+	got := DefaultConfigFilePath()
+	if !strings.HasSuffix(got, "workflow.json") {
+		t.Errorf("DefaultConfigFilePath should end in workflow.json; got %q", got)
+	}
+	if strings.Contains(got, ".goon") || strings.Contains(got, ".config") {
+		t.Errorf("DefaultConfigFilePath leaked legacy path; got %q", got)
 	}
 }
 
@@ -92,6 +148,13 @@ func TestLoadConfig_RepoLocalWins(t *testing.T) {
 	t.Setenv("HOME", tmp)
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("GOON_WORKFLOW_FILE", "")
+	// Chdir to tmp so the new ./workflow.json default doesn't pick up
+	// a stray file from whatever dir `go test` was launched in.
+	cwd, _ := os.Getwd()
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
 
 	cfg, src, err := LoadConfig(repoDir)
 	if err != nil {
@@ -149,6 +212,48 @@ func TestSaveDefault_RefusesOverwrite(t *testing.T) {
 	}
 }
 
+// TestSaveDefault_WritesEducationalStarter covers the v0.2 contract:
+// `goon workflow init` writes a comprehensive starter with every hook
+// represented and a few populated with self-documenting echo commands so
+// a first-time user can read the JSON top-to-bottom without consulting
+// docs. Regression risk is high if a future refactor reverts this to
+// empty-array hooks (loses onboarding clarity silently).
+func TestSaveDefault_WritesEducationalStarter(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wf.json")
+	if err := SaveDefault(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	data, _ := os.ReadFile(path)
+	var cfg WorkflowConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if cfg.AutoApprove {
+		t.Error("starter should default auto_approve=false (gates fire)")
+	}
+	if cfg.VerifyRuns != 3 {
+		t.Errorf("starter verify_runs = %d, want 3", cfg.VerifyRuns)
+	}
+	if len(cfg.ExtraLabels) == 0 {
+		t.Error("starter should have extra_labels populated for visibility")
+	}
+	// Hooks must include educational echo commands at the obvious entry
+	// points, not be entirely empty.
+	for _, k := range []string{HookBeforeTriage, HookAfterExecute, HookBeforePR, HookAfterPR, HookOnFailure} {
+		if len(cfg.Hooks[k]) == 0 {
+			t.Errorf("starter %s hook should have an example command, got empty", k)
+		}
+	}
+	// Description should mention the gates so the user knows what
+	// auto_approve toggles.
+	for _, want := range []string{"confirm_repo", "approve_plan", "auto_approve"} {
+		if !strings.Contains(cfg.Description, want) {
+			t.Errorf("starter description missing %q: %q", want, cfg.Description)
+		}
+	}
+}
+
 func TestBranchName(t *testing.T) {
 	cases := []struct{ prefix, key, want string }{
 		{"", "ENG-1", "goon/eng-1"},
@@ -174,5 +279,124 @@ func TestMerge_OverlaysOnlyNonZero(t *testing.T) {
 	}
 	if base.BranchPrefix != "goon/" {
 		t.Errorf("branch_prefix should remain default: %q", base.BranchPrefix)
+	}
+}
+
+// TestDefaultConfig_HasName guards the contract that DefaultConfig() always
+// produces a non-empty Name — startup code uses this name in stdout/log lines
+// to identify the active workflow.
+func TestDefaultConfig_HasName(t *testing.T) {
+	c := DefaultConfig()
+	if c.Name == "" {
+		t.Error("DefaultConfig().Name is empty; expected a non-empty default")
+	}
+	if c.Description == "" {
+		t.Error("DefaultConfig().Description is empty; expected a sensible default")
+	}
+}
+
+// TestLoadConfig_Name verifies a custom name in the JSON file is preserved
+// through merge() and surfaces on the loaded config — this is the value
+// printed at startup so the user knows which workflow is active.
+func TestLoadConfig_Name(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wf.json")
+	contents := `{
+	  "name": "my-eng-pipeline",
+	  "description": "custom pipeline for repo X",
+	  "branch_prefix": "goon/"
+	}`
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOON_WORKFLOW_FILE", path)
+	cfg, _, err := LoadConfig("")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.Name != "my-eng-pipeline" {
+		t.Errorf("Name: got %q want %q", cfg.Name, "my-eng-pipeline")
+	}
+	if cfg.Description != "custom pipeline for repo X" {
+		t.Errorf("Description: got %q", cfg.Description)
+	}
+}
+
+// TestMerge_NameOverridesDefault checks that a partial config's Name
+// replaces the default — without this, every workflow would silently
+// announce itself as "default" no matter what the JSON says.
+func TestMerge_NameOverridesDefault(t *testing.T) {
+	base := DefaultConfig()
+	if base.Name != "default" {
+		t.Fatalf("precondition: default name should be %q, got %q", "default", base.Name)
+	}
+	partial := WorkflowConfig{Name: "marketing-brief", Description: "campaign pipeline"}
+	merge(&base, partial)
+	if base.Name != "marketing-brief" {
+		t.Errorf("Name not overridden: %q", base.Name)
+	}
+	if base.Description != "campaign pipeline" {
+		t.Errorf("Description not overridden: %q", base.Description)
+	}
+}
+
+// TestAnnounce_PrintsName covers the user-visible startup banner. We call
+// Announce with no config file present and assert the default name appears
+// in the printed line — that's what `goon start` shows on its first line.
+func TestAnnounce_PrintsName(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("GOON_WORKFLOW_FILE", "")
+
+	var buf strings.Builder
+	cfg, src := Announce("", &buf)
+	if cfg.Name == "" {
+		t.Error("Announce returned empty Name")
+	}
+	if src != "" {
+		t.Errorf("expected no source for default config, got %q", src)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "workflow:") {
+		t.Errorf("banner missing 'workflow:' prefix: %q", out)
+	}
+	if !strings.Contains(out, cfg.Name) {
+		t.Errorf("banner missing name %q: %q", cfg.Name, out)
+	}
+}
+
+// TestAnnounce_PrintsCustomName: when a workflow JSON declares a name, that
+// is what shows up in the banner — not "default" — so an operator running
+// `goon start` against, say, the marketing pipeline sees that name.
+func TestAnnounce_PrintsCustomName(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "wf.json")
+	if err := os.WriteFile(path, []byte(`{
+	  "name": "marketing-brief",
+	  "description": "campaign pipeline",
+	  "stages": [{"name":"x","type":"llm","prompt":"hi"}]
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GOON_WORKFLOW_FILE", path)
+
+	var buf strings.Builder
+	cfg, src := Announce("", &buf)
+	if cfg.Name != "marketing-brief" {
+		t.Errorf("Name: got %q want %q", cfg.Name, "marketing-brief")
+	}
+	if src != path {
+		t.Errorf("source: got %q want %q", src, path)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "marketing-brief") {
+		t.Errorf("banner missing custom name: %q", out)
+	}
+	if !strings.Contains(out, "1 stage") {
+		t.Errorf("banner missing stage count: %q", out)
+	}
+	if !strings.Contains(out, "campaign pipeline") {
+		t.Errorf("banner missing description: %q", out)
 	}
 }

@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goon — Documentation</title>
+<style>
+  :root {
+    --bg: #0e1116; --bg-soft: #161b22; --bg-code: #0a0d12;
+    --fg: #d8dee4; --fg-soft: #8b949e; --fg-mute: #6a737d;
+    --accent: #58a6ff; --accent-soft: #1f6feb33;
+    --warn: #d29922; --err: #f85149; --ok: #3fb950;
+    --border: #30363d;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff; --bg-soft: #f6f8fa; --bg-code: #f6f8fa;
+      --fg: #1f2328; --fg-soft: #57606a; --fg-mute: #6e7781;
+      --accent: #0969da; --accent-soft: #ddf4ff;
+      --warn: #9a6700; --err: #cf222e; --ok: #1a7f37;
+      --border: #d0d7de;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15px; line-height: 1.6; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre, kbd { font-family: var(--mono); }
+  code { background: var(--bg-code); padding: 1px 5px; border-radius: 3px; font-size: 0.92em; border: 1px solid var(--border); }
+  pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; font-size: 0.92em; line-height: 1.5; }
+  pre code { background: transparent; border: none; padding: 0; font-size: 1em; }
+  kbd { background: var(--bg-soft); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; padding: 1px 5px; font-size: 0.85em; }
+  blockquote { margin: 0 0 16px; padding: 8px 14px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--fg); border-radius: 0 4px 4px 0; }
+  blockquote.warn { border-color: var(--warn); background: rgba(210, 153, 34, 0.12); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+  table { border-collapse: collapse; margin: 12px 0 20px; width: 100%; }
+  th, td { border-bottom: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
+  th { font-weight: 600; color: var(--fg-soft); font-size: 0.92em; text-transform: uppercase; letter-spacing: 0.04em; }
+  /* layout */
+  .wrap { display: flex; min-height: 100vh; }
+  nav.toc { width: 260px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 28px 20px; position: sticky; top: 0; align-self: flex-start; max-height: 100vh; overflow-y: auto; background: var(--bg-soft); }
+  nav.toc h1 { font-size: 1.4em; margin: 0 0 4px; letter-spacing: -0.02em; }
+  nav.toc h1 a { color: var(--fg); }
+  nav.toc .tag { font-size: 0.78em; color: var(--fg-mute); margin-bottom: 18px; }
+  nav.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: section; }
+  nav.toc ol li { counter-increment: section; margin: 4px 0; font-size: 0.93em; }
+  nav.toc ol li::before { content: counter(section) ". "; color: var(--fg-mute); }
+  nav.toc ol li a { color: var(--fg-soft); }
+  nav.toc ol li a:hover, nav.toc ol li a.active { color: var(--accent); text-decoration: none; }
+  nav.toc .back { display: inline-block; margin-top: 18px; font-size: 0.85em; color: var(--fg-mute); }
+  main { max-width: 860px; padding: 36px 48px 80px; flex: 1; }
+  section { margin-bottom: 48px; scroll-margin-top: 24px; }
+  section h2 { font-size: 1.65em; margin: 0 0 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); letter-spacing: -0.01em; }
+  section h2 .num { color: var(--fg-mute); margin-right: 8px; font-weight: 500; }
+  section h3 { font-size: 1.18em; margin: 28px 0 10px; }
+  section h4 { font-size: 1em; margin: 20px 0 6px; color: var(--fg-soft); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  section p { margin: 0 0 14px; }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78em; font-weight: 600; letter-spacing: 0.02em; }
+  .pill.ok { background: rgba(63,185,80,0.15); color: var(--ok); }
+  .pill.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
+  .pill.err { background: rgba(248,81,73,0.15); color: var(--err); }
+  .pill.acc { background: var(--accent-soft); color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 12px 0 20px; }
+  .card { border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; background: var(--bg-soft); }
+  .card h4 { margin-top: 0; }
+  .small { font-size: 0.92em; color: var(--fg-soft); }
+  details { margin: 8px 0; border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; background: var(--bg-soft); }
+  details summary { cursor: pointer; font-weight: 600; }
+  details[open] summary { margin-bottom: 8px; }
+  @media (max-width: 760px) {
+    .wrap { flex-direction: column; }
+    nav.toc { width: 100%; position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); }
+    main { padding: 24px 18px 60px; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="toc">
+  <h1><a href="/">goon</a></h1>
+  <div class="tag">documentation · v0.1</div>
+  <ol>
+    <li><a href="#what">What is goon</a></li>
+    <li><a href="#quickstart">Quick start</a></li>
+    <li><a href="#config">Configuration</a></li>
+    <li><a href="#commands">Commands</a></li>
+    <li><a href="#workflow">The autonomous workflow</a></li>
+    <li><a href="#approval">Approval gates</a></li>
+    <li><a href="#memory">Memory</a></li>
+    <li><a href="#telegram">Telegram bot</a></li>
+    <li><a href="#customize">Customize the pipeline</a></li>
+    <li><a href="#tools">Tools shipped</a></li>
+    <li><a href="#providers">LLM providers</a></li>
+    <li><a href="#safety">Safety model</a></li>
+    <li><a href="#troubleshoot">Troubleshooting</a></li>
+    <li><a href="#faq">FAQ</a></li>
+  </ol>
+  <a class="back" href="/">← back to dashboard</a>
+</nav>
+
+<main>
+
+<section id="what">
+  <h2><span class="num">1</span>What is goon</h2>
+  <p>
+    <strong>goon</strong> is an autonomous AI engineer in a single Go binary.
+    It can act as a one-shot CLI agent (you ask, it executes) or run as a
+    background daemon that polls a ticket board (Jira / GitHub Issues), plans
+    each ticket, asks you to approve, codes it, tests, verifies, updates its
+    own memory, and opens a PR.
+  </p>
+  <p>You can drive it from three places, all backed by the same memory store:</p>
+  <ul>
+    <li><strong>CLI</strong> — <code>goon "task"</code>, <code>goon start</code>, <code>goon train</code>, etc.</li>
+    <li><strong>Web UI</strong> — this page; the dashboard at <a href="/">/</a> mirrors every CLI command.</li>
+    <li><strong>Telegram bot</strong> — DM your bot to monitor, approve, review PRs, or chat with the model.</li>
+  </ul>
+  <h3>Why goon is different</h3>
+  <ul>
+    <li><strong>Single binary, zero deps.</strong> Go stdlib only. Drop the binary anywhere, run.</li>
+    <li><strong>Pluggable everything.</strong> LLM (OpenAI, Anthropic, Ollama, mock), board (Jira, GitHub), git host (GitHub, GitLab, Bitbucket).</li>
+    <li><strong>Safe by default.</strong> Strict-JSON tool contract, regex blocklist on every shell command, approval gates before code lands.</li>
+    <li><strong>Persistent memory.</strong> Markdown notes the agent reads and writes across runs.</li>
+  </ul>
+</section>
+
+<section id="quickstart">
+  <h2><span class="num">2</span>Quick start</h2>
+  <p>Pick the path that matches how you want to use goon. All paths share the same setup steps; only the env vars differ.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h4>Path A — Offline test</h4>
+      <p class="small">No keys, no network. See the agent loop work.</p>
+      <pre><code>GOON_LLM_PROVIDER=mock \
+GOON_MOCK_REPLIES='{"tool":"finish","args":{"message":"hello"}}' \
+goon "say hi"</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path B — One-shot CLI agent</h4>
+      <p class="small">Use goon as a personal assistant for ad-hoc tasks.</p>
+      <pre><code>goon config set GOON_LLM_PROVIDER openai
+goon config set OPENAI_API_KEY sk-...
+goon "tidy go.mod" --explain</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path C — Autonomous daemon</h4>
+      <p class="small">Polls a board, asks approval, files PRs.</p>
+      <pre><code>goon config set GOON_BOARD jira
+goon config set GOON_GIT_HOST github
+goon config set ATLASSIAN_BASE_URL https://acme.atlassian.net
+goon config set ATLASSIAN_EMAIL me@acme.com
+goon config set ATLASSIAN_API_TOKEN ...
+goon config set GITHUB_TOKEN ghp_...
+goon start --web=:8080</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path D — Telegram bot</h4>
+      <p class="small">Drive goon from your phone.</p>
+      <pre><code>goon config set TELEGRAM_BOT_TOKEN ...
+goon config set GOON_TELEGRAM_SECRET <random-phrase>
+goon start
+# DM /auth &lt;random-phrase&gt; to your bot</code></pre>
+    </div>
+  </div>
+
+  <h3>Verify your setup</h3>
+  <p><code>goon doctor</code> live-probes every configured provider. Anything red is missing creds — fix in <code>.env</code> and re-run.</p>
+  <pre><code>goon doctor</code></pre>
+</section>
+
+<section id="config">
+  <h2><span class="num">3</span>Configuration</h2>
+  <p>
+    All knobs are environment variables (or <code>.env</code>). The config file
+    lives at <code>~/.config/goon/.env</code>. Manage it with the
+    <code>config</code> subcommand:
+  </p>
+  <pre><code>goon config              # show all (secrets masked)
+goon config set KEY VAL  # KEY=VAL also works
+goon config get KEY
+goon config edit         # open in $EDITOR
+goon config path         # print the config file path</code></pre>
+  <p class="small">Values exported in your shell always win over the file. <code>goon config show</code> labels each row <code>[shell]</code>, <code>[config-file]</code>, <code>[default]</code>, or <code>[unset]</code>.</p>
+
+  <h3>Tier 1 — LLM provider <span class="pill acc">required</span></h3>
+  <table>
+    <tr><th>Provider</th><th>Switch</th><th>Required env vars</th></tr>
+    <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>OPENAI_API_KEY</code></td></tr>
+    <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>ANTHROPIC_API_KEY</code></td></tr>
+    <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td>just run <code>ollama serve</code> + <code>ollama pull llama3</code></td></tr>
+    <tr><td>Mock (offline)</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td><code>GOON_MOCK_REPLIES</code> (canned JSON)</td></tr>
+  </table>
+
+  <h3>Tier 2 — Autonomous daemon <span class="pill warn">required for goon start</span></h3>
+  <table>
+    <tr><th>Variable</th><th>Purpose</th></tr>
+    <tr><td><code>GOON_BOARD</code></td><td><code>jira</code> | <code>github</code> | <code>mock</code></td></tr>
+    <tr><td><code>GOON_GIT_HOST</code></td><td><code>github</code> | <code>gitlab</code> | <code>bitbucket</code> (optional — skips PR if unset)</td></tr>
+    <tr><td><code>GOON_AUTO_APPROVE</code></td><td><code>1</code> to skip the approval gates (fully unattended)</td></tr>
+    <tr><td><code>GOON_POLL_SECONDS</code></td><td>poll interval, default <code>300</code> (5 min)</td></tr>
+    <tr><td><code>GOON_VERIFY_RUNS</code></td><td>extra verify passes before PR, default <code>3</code></td></tr>
+    <tr><td><code>GOON_REPO_MAP</code></td><td>map board project to local clone, e.g. <code>ENG=/repos/eng,*=/repos/default</code></td></tr>
+  </table>
+
+  <h3>Atlassian (Jira board + Confluence tool)</h3>
+  <p class="small">Both products share an Atlassian Account. Set these three and Jira+Confluence both work; per-product overrides win when set.</p>
+  <pre><code>ATLASSIAN_BASE_URL=https://acme.atlassian.net
+ATLASSIAN_EMAIL=me@acme.com
+ATLASSIAN_API_TOKEN=...   # id.atlassian.com/manage-profile/security/api-tokens</code></pre>
+
+  <h3>GitHub (board + PR host)</h3>
+  <pre><code>GITHUB_TOKEN=ghp_...        # repo + issues + pull_requests scopes
+GITHUB_REPOS=owner/a,owner/b   # required when GOON_BOARD=github
+GITHUB_LABEL=                  # filter to issues with this label (optional)
+GITHUB_ASSIGNEE=@me            # default @me</code></pre>
+
+  <h3>Bitbucket Cloud (PR host)</h3>
+  <p class="small">Auth is SEPARATE from your Atlassian API token — generate an app password at <a href="https://bitbucket.org/account/settings/app-passwords" target="_blank" rel="noopener">bitbucket.org/account/settings/app-passwords</a>.</p>
+  <pre><code>BITBUCKET_USERNAME=me@acme.com
+BITBUCKET_APP_PASSWORD=...
+# OR a workspace/repo access token:
+BITBUCKET_TOKEN=...</code></pre>
+
+  <h3>Telegram bot</h3>
+  <pre><code>TELEGRAM_BOT_TOKEN=123:abc           # from @BotFather
+GOON_TELEGRAM_SECRET=long-phrase     # required for inbound bot
+TELEGRAM_CHAT_ID=                    # default chat for outbound notify
+GOON_REVIEW_REPOS=owner/a,owner/b    # default repos for /prs</code></pre>
+
+  <h3>Storage layout</h3>
+  <p class="small">Per-project state under <code>./storage/</code>. Each working directory gets self-contained state you can <code>.gitignore</code>.</p>
+  <pre><code>./storage/
+├── memory.json        passive runtime state
+├── memory/            active markdown notes (PINNED.md, …)
+├── logs/goon.log      rotated structured log
+└── goon.pid           present while daemon runs</code></pre>
+  <p class="small">Override the root with <code>GOON_STORAGE_DIR</code> to share state across repos.</p>
+</section>
+
+<section id="commands">
+  <h2><span class="num">4</span>Commands</h2>
+  <table>
+    <tr><th>Command</th><th>Purpose</th></tr>
+    <tr><td><code>goon "&lt;task&gt;"</code></td><td>One-shot agent run. Add <code>--explain</code> / <code>--run</code> / <code>--auto</code>.</td></tr>
+    <tr><td><code>goon start</code></td><td>Autonomous daemon. <code>--web=:8080</code> opens this UI; <code>--once</code> runs one cycle.</td></tr>
+    <tr><td><code>goon stop</code></td><td>Stop the running daemon.</td></tr>
+    <tr><td><code>goon status</code></td><td>Daemon + queue snapshot.</td></tr>
+    <tr><td><code>goon doctor</code></td><td>Live-probe every configured provider. Add <code>--json</code> for machine-readable.</td></tr>
+    <tr><td><code>goon train</code></td><td>Answer questions queued by the agent (interactive).</td></tr>
+    <tr><td><code>goon train answer &lt;id&gt; &lt;text&gt;</code></td><td>Non-interactive answer.</td></tr>
+    <tr><td><code>goon workflow show|init|edit|hooks</code></td><td>Customize the per-ticket pipeline.</td></tr>
+    <tr><td><code>goon memory list|read|write|append|search|edit|delete|path</code></td><td>Manage the markdown notes store.</td></tr>
+    <tr><td><code>goon logs --tail|--follow|--clear|--path</code></td><td>Browse the structured log file.</td></tr>
+    <tr><td><code>goon config show|get|set|unset|path|edit</code></td><td>Manage <code>~/.config/goon/.env</code>.</td></tr>
+    <tr><td><code>goon update [&lt;ref&gt;]</code></td><td>Rebuild from upstream. Requires <code>git</code> and <code>go</code> on PATH.</td></tr>
+    <tr><td><code>goon uninstall [--yes] [--purge]</code></td><td>Remove the binary; <code>--purge</code> wipes state too.</td></tr>
+  </table>
+
+  <h3>Modes (for one-shot agent runs)</h3>
+  <table>
+    <tr><th>Flag</th><th>Behavior</th></tr>
+    <tr><td>(none)</td><td><strong>dry-run</strong> — prints planned actions, never executes</td></tr>
+    <tr><td><code>--explain</code></td><td>plan only — produce a step-by-step explanation</td></tr>
+    <tr><td><code>--run</code></td><td>execute, ask <kbd>y</kbd>/<kbd>N</kbd> before each mutating step</td></tr>
+    <tr><td><code>--auto</code></td><td>execute every validated step automatically</td></tr>
+    <tr><td><code>--debug</code></td><td>extra diagnostic output</td></tr>
+  </table>
+</section>
+
+<section id="workflow">
+  <h2><span class="num">5</span>The autonomous workflow</h2>
+  <p>When <code>goon start</code> picks up a ticket from the board, it runs this resumable pipeline:</p>
+  <pre><code>1. Triage          LLM produces an ordered plan + suggested repo
+2. Confirm repo  ◀ gate: "Confirm repo for ENG-123? (yes / change=&lt;path&gt; / no)"
+3. Approve plan  ◀ gate: "Approve work + test plan?  (yes / no)"
+4. Execute         agent runs each plan step, safety-validated
+5. Test            best-effort `make test` (or repo-defined test command)
+6. Verify × N      LLM re-checks the work N times (default 3)
+7. Update memory   agent distils learnings into PINNED.md / topic notes
+8. Open PR         GitHub / GitLab / Bitbucket
+9. Notify          Telegram + board comment + status transition</code></pre>
+  <p>The pipeline is a <strong>resumable state machine</strong>. When a gate fires, the workflow queues a question and exits; the daemon picks the workflow up again on a later tick once you reply.</p>
+  <p>Set <code>GOON_AUTO_APPROVE=1</code> or <code>auto_approve: true</code> in <code>workflow.json</code> to skip the gates entirely for fully unattended runs.</p>
+</section>
+
+<section id="approval">
+  <h2><span class="num">6</span>Approval gates</h2>
+  <p>Two gates fire by default before any code lands:</p>
+  <h4>confirm_repo</h4>
+  <p>After triage, goon proposes a target repo and asks you to confirm. Reply with <code>yes</code> to accept, or <code>change=/path/to/repo</code> to override.</p>
+  <h4>approve_plan</h4>
+  <p>After repo confirmation, goon shows the numbered plan it produced and asks you to approve. Reply <code>yes</code> to proceed, <code>no</code> to abort.</p>
+  <h3>How to answer</h3>
+  <p>Three equivalent ways:</p>
+  <ul>
+    <li><strong>This web UI</strong> — pending questions appear on the dashboard. Click <em>Answer</em>.</li>
+    <li><strong>CLI</strong> — <code>goon train</code> walks you through pending questions, or <code>goon train answer &lt;id&gt; &lt;text&gt;</code> for non-interactive use.</li>
+    <li><strong>Telegram</strong> — <code>/queue</code> to see what's pending, <code>/answer &lt;id&gt; yes</code> to approve.</li>
+  </ul>
+  <blockquote class="warn">
+    Anything other than <code>yes</code> at <code>approve_plan</code> aborts the
+    workflow. The ticket is marked failed in <code>memory.json</code>; the
+    board comment + transition do not happen.
+  </blockquote>
+</section>
+
+<section id="memory">
+  <h2><span class="num">7</span>Memory</h2>
+  <p>goon has two memory layers that serve different jobs.</p>
+
+  <h3>Passive memory (<code>memory.json</code>)</h3>
+  <p class="small">Runtime state. Don't edit by hand — goon manages it.</p>
+  <p>Holds:</p>
+  <ul>
+    <li>Last 200 interactions and a per-command frequency counter</li>
+    <li>Tickets the daemon has seen</li>
+    <li>Workflow records (with state, stage, plan, approvals, PR URL)</li>
+    <li>The question queue (asked, answered, pending)</li>
+    <li>Daemon status snapshot</li>
+    <li>Authorized Telegram chat IDs</li>
+  </ul>
+
+  <h3>Active memory (markdown notes)</h3>
+  <p class="small">Plain <code>.md</code> files at <code>./storage/memory/</code>. The agent reads + writes them via tool calls. Knowledge survives across runs and any LLM provider can use them — they're just markdown.</p>
+  <pre><code>goon memory init               # creates the dir + seeds PINNED.md
+goon memory list               # * = auto-loaded
+goon memory edit PINNED.md
+goon memory read learnings/regex.md
+goon memory search "auth"      # case-insensitive grep</code></pre>
+  <h4>Five tools the agent gets automatically</h4>
+  <table>
+    <tr><th>Tool</th><th>Purpose</th></tr>
+    <tr><td><code>memory_list</code></td><td>enumerate every note</td></tr>
+    <tr><td><code>memory_read</code></td><td>fetch one note's contents</td></tr>
+    <tr><td><code>memory_write</code></td><td>create or REPLACE a note</td></tr>
+    <tr><td><code>memory_append</code></td><td>add to an existing note (preferred)</td></tr>
+    <tr><td><code>memory_search</code></td><td>case-insensitive substring scan</td></tr>
+  </table>
+  <h4>PINNED.md — the always-loaded note</h4>
+  <p>When <code>./storage/memory/PINNED.md</code> exists, its contents are injected into the agent's system prompt on every call. Use it for facts that should always be top-of-mind: codebase conventions, names of services/people, "don't do this" rules. Keep it short and high-signal.</p>
+</section>
+
+<section id="telegram">
+  <h2><span class="num">8</span>Telegram bot</h2>
+  <p>A bidirectional bot — sends notifications <em>and</em> lets you drive goon from your phone.</p>
+  <h3>Setup</h3>
+  <ol>
+    <li>Open Telegram, message <strong>@BotFather</strong>, send <code>/newbot</code>, copy the token.</li>
+    <li>Add to <code>.env</code>:
+      <pre><code>TELEGRAM_BOT_TOKEN=123456:abc-from-botfather
+GOON_TELEGRAM_SECRET=any-random-phrase-you-pick
+GOON_REVIEW_REPOS=owner/a,owner/b   # optional</code></pre>
+    </li>
+    <li>Restart goon: <code>goon stop && goon start</code></li>
+    <li>DM your bot: <code>/auth any-random-phrase-you-pick</code></li>
+  </ol>
+  <p>The bot publishes its full command list to Telegram's menu — tap the ☰ button next to the input bar after authentication.</p>
+  <h3>Commands</h3>
+  <table>
+    <tr><th>Group</th><th>Commands</th></tr>
+    <tr><td>monitor</td><td><code>/status</code> · <code>/logs [n]</code> · <code>/workflows [n]</code> · <code>/tickets [filter]</code> · <code>/ticket &lt;id&gt;</code> · <code>/memory list|read|search</code></td></tr>
+    <tr><td>queue</td><td><code>/queue</code> · <code>/answer &lt;id&gt; &lt;text&gt;</code></td></tr>
+    <tr><td>PR review</td><td><code>/prs [repo]</code> · <code>/review &lt;repo&gt; &lt;num&gt;</code> · <code>/approve</code> · <code>/decline</code> · <code>/comment</code></td></tr>
+    <tr><td>agent</td><td><code>/run &lt;task&gt;</code> · plain text → LLM chat (6-turn history)</td></tr>
+    <tr><td>session</td><td><code>/whoami</code> · <code>/logout</code> · <code>/help</code></td></tr>
+    <tr><td>passthrough</td><td>any other <code>/&lt;subcmd&gt;</code> shells out to <code>goon &lt;subcmd&gt;</code></td></tr>
+  </table>
+  <p class="small">Disallowed: <code>/start</code>, <code>/stop</code>, <code>/uninstall</code>, <code>/update</code>.</p>
+  <h3>Typical session</h3>
+  <pre><code>you →  /queue
+bot →  1 pending: [q-3] Approve work + test plan for ENG-42?
+you →  /answer q-3 yes
+bot →  ✓ answered q-3   (daemon resumes ENG-42 next poll)
+you →  /prs
+bot →  3 open PRs: …
+you →  /review owner/repo 17
+bot →  Review of #17 — Refactor auth …
+       SUMMARY / RISKS / NITS / RECOMMENDATION
+you →  /decline owner/repo 17 needs error handling on token refresh
+bot →  ✓ requested changes</code></pre>
+</section>
+
+<section id="customize">
+  <h2><span class="num">9</span>Customize the pipeline</h2>
+  <p>Drop a <code>workflow.json</code> in your repo root and goon picks it up on the next poll — no rebuild, no restart.</p>
+  <pre><code>goon workflow init     # writes a starter ./workflow.json
+goon workflow show     # prints the resolved config
+goon workflow edit     # open in $EDITOR
+goon workflow hooks    # list every hook name + env vars</code></pre>
+  <h3>Minimal example</h3>
+  <pre><code>{
+  "version": 1,
+  "name": "engineering-prod",
+  "branch_prefix": "feature/",
+  "test_command": "make ci",
+  "verify_runs": 5,
+  "auto_approve": false,
+  "pr_title_template": "FIX({{.Key}}): {{.Title}}",
+  "pr_body_template": "Resolves {{.Key}}\n\nBranch: {{.Branch}}",
+  "extra_labels": ["customer-x"],
+  "hooks": {
+    "before_execute": ["echo 'goon picked up {{.Key}}'"],
+    "before_test":    ["make build"],
+    "before_pr":      ["go fmt ./...", "goimports -w ."],
+    "on_failure":     ["echo \"goon failed on $TICKET_KEY\" | mail -s goon you@x"]
+  }
+}</code></pre>
+  <p>Hook commands run sequentially through <code>sh -c</code> in the repo dir, with ticket env vars exported (<code>$TICKET_KEY</code>, <code>$TICKET_URL</code>, <code>$REPO</code>, <code>$BRANCH</code>, etc.) and Go-template substitution inside the command itself. Failed hooks fail the workflow phase. <code>on_failure</code> is best-effort.</p>
+  <h3>Replace the pipeline (declarative stages)</h3>
+  <p>For non-engineering work — marketing, sales, ops — you can replace the built-in pipeline wholesale with a <code>stages</code> array:</p>
+  <pre><code>{
+  "version": 2,
+  "stages": [
+    {"name": "triage",  "type": "llm",   "json_mode": true,
+     "prompt": "Break {{.Key}} into 3-7 atomic steps. Reply JSON {\"steps\":[{\"title\":\"...\"}]}."},
+    {"name": "execute", "type": "agent",
+     "task": "Implement: {{(index (index .Stages.triage.steps 0) \"title\")}}"},
+    {"name": "verify",  "type": "agent", "repeat": 3,
+     "task": "Verify {{.Key}} is done. List defects via finish."}
+  ]
+}</code></pre>
+  <p>Stage types are <code>llm</code> or <code>agent</code>. Each stage's output is available to later stages via <code>{{.Stages.&lt;name&gt;.field}}</code>.</p>
+</section>
+
+<section id="tools">
+  <h2><span class="num">10</span>Tools shipped</h2>
+  <p>The agent picks tools by name from this manifest each turn:</p>
+  <table>
+    <tr><th>Tool</th><th>Purpose</th></tr>
+    <tr><td><code>run_command</code></td><td>shell command (safety-validated)</td></tr>
+    <tr><td><code>read_file</code></td><td>up to 64KB</td></tr>
+    <tr><td><code>list_dir</code></td><td>up to 100 entries</td></tr>
+    <tr><td><code>confluence</code></td><td>search/get pages (Atlassian Cloud)</td></tr>
+    <tr><td><code>telegram</code></td><td>send a message via Bot API</td></tr>
+    <tr><td><code>ask_user</code></td><td>queue a question for the user (daemon mode)</td></tr>
+    <tr><td><code>memory_*</code></td><td>five tools for the markdown notes store</td></tr>
+    <tr><td><code>finish</code></td><td>end the loop with a summary</td></tr>
+  </table>
+  <h3>The model contract</h3>
+  <p>The LLM must emit exactly one JSON object per turn:</p>
+  <pre><code>{
+  "tool": "run_command",
+  "args": { "command": "ls -la internal" },
+  "rationale": "list packages before reading"
+}</code></pre>
+  <p>Parse errors are fed back to the model so it self-corrects. Unknown tool names are rejected.</p>
+</section>
+
+<section id="providers">
+  <h2><span class="num">11</span>LLM providers</h2>
+  <table>
+    <tr><th>Provider</th><th>Switch</th><th>Default model</th></tr>
+    <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>gpt-4o-mini</code></td></tr>
+    <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>claude-sonnet-4-5</code></td></tr>
+    <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td><code>llama3</code></td></tr>
+    <tr><td>Mock</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td>(offline fixtures)</td></tr>
+  </table>
+  <p>For Ollama, install from <a href="https://ollama.com" target="_blank" rel="noopener">ollama.com</a>, then:</p>
+  <pre><code>ollama serve
+ollama pull qwen2.5-coder:7b      # or llama3 / mistral
+goon config set GOON_LLM_PROVIDER ollama
+goon config set OLLAMA_MODEL qwen2.5-coder:7b</code></pre>
+  <p>Internally goon posts to <code>http://localhost:11434/api/chat</code> with <code>format=json</code> so the model is forced into the strict-JSON tool-call contract.</p>
+</section>
+
+<section id="safety">
+  <h2><span class="num">12</span>Safety model</h2>
+  <p>Three layers — each independent, all must pass.</p>
+  <h4>1. The strict-JSON contract</h4>
+  <p>Every model output must parse as a <code>ToolCall</code>. Bad JSON is fed back as a parse error so the model self-corrects.</p>
+  <h4>2. The regex blocklist</h4>
+  <p><code>internal/safety</code> blocks the most dangerous patterns regardless of mode: <code>rm -rf /</code>, <code>rm -rf ~</code>, <code>mkfs.*</code>, <code>dd of=/dev/*</code>, fork bombs, <code>shutdown</code>/<code>reboot</code>/<code>halt</code>, <code>chmod -R 777 /</code>, <code>curl … | sh</code>. Hooks go through the same validator.</p>
+  <h4>3. Mode-aware execution</h4>
+  <p>In <code>--run</code> mode the executor asks <kbd>y</kbd>/<kbd>N</kbd> before any mutating tool call. Default mode is dry-run — prints what would happen, never executes.</p>
+  <h4>4. Approval gates</h4>
+  <p>In daemon mode, no code lands without <code>confirm_repo</code> + <code>approve_plan</code> approval (unless you set <code>GOON_AUTO_APPROVE=1</code>).</p>
+</section>
+
+<section id="troubleshoot">
+  <h2><span class="num">13</span>Troubleshooting</h2>
+
+  <details>
+    <summary>"goon doctor" all green but the daemon never opens a PR</summary>
+    <p>Check that <code>GOON_GIT_HOST</code> is set. <code>doctor</code> reports "skipped" (not red) when it's missing. Set the var, supply matching auth (e.g. <code>GITHUB_TOKEN</code>), restart.</p>
+  </details>
+
+  <details>
+    <summary>"goon start" prints "waiting for config" forever</summary>
+    <p>The daemon needs <code>GOON_LLM_PROVIDER</code> AND <code>GOON_BOARD</code> at minimum. Run <code>goon doctor</code>; anything red is missing creds.</p>
+  </details>
+
+  <details>
+    <summary>The daemon stops at "awaiting approval" and never resumes</summary>
+    <p>That's a gate firing. Answer the question via this web UI's queue panel, or <code>goon train</code>, or your Telegram bot's <code>/answer</code>. The daemon resumes on the next poll cycle (default 5 min — set <code>GOON_POLL_SECONDS=30</code> for faster feedback during testing).</p>
+  </details>
+
+  <details>
+    <summary>Telegram bot says "PR review unavailable" or "not yet implemented"</summary>
+    <p>The first means <code>GOON_GIT_HOST</code> isn't set. The second means the configured host's adapter doesn't support review yet — currently only <strong>github</strong> and <strong>bitbucket</strong> do; gitlab is read-only.</p>
+  </details>
+
+  <details>
+    <summary>Telegram bot accepts /auth but no commands appear in the menu</summary>
+    <p>Telegram caches the menu briefly per client. Close and reopen the chat. The bot logs <code>→ telegram bot: 16 commands registered in menu</code> at startup if registration succeeded.</p>
+  </details>
+
+  <details>
+    <summary>"goon train" shows no questions but the workflow paused</summary>
+    <p><code>goon train --all</code> shows answered + pending; <code>goon train</code> only shows pending. If both are empty, the workflow may have failed before queueing — check <code>goon logs --tail=50</code>.</p>
+  </details>
+
+  <details>
+    <summary>Want faster feedback during testing</summary>
+    <pre><code>GOON_POLL_SECONDS=15 GOON_VERIFY_RUNS=1 GOON_AUTO_APPROVE=1 goon start</code></pre>
+    <p>Tight poll interval, single verify pass, no approval gates. Don't ship like this.</p>
+  </details>
+
+  <details>
+    <summary>How to wipe everything and start fresh</summary>
+    <pre><code>goon stop
+rm -rf ./storage          # clears state for THIS project only
+# OR for global clean:
+rm -rf ~/.config/goon
+goon uninstall --yes --purge   # also removes the binary</code></pre>
+  </details>
+</section>
+
+<section id="faq">
+  <h2><span class="num">14</span>FAQ</h2>
+
+  <h4>Does goon work on Windows?</h4>
+  <p>Yes — both CLI one-shot mode and daemon mode are supported on Windows alongside Linux and macOS. Workflow hooks and <code>run_command</code> use <code>cmd /C</code> on Windows and <code>sh -c</code> on POSIX, so cross-platform hook scripts should either stick to commands both shells understand or branch on the platform inside the hook. The same multi-process <code>memory.json</code> caveat applies on every OS: a sibling lockfile coordinates writes, and on filesystems that don't support atomic file creation reliably (some network mounts) you may see a "lockfile held by another process" warning. WSL also works fine if you prefer a POSIX environment.</p>
+
+  <h4>Can I run goon without an LLM API key?</h4>
+  <p>Yes — use Ollama for local models, or the <code>mock</code> provider for offline testing. Both are zero-cost.</p>
+
+  <h4>How does goon decide which repo to work on?</h4>
+  <p>By <code>GOON_REPO_MAP</code> (mapping board project keys to local paths) or by the ticket's project field. The <code>confirm_repo</code> gate gives you a chance to override before any code is written.</p>
+
+  <h4>What does goon write to memory.json that I should know about?</h4>
+  <p>Tickets seen, workflow records (state + plan + approvals + PR URL), the question queue, daemon status snapshot, and authorized Telegram chat IDs. No source code, no secrets — secrets stay in <code>.env</code>, never in <code>memory.json</code>.</p>
+
+  <h4>Can I share state across projects?</h4>
+  <p>Yes — set <code>GOON_STORAGE_DIR=~/.goon-state</code> to a shared path. Default is per-project (<code>./storage/</code>) so each repo gets clean state.</p>
+
+  <h4>What if the LLM hallucinates a tool call?</h4>
+  <p>It's rejected (the agent loop validates against the registered tool list and feeds the error back). After max steps without a valid call, the agent surrenders with a "max steps reached" message rather than executing anything random.</p>
+
+  <h4>How do I add a new tool?</h4>
+  <p>Implement <code>tools.Tool</code> and register in <code>DefaultRegistry</code>. The model picks it up automatically through the manifest line in the system prompt.</p>
+
+  <h4>How do I add a new LLM provider?</h4>
+  <p>Implement <code>llm.Provider</code> and route in <code>llm.NewFromEnv</code>. The agent loop is provider-agnostic.</p>
+
+  <h4>How do I add a new git host (e.g. Gitea)?</h4>
+  <p>Implement <code>githost.Host</code> and route in <code>githost.NewFromEnv</code>. To enable PR review via the Telegram bot, also implement the <code>githost.PRReviewer</code> companion interface.</p>
+</section>
+
+<hr>
+<p class="small">Documentation embedded in the goon binary · for the latest source, see <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">github.com/harisaginting/goon</a></p>
+
+</main>
+
+</div>
+</body>
+</html>

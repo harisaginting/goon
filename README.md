@@ -1,226 +1,464 @@
 # goon — Go ON
 
-An autonomous AI engineer in a single Go binary. Polls your ticket board
-(Jira or GitHub Issues), triages each ticket, plans, executes, verifies its
-own work N times, opens a PR (GitHub, GitLab, or Bitbucket), and pings you
-on Telegram.
-Same memory backs the CLI and the htmx-driven web UI, so everything you can
-see in one is reflected in the other.
+**Autonomous AI engineer in a single Go binary.** Polls your ticket board
+(Jira / GitHub Issues), plans the work, asks you to approve, codes it,
+tests, verifies, updates its own memory, and opens a PR. Driveable from
+the terminal, the web UI, or Telegram.
 
-Pluggable LLM providers (OpenAI, Anthropic, Ollama for local models, mock for
-tests). Strict-JSON tool-call contract. Layered safety checks. Persistent
-memory at `~/.goon/memory.json`.
-
-## The autonomous mode
-
-```sh
-goon config set GOON_LLM_PROVIDER ollama
-goon config set GOON_BOARD jira
-goon config set GOON_GIT_HOST github
-goon config set ATLASSIAN_BASE_URL https://acme.atlassian.net   # covers Jira + Confluence
-# (set the rest via 'goon config' or ~/.config/goon/.env)
-
-goon start --web=:8080            # starts the daemon + web UI
-# leave it running. open http://localhost:8080 in a browser.
-```
-
-What happens, every `GOON_POLL_SECONDS` (default 5 minutes):
+- **Single binary, zero dependencies.** Go stdlib only — no PyTorch, no
+  Node, no daemon-of-daemons. Drop the binary on any machine, run.
+- **Pluggable everything.** LLM provider (OpenAI, Anthropic, Ollama,
+  mock), board (Jira, GitHub Issues), git host (GitHub, GitLab,
+  Bitbucket), notification (Telegram).
+- **Safe by default.** Strict-JSON tool contract, regex blocklist on
+  every shell command, approval gates before code lands.
+- **Persistent memory.** Markdown notes the agent reads and writes
+  across runs, so the next ticket starts smarter than the last.
 
 ```
-Board   ──► Triage ──► Plan ──► Execute ──► Test ──► Verify×N ──► PR ──► Notify
-(Jira/GH)   (LLM)     (LLM)    (agent)    (make)    (LLM)       (GH/GL) (Telegram)
-                                  │
-                                  └─► may call ask_user → queue question
-                                       (workflow blocks; you answer via
-                                        `goon train` or the web UI; daemon
-                                        resumes on the next poll)
+                 ┌─────────────── you ───────────────┐
+                 │  approve / decline / review / chat │
+                 └─────────┬──────────────────┬───────┘
+                       CLI │ web UI           │ Telegram bot
+                           ▼                  ▼
+   board ──► triage ──► confirm_repo ──► approve_plan ──► execute ──►
+   (Jira/GH)  (LLM)        (gate)            (gate)        (agent)
+                                                             │
+            ◄── notify ◄── PR ◄── update_memory ◄── verify ◄──┘
+                (Telegram)  (GitHub/GitLab/Bitbucket)  (LLM × N)
 ```
 
-Everything (status, tickets, workflows, plan progress, pending questions,
-PR links, history) lives in one JSON file at `~/.goon/memory.json` so the
-CLI (`goon status`, `goon train`) and the web UI agree on every byte.
+---
 
-## Subcommands
+## Pick your setup
 
-```
-goon "<task>" [--run|--auto|--explain]   # one-shot agent run
-goon start [--web=:8080] [--once]        # autonomous daemon
-goon stop                                # stop the running daemon
-goon status                              # daemon + queue snapshot
-goon train [--list|--all]                # answer questions queued by the agent
-goon train answer <id> <answer>          # non-interactive form
-goon doctor [--json] [--quiet]           # live probe every configured provider
-goon workflow <action>                   # customize the per-ticket workflow (hooks, templates, …)
-goon logs [--tail|--follow|--clear|--path] # browse the structured log file
-goon config <action> [args]              # show/get/set/unset/path/edit ~/.config/goon/.env
-goon update [<ref>]                      # rebuild from upstream
-goon uninstall [--yes] [--purge]         # remove the binary and (optional) state
-```
+| You want… | What to read |
+|---|---|
+| **Try goon in 60 seconds** with no API keys | [Run offline with the mock provider](#run-offline-no-keys) |
+| **Use goon as a CLI assistant** for one-off tasks | [One-shot agent quick start](#one-shot-agent-quick-start) |
+| **Run the autonomous daemon** that picks up tickets and files PRs | [Daemon quick start](#daemon-quick-start) |
+| **Drive goon from Telegram** (review PRs, approve plans, chat) | [Telegram bot setup](#the-telegram-bot) |
 
-A Go CLI that turns natural-language tasks into structured tool calls and
-executes them safely. Strict JSON contract from the model, layered safety
-checks, multi-step agent loop, persistent memory, and pluggable LLM
-providers (OpenAI, Anthropic, Ollama for local models, mock for tests).
+All paths share the same setup steps. Pick the highest one that fits.
+
+---
 
 ## Quick start
+
+**Prereqs:** Go 1.21+, that's it.
+
+**Supported platforms.** Linux, macOS, and Windows. CLI one-shot mode and
+daemon mode both work on all three. The same memory.json multi-process
+lock-file caveat applies everywhere — concurrent goon processes against
+the same `./storage/` directory serialize through a sibling lockfile, and
+on filesystems that don't support atomic file creation reliably (some
+network mounts) you may see a "lockfile held by another process" warning.
+Workflow hooks and `run_command` invoke the host shell (`sh -c` on POSIX,
+`cmd /C` on Windows), so portable hooks should stick to commands both
+shells understand or branch on platform inside the hook itself.
+
+### 1. Build
 
 ```sh
 git clone https://github.com/harisaginting/goon
 cd goon
-cp .env.example .env       # then edit: set OPENAI_API_KEY (or ANTHROPIC_API_KEY)
-make build                 # produces ./goon
-./goon "summarize the .go files in internal/" --explain
+make build                       # → ./goon
+cp .env.example .env             # then edit .env with your keys
 ```
 
-**Want to try it without any keys?** Use the mock provider for an offline
-smoke test (it returns a canned reply, so the agent loop runs end-to-end):
+`.env.example` is tiered — fill in only the sections you need. Required
+vs optional is called out at the top of every section.
+
+### 2. Verify your config
+
+```sh
+./goon doctor                    # live-probes every configured provider
+```
+
+You should see green checks for the LLM provider and any board/host
+you set up. Anything red is missing creds — fix in `.env` and re-run.
+
+---
+
+### Run offline (no keys)
+
+Just to see the agent loop work end-to-end:
 
 ```sh
 GOON_LLM_PROVIDER=mock \
 GOON_MOCK_REPLIES='{"tool":"finish","args":{"message":"hello from mock"}}' \
-go run . "say hi"
+./goon "say hi"
 ```
 
-## Run on the fly (no install)
+The mock provider returns canned replies, so the agent loop runs without
+hitting any network.
 
-`goon` has zero external dependencies, so if you have Go 1.21+ you can
-just run it from a checkout — no `make build`, no copying anything onto
-`PATH`, no `go mod download`. Same flags, same subcommands:
+### One-shot agent quick start
+
+Minimum `.env`:
 
 ```sh
-# from inside the repo
-go run . "list every .go file under internal"     # one-shot agent run
-go run . "tidy go.mod" --auto                     # ditto, no prompt
-go run . start --web=:8080                        # autonomous daemon
-go run . doctor                                   # health probe
-go run . workflow init                            # any subcommand
-go run . logs --follow                            # tail the log
+GOON_LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...
 ```
 
-`go run main.go "..."` works too — it's the same thing because `main.go`
-is the only file in the root package.
-
-> **Don't** prefix with `goon` when using `go run .` — `go run .` IS already
-> goon, so `go run . goon workflow init` would mean "ask the agent to do
-> workflow init" rather than running the subcommand. (Goon catches this
-> common mistake and strips the redundant prefix with a hint, but the
-> cleaner form is just `go run . workflow init`.)
-
-There are Makefile shortcuts so you don't have to remember the flags:
+Then:
 
 ```sh
-make run         TASK='list every .go file under internal'   # dry-run
-make run-auto    TASK='tidy go.mod'                           # validated, no prompt
-make run-explain TASK='delete every .log older than 30 days'  # plan only
+./goon "list every .go file under internal/" --explain   # plan only
+./goon "tidy go.mod" --auto                              # run, no prompts
+./goon "find all .log files under /tmp and delete them" --run   # ask y/N each step
 ```
 
-You can also run it from anywhere on disk without cloning, by pointing
-`go run` at the upstream module. Go fetches, compiles, and executes in
-one step:
+See [Modes](#modes) for the difference between `--explain`, `--run`,
+and `--auto`. By default goon does a **dry run** — prints what it would
+do but never executes.
+
+### Daemon quick start
+
+Add a board and a git host to your `.env`:
+
+```sh
+# Atlassian (Jira board + Confluence wiki) — three lines cover both products
+ATLASSIAN_BASE_URL=https://acme.atlassian.net
+ATLASSIAN_EMAIL=me@acme.com
+ATLASSIAN_API_TOKEN=...
+
+# Tell goon to use them
+GOON_BOARD=jira
+GOON_GIT_HOST=bitbucket          # or github / gitlab
+
+# Bitbucket has separate auth — generate at bitbucket.org/account/settings/app-passwords
+BITBUCKET_USERNAME=me@acme.com
+BITBUCKET_APP_PASSWORD=...
+```
+
+Then:
+
+```sh
+./goon start --web=:8080         # daemon + web UI
+# open http://localhost:8080 to watch tickets stream through
+```
+
+The daemon now polls Jira every 5 minutes, picks the most-recently-updated
+open ticket assigned to you, and runs it through the
+[approval-gated pipeline](#how-a-ticket-flows). When a gate fires you'll
+see it in the web UI under "pending questions" — answer there, in
+Telegram, or with `goon train`.
+
+---
+
+## How a ticket flows
+
+When the daemon picks up a ticket it runs this resumable pipeline. The
+two **gates** pause the workflow until you reply (via `goon train`, the
+web UI, or Telegram); the daemon then resumes from that exact stage on
+the next tick.
+
+```
+1. Pull ticket          board.List → most-recently-updated open ticket
+2. Triage               LLM produces an ordered plan + suggested repo
+3. Confirm repo  ◀─gate "Confirm repo for ENG-123? (yes / change=<path>)"
+4. Approve plan  ◀─gate "Approve work + test plan?  (yes / no)"
+5. Execute              agent runs each plan step, safety-validated
+6. Test                 best-effort `make test` (or repo-defined)
+7. Verify × N           LLM re-checks the work N times
+8. Update memory        agent distils learnings into PINNED.md / notes
+9. Open PR              GitHub / GitLab / Bitbucket
+10. Notify              Telegram + board comment + status transition
+```
+
+Want it fully unattended? Set `auto_approve: true` in `workflow.json`
+or `GOON_AUTO_APPROVE=1` and the gates pass automatically.
+
+---
+
+## Install (run `goon` from anywhere)
+
+```sh
+make install               # → ~/.local/bin/goon (no sudo)
+make install-system        # → /usr/local/bin/goon (needs sudo)
+make install-go            # → $(go env GOPATH)/bin/goon
+```
+
+If `~/.local/bin` isn't on your `PATH`, the install command prints the
+exact line to add. Or run it directly without installing:
 
 ```sh
 go run github.com/harisaginting/goon@latest "summarize the .go files in internal/" --explain
-go run github.com/harisaginting/goon@v0.1.0  "tidy go.mod" --auto
-go run github.com/harisaginting/goon@main    "list .log files older than 30 days"
 ```
 
-The first remote run takes a few seconds while Go downloads and compiles.
-Every run after that is cached, so it's near-instant. Configuration still
-lives in `~/.config/goon/.env` and state in `~/.goon/` — both shared with
-the installed binary.
-
-> Want a shorter command? Add a shell alias:
-> `alias goon='go run github.com/harisaginting/goon@latest'`
-
-## Install (so you can run `goon` from anywhere)
-
-Pick whichever fits your machine — none of them touch your Go module cache,
-they just copy the built binary somewhere on `PATH`.
+To remove:
 
 ```sh
-make install               # default: copies to ~/.local/bin/goon (no sudo)
-make install-system        # /usr/local/bin/goon (needs sudo on most systems)
-make install-go            # $(go env GOPATH)/bin/goon via `go install`
+goon uninstall              # confirms first, leaves data
+goon uninstall --yes --purge   # also wipe ~/.config/goon and ~/.goon
 ```
 
-If `~/.local/bin` is not yet on your `PATH`, the install command prints the
-exact line to add to your shell rc. Quickest:
+---
+
+## Configure
+
+All knobs are environment variables (or `.env`). The config file lives at
+`~/.config/goon/.env`. Manage it with the `config` subcommand:
 
 ```sh
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc   # or ~/.bashrc
-exec $SHELL                                                # reload
-goon --version                                             # → goon 0.1.0
-goon "tell my Telegram bot we shipped" --auto
+goon config              # show all (secrets masked)
+goon config set KEY VAL  # KEY=VAL also works
+goon config get KEY
+goon config edit         # open in $EDITOR
+goon config path         # print the config file path
 ```
 
-To remove it later, either ask `goon` to remove itself:
+Shell-exported values always win over the file. `goon doctor` live-probes
+every configured provider so you can verify auth before kicking off the
+daemon.
+
+### Required for autonomous mode
+
+| variable | purpose |
+|---|---|
+| `GOON_LLM_PROVIDER` | `openai` \| `anthropic` \| `ollama` \| `mock` |
+| `GOON_BOARD`        | `jira` \| `github` |
+| `GOON_GIT_HOST`     | `github` \| `gitlab` \| `bitbucket` *(optional — skip PR creation if unset)* |
+
+### LLM providers
 
 ```sh
-goon uninstall              # confirms first, leaves data alone
-goon uninstall --yes        # skip the confirmation
-goon uninstall --yes --purge  # also wipe ~/.goon and ~/.config/goon
+# OpenAI
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini                # default
+
+# Anthropic
+ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL=claude-sonnet-4-5       # default
+
+# Ollama (local)
+OLLAMA_BASE_URL=http://localhost:11434  # default
+OLLAMA_MODEL=llama3                     # default — change to qwen2.5-coder:7b for code work
 ```
 
-…or use the Makefile (no source repo? just delete `$(command -v goon)`):
+### Atlassian (Jira + Confluence share creds)
 
 ```sh
-make uninstall             # removes ~/.local/bin/goon
-make uninstall-system      # removes /usr/local/bin/goon (needs sudo)
-make uninstall-go          # removes $GOPATH/bin/goon
+ATLASSIAN_BASE_URL=https://acme.atlassian.net
+ATLASSIAN_EMAIL=me@acme.com
+ATLASSIAN_API_TOKEN=...   # id.atlassian.com/manage-profile/security/api-tokens
 ```
 
-### `.env` lookup once installed
+`JIRA_*` / `CONFLUENCE_*` per-product overrides win when set — useful
+for self-hosted Data Center where Jira and Confluence live on different
+hosts.
 
-`goon` reads `.env` from the **current working directory**, so once it's on
-your PATH you can either:
-
-- keep your `.env` in the project you're working in, or
-- export the variables in your shell rc (`OPENAI_API_KEY`, `TELEGRAM_BOT_TOKEN`, …),
-- or move the file to `~/.config/goon/.env` and `cd` there before running.
-
-## Customizing the workflow
-
-Every phase of the autonomous pipeline is hookable. Drop a `workflow.json`
-into one of the standard locations and goon will pick it up — no rebuild,
-no restart needed (the daemon's poll loop reloads on every tick).
+### GitHub Issues + PRs
 
 ```sh
-goon workflow init       # writes a starter ~/.config/goon/workflow.json
-goon workflow show       # prints the resolved config (defaults + overrides)
-goon workflow path       # prints where it's looking
-goon workflow edit       # opens it in $EDITOR
-goon workflow hooks      # lists every supported hook name + env vars
+GITHUB_TOKEN=ghp_...        # repo + issues + pull_requests scopes
+GITHUB_REPOS=owner/a,owner/b   # required when GOON_BOARD=github
+GITHUB_LABEL=                  # filter to issues with this label (optional)
+GITHUB_ASSIGNEE=@me            # default @me
+GITHUB_API_URL=                # default https://api.github.com (set for GHES)
 ```
 
-Resolution order (first match wins):
+### Telegram bot
+
+```sh
+TELEGRAM_BOT_TOKEN=123:abc        # from @BotFather
+GOON_TELEGRAM_SECRET=long-phrase  # required for inbound bot (see below)
+TELEGRAM_CHAT_ID=987654321        # optional default chat for outbound notify
+GOON_REVIEW_REPOS=owner/a,owner/b # default repos for /prs without args
+```
+
+### Storage knobs (project-local by default)
+
+```sh
+GOON_STORAGE_DIR=./storage   # everything below derives from this
+GOON_LOG_FILE=               # default: $STORAGE/logs/goon.log
+GOON_MEMORY_PATH=            # default: $STORAGE/memory.json
+GOON_MEMORY_DIR=             # default: $STORAGE/memory
+GOON_PID_FILE=               # default: $STORAGE/goon.pid
+GOON_WORKFLOW_FILE=          # default: ./workflow.json
+```
+
+`cd ~/myproject && goon start` gets its own `myproject/storage/` —
+override `GOON_STORAGE_DIR` to share across repos.
+
+### Pipeline knobs
+
+```sh
+GOON_AUTO_APPROVE=1     # skip the confirm_repo + approve_plan gates
+GOON_VERIFY_RUNS=3      # extra verify passes after execute (1..10)
+GOON_MAX_STEPS=5        # agent loop bound (1..50)
+GOON_POLL_SECONDS=300   # daemon poll interval
+GOON_REPO_MAP="ENG=/repos/eng,WEB=/repos/web,*=/repos/default"
+```
+
+---
+
+## The Telegram bot
+
+A bidirectional bot — sends notifications **and** lets you drive goon
+from your phone with `/status`, `/run`, `/prs`, `/review`, plus free-text
+chat with the model.
+
+### Setup (3 steps)
+
+**1. Create a bot.** Open Telegram, search `@BotFather`, send `/newbot`,
+follow the prompts. Copy the **HTTP API token** it gives you.
+
+**2. Add to `.env`:**
+
+```sh
+TELEGRAM_BOT_TOKEN=123456:abcdefg-from-botfather
+GOON_TELEGRAM_SECRET=any-long-random-phrase-you-pick
+
+# Optional: default repos when you type /prs with no arguments
+GOON_REVIEW_REPOS=harisaginting/goon,you/other-repo
+
+# Optional: default chat for outbound notifications (workflow done, etc.)
+TELEGRAM_CHAT_ID=987654321
+```
+
+**3. Restart goon:**
+
+```sh
+goon stop && goon start
+# you'll see: → telegram bot ready: @your_bot_name
+#             → telegram bot: 16 commands registered in menu
+```
+
+### First DM
+
+Open a chat with your bot in Telegram. Tap the ☰ menu next to the input
+bar — you'll see all commands. Then authenticate once:
+
+```
+/auth any-long-random-phrase-you-pick
+```
+
+The bot constant-time compares against `GOON_TELEGRAM_SECRET`. After
+that, your chat ID is trusted until you `/logout` or wipe
+`storage/memory.json`.
+
+**Commands.**
+
+```
+monitor:    /status               daemon snapshot
+            /logs [n]             last n log lines (default 30)
+            /workflows [n]        recent workflow runs
+            /memory list          notes index
+            /memory read <name>
+            /memory search <q>
+            /queue                pending questions
+
+approvals:  /answer <id> <text>   answers the gate question
+
+PR review:  /prs [repo]           list open PRs
+            /review <repo> <num>  ask the model to review the diff
+            /approve <repo> <num> [body]
+            /decline <repo> <num> <reason>
+            /comment <repo> <num> <body>
+
+agent:      /run <task>           one-shot agent task (like CLI)
+            (any plain text)      chat with the model — 6-turn rolling history
+
+session:    /whoami /logout /help
+
+passthrough: /<any-other> → goon CLI subcommand
+            (start / stop / uninstall / update are blocked)
+```
+
+**Typical session over Telegram:**
+
+```
+you →  /auth my-shared-secret
+bot →  ✓ authenticated
+you →  /queue
+bot →  1 pending question: [q-3] Approve work + test plan for ENG-42?
+you →  /answer q-3 yes
+bot →  ✓ answered q-3
+       (next poll, the daemon resumes ENG-42 from approve_plan)
+you →  /prs
+bot →  3 open PRs: …
+you →  /review owner/repo 17
+bot →  Review of #17 — Refactor auth …
+       SUMMARY: …
+       RISKS:   …
+       NITS:    …
+       RECOMMENDATION: request_changes
+you →  /decline owner/repo 17 needs error-handling on token refresh
+bot →  ✓ requested changes on owner/repo#17
+```
+
+---
+
+## Daily commands
+
+```sh
+goon "<task>" [--run|--auto|--explain]   # one-shot agent run
+goon start [--web=:8080] [--once]        # autonomous daemon
+goon stop                                # stop the running daemon
+goon status                              # daemon + queue snapshot
+goon doctor [--json] [--quiet]           # live-probe every provider
+goon train                               # answer questions queued by the agent
+goon train answer <id> <answer>          # non-interactive
+goon workflow init|show|path|edit|hooks  # customize the pipeline
+goon memory init|list|read|write|append|search|edit|delete|path  # active markdown notes
+goon logs [--tail|--follow|--clear]      # browse the structured log
+goon config show|get|set|unset|path|edit # ~/.config/goon/.env
+goon update [<ref>]                      # rebuild from upstream
+goon uninstall [--yes] [--purge]
+```
+
+### Modes
+
+| flag | behavior |
+|---|---|
+| (none) | **dry-run** — print the planned action, never execute |
+| `--run` | execute, ask `y/N` before each mutating step |
+| `--auto` | execute every validated step automatically |
+| `--explain` | plan only — produce a step-by-step explanation, no tool calls |
+| `--debug` | extra diagnostic output |
+
+---
+
+## Customize the workflow
+
+Drop a `workflow.json` in your repo root and goon picks it up on the
+next poll — no rebuild, no restart.
+
+```sh
+goon workflow init    # writes a starter ./workflow.json
+goon workflow show    # prints the resolved config
+goon workflow edit    # open in $EDITOR
+goon workflow hooks   # list every hook name + env vars
+```
+
+Lookup order (first match wins):
 
 1. `$GOON_WORKFLOW_FILE`
-2. `<repo>/.goon/workflow.json` (per-repo override)
-3. `./.goon/workflow.json` (current dir)
-4. `$XDG_CONFIG_HOME/goon/workflow.json`
-5. `~/.config/goon/workflow.json`
-6. `~/.goon/workflow.json`
+2. `./workflow.json` *(repo root — recommended)*
+3. `<repo>/workflow.json`, `<repo>/.goon/workflow.json` *(legacy)*
+4. `~/.config/goon/workflow.json`
 
-### `workflow.json` shape
+### Minimal example
 
 ```jsonc
 {
   "version": 1,
+  "name": "engineering-prod",
+  "description": "PR-opening pipeline for the prod monorepo",
   "branch_prefix": "feature/",
   "test_command": "make ci",
   "verify_runs": 5,
+  "auto_approve": false,                  // false = the two gates fire (default)
   "pr_title_template": "FIX({{.Key}}): {{.Title}}",
   "pr_body_template":  "Resolves {{.Key}}\n\nBranch: {{.Branch}}",
-  "extra_labels":      ["customer-x", "needs-review"],
+  "extra_labels":      ["customer-x"],
   "hooks": {
-    "before_triage":  [],
-    "before_execute": ["echo 'goon picked up {{.Key}} — {{.Title}}'"],
-    "after_execute":  [],
+    "before_execute": ["echo 'goon picked up {{.Key}}'"],
     "before_test":    ["make build"],
-    "after_test":     [],
-    "before_verify":  [],
-    "after_verify":   [],
-    "before_pr":      ["go fmt ./...", "goimports -w .", "git diff --stat"],
+    "before_pr":      ["go fmt ./...", "goimports -w ."],
     "after_pr":       ["echo 'PR up at $TICKET_URL'"],
     "on_failure":     ["echo \"goon failed on $TICKET_KEY\" | mail -s goon you@x"]
   }
@@ -229,321 +467,112 @@ Resolution order (first match wins):
 
 ### Hook commands
 
-Every hook value is a list of shell commands. They run sequentially through
-`sh -c`, in the **repo directory** (when a repo is resolved via
-`GOON_REPO_MAP`), and are piped through goon's safety validator — so an
-accidental `rm -rf /` is still blocked.
+Every hook value is a list of shell commands run sequentially through
+`sh -c` in the resolved repo directory, piped through goon's safety
+validator. Each command receives `$TICKET_KEY`, `$TICKET_TITLE`,
+`$TICKET_URL`, `$TICKET_SOURCE`, `$TICKET_PROJECT`, `$REPO`, `$BRANCH`
+as env vars, plus full Go template substitution inside the command
+itself (`{{.Key}}`, `{{.Branch}}`, etc.).
 
-Each command receives these env vars:
+A failed hook fails the workflow phase. `on_failure` is best-effort and
+never blocks anything.
 
-| variable | example |
-|---|---|
-| `$TICKET_KEY` | `ENG-123` |
-| `$TICKET_TITLE` | `Add login` |
-| `$TICKET_URL` | `https://acme.atlassian.net/browse/ENG-123` |
-| `$TICKET_SOURCE` | `jira` |
-| `$TICKET_PROJECT` | `ENG` |
-| `$REPO` | `/home/me/repos/eng` |
-| `$BRANCH` | `goon/eng-123` |
+### Replace the pipeline (stages)
 
-…or use Go template syntax inside the command itself:
-
-```json
-"before_execute": ["git fetch origin {{.Branch}} || true"]
-```
-
-A failed hook fails the workflow phase (the workflow is marked `failed` in
-memory and surfaces in the web UI). The exception is `on_failure`, which is
-best-effort and never blocks anything.
-
-### PR templates
-
-`pr_title_template` and `pr_body_template` are full Go `text/template`
-strings. The data passed in is `{Key, Title, URL, Source, Project, Branch,
-Repo, Plan}` where `.Plan` is `[]PlanStep` with `.Title` and `.Done`:
-
-```jsonc
-"pr_body_template": "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖"
-```
-
-If the template fails to compile or render, goon falls back to the built-in
-default rather than blocking the PR.
-
-### Built-in defaults
-
-`goon workflow show` (with no overrides) prints the baked-in defaults:
-
-```jsonc
-{
-  "version": 1,
-  "branch_prefix": "goon/",
-  "pr_title_template": "[{{.Key}}] {{.Title}}",
-  "pr_body_template":  "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
-  "hooks": { ...all 10 hook keys with empty arrays... }
-}
-```
-
-### Replacing the pipeline (stages)
-
-Hooks let you run shell commands *around* goon's built-in 7-phase pipeline
-(triage → execute → test → verify → PR → notify). When you need a
-genuinely different pipeline — a marketing brief workflow, a sales-lead
-qualifier, an ops runbook — declare a `stages` array. **When `stages` is
-present, the built-in pipeline is replaced wholesale** with the stages
-you list. Hooks (before_pr, on_failure, …) and PR/notify still fire at
-the equivalent boundaries.
-
-A stage has a `name`, a `type` (currently `llm` or `agent`), and the
-fields its type needs. Earlier stage outputs are available to later
-stages as `{{.Stages.NAME.field}}`:
+Hooks run *around* goon's built-in pipeline. When you need a
+fundamentally different shape — a marketing-brief workflow, a sales-lead
+qualifier — declare a `stages` array. **`stages` replaces the built-in
+pipeline wholesale** but PR/notify still fire at the end if configured.
 
 ```jsonc
 {
   "version": 2,
   "stages": [
-    {
-      "name": "triage",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.1,
-      "prompt": "Break ticket {{.Key}} ({{.Title}}) into 3-7 atomic steps. Reply JSON {\"steps\":[{\"title\":\"...\"}]}."
-    },
-    {
-      "name": "execute",
-      "type": "agent",
-      "task": "Implement: {{(index (index .Stages.triage.steps 0) \"title\")}}"
-    },
-    {
-      "name": "verify",
-      "type": "agent",
-      "repeat": 3,
-      "task": "Verify ticket {{.Key}} is done. List defects via finish."
-    }
+    { "name": "triage",  "type": "llm", "json_mode": true,
+      "prompt": "Break {{.Key}} into 3-7 atomic steps. Reply JSON {\"steps\":[{\"title\":\"...\"}]}." },
+    { "name": "execute", "type": "agent",
+      "task": "Implement: {{(index (index .Stages.triage.steps 0) \"title\")}}" },
+    { "name": "verify",  "type": "agent", "repeat": 3,
+      "task": "Verify ticket {{.Key}} is done. List defects via finish." }
   ]
 }
 ```
 
-**Stage fields**
+Stage fields: `name`, `type` (`llm` \| `agent`), `if`, `repeat`,
+`on_error`, plus type-specific fields. See
+[`examples/workflows/`](examples/workflows/) for marketing/sales/ops
+presets.
 
-| field | applies to | meaning |
+---
+
+## Memory
+
+Two layers — **passive** runtime state (a JSON file) and **active**
+persistent knowledge (markdown notes the agent reads + writes).
+
+```
+./storage/
+├── memory.json     passive: tickets, workflows, queue, daemon status
+├── memory/         active: PINNED.md + topic notes the agent maintains
+│   ├── PINNED.md           ← always loaded into the system prompt
+│   └── learnings/...md     ← topic notes the agent fetches as needed
+├── logs/goon.log
+└── goon.pid        present while the daemon runs
+```
+
+You don't edit `memory.json` by hand — goon manages it. The notes dir is
+plain markdown; you can edit, version-control, or copy across repos.
+
+```sh
+goon memory init                        # creates memory/ + seeds PINNED.md
+goon memory list                        # * = auto-loaded
+goon memory edit PINNED.md
+goon memory read learnings/regex.md
+goon memory search "auth"               # case-insensitive grep
+```
+
+The agent gets five tools — `memory_list`, `memory_read`,
+`memory_write`, `memory_append`, `memory_search` — and is nudged in the
+system prompt to write down what it learned after each task. The
+**update_memory** workflow phase makes this an explicit step before
+every PR opens, so steady-state knowledge keeps growing.
+
+**PINNED.md** is the always-loaded note. Keep it short and high-signal:
+codebase conventions, names of services/people, "don't do this" rules,
+pointers to other notes worth reading. Park bulky context in topic
+notes (`learnings/oauth-flow.md`, `repos/webapp.md`) and let the agent
+fetch them on demand.
+
+---
+
+## Tools, providers, contract
+
+### Tools shipped
+
+| tool | purpose |
+|---|---|
+| `run_command`   | shell command (safety-validated) |
+| `read_file`     | up to 64KB |
+| `list_dir`      | up to 100 entries |
+| `confluence`    | search/get pages (Atlassian Cloud) |
+| `telegram`      | send a message via Bot API |
+| `ask_user`      | queue a question for the user (daemon mode) |
+| `memory_*`      | five tools to read/write the markdown notes store |
+| `finish`        | end the loop with a summary |
+
+### LLM providers
+
+| provider | switch | default model |
 |---|---|---|
-| `name`        | both  | unique id; later stages reference output as `{{.Stages.NAME.…}}` |
-| `type`        | both  | `llm` or `agent` |
-| `if`          | both  | Go template; stage is skipped when it renders to `""`/`false`/`no`/`0` |
-| `repeat`      | both  | run the stage N times (1 if omitted). Useful for verify-style passes |
-| `on_error`    | both  | `fail` (default) / `continue` / `warn` |
-| `prompt`      | llm   | prompt template (required) |
-| `system`      | llm   | optional system message template |
-| `json_mode`   | llm   | request strict JSON; output is parsed into a value usable by later stages |
-| `temperature` | llm   | float, default 0 |
-| `max_tokens`  | llm   | int, default provider default |
-| `output`      | llm   | override the key under `.Stages` (defaults to `name`) |
-| `task`        | agent | task template (required) |
-| `max_steps`   | agent | reserved (use `GOON_MAX_STEPS` for now) |
+| OpenAI    | `GOON_LLM_PROVIDER=openai`    | `gpt-4o-mini` |
+| Anthropic | `GOON_LLM_PROVIDER=anthropic` | `claude-sonnet-4-5` |
+| Ollama    | `GOON_LLM_PROVIDER=ollama`    | `llama3` |
+| Mock      | `GOON_LLM_PROVIDER=mock`      | offline fixtures |
 
-**Templating data** — every template (prompt, task, if, system) sees:
+### The model contract
 
-```
-.Key, .Title, .URL, .Source, .Project, .Repo, .Branch  (HookCtx fields)
-.Stages.<name>                                          (output of earlier stages)
-.Attempt                                                (1-based pass index when Repeat > 1)
-```
-
-**Example presets** (in [`examples/workflows/`](examples/workflows/)):
-
-- [`engineering.json`](examples/workflows/engineering.json) — reproduces
-  the built-in eng pipeline as explicit stages. Good starting point for
-  customizing prompts.
-- [`marketing-brief.json`](examples/workflows/marketing-brief.json) —
-  brief → review → publish. No PR, no test command.
-- [`sales-lead.json`](examples/workflows/sales-lead.json) — qualify →
-  draft outreach → push to CRM, with `if` skipping cold leads.
-
-Drop one in `~/.config/goon/workflow.json` (or set
-`GOON_WORKFLOW_FILE=/path/to/your.json`) and the next ticket goon picks
-up will run through it. Same hot-reload as everything else: edit the
-JSON, save, the daemon picks it up on the next poll.
-
-## Built-in subcommands
-
-```sh
-goon update [<ref>]                # rebuild from upstream master / branch / tag / commit
-goon uninstall [--yes] [--purge]   # remove the binary, optionally wipe state
-goon config <action> [args]        # manage ~/.config/goon/.env (see below)
-```
-
-## `goon config`
-
-```sh
-goon config                  # alias for `show` — prints all config (secrets masked)
-goon config show [--reveal]  # --reveal prints secret values verbatim
-goon config get <KEY>        # print a single value
-goon config set <KEY> <VAL>  # write to ~/.config/goon/.env
-goon config set KEY=VAL      # KEY=VAL form also accepted
-goon config unset <KEY>      # remove a key from the config file
-goon config path             # print path to the config file
-goon config edit             # open the config file in $EDITOR
-```
-
-The config file is `$XDG_CONFIG_HOME/goon/.env` (defaults to `~/.config/goon/.env`).
-Values exported in your shell always win over values in the config file — `goon config show` labels each row `[shell]`, `[config-file]`, `[default]`, or `[unset]`.
-
-## Local models with Ollama
-
-`goon` can run against a local [Ollama](https://ollama.com) server — no API key, no network.
-
-```sh
-ollama serve                          # start the daemon (often auto-started)
-ollama pull qwen2.5-coder:7b          # or llama3, mistral, etc.
-
-goon config set GOON_LLM_PROVIDER ollama
-goon config set OLLAMA_MODEL qwen2.5-coder:7b
-goon "list every .go file under internal/" --explain
-```
-
-Internally `goon` posts to `http://localhost:11434/api/chat` with `format=json` so the model is forced into the strict-JSON tool-call contract. Tune via `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
-
-## Self-update
-
-Once `goon` is on your `PATH`, it can rebuild itself in place:
-
-```sh
-goon update                         # latest commit on master
-goon update v0.2.0                  # tag
-goon update feature/new-tool        # branch
-goon update 3288a2c02b              # specific commit (7–40 hex chars)
-```
-
-Under the hood it clones [github.com/harisaginting/goon](https://github.com/harisaginting/goon)
-to a temp dir, checks out the requested ref, runs `go build`, and atomically
-replaces the running binary. Requires `git` and `go` on `PATH`.
-
-Override the upstream (useful for forks or air-gapped mirrors):
-
-```sh
-GOON_UPSTREAM=https://github.com/yourfork/goon goon update
-```
-
-## Modes
-
-| flag        | behavior                                                                |
-| ----------- | ----------------------------------------------------------------------- |
-| (none)      | **dry-run** — print the planned action, never execute                   |
-| `--run`     | execute, but ask `y/N` before each mutating step                        |
-| `--auto`    | execute every validated step automatically                              |
-| `--explain` | plan only — produce a step-by-step explanation, no tool calls           |
-| `--debug`   | extra diagnostic output                                                 |
-
-## Tools shipped
-
-| tool          | purpose                                              |
-| ------------- | ---------------------------------------------------- |
-| `run_command` | run a shell command (safety-validated)               |
-| `read_file`   | read up to 64KB of a file                            |
-| `list_dir`    | list a directory (max 100 entries)                   |
-| `confluence`  | search pages or fetch a page by id (Atlassian Cloud) |
-| `telegram`    | send a message to a Telegram chat via Bot API        |
-| `ask_user`    | queue a question for the user (daemon mode)          |
-| `finish`      | end the loop with a summary                          |
-
-## LLM providers shipped
-
-| provider    | env switch                          | default model      |
-| ----------- | ----------------------------------- | ------------------ |
-| OpenAI      | `GOON_LLM_PROVIDER=openai`          | `gpt-4o-mini`      |
-| Anthropic   | `GOON_LLM_PROVIDER=anthropic`       | `claude-sonnet-4-5`|
-| Ollama      | `GOON_LLM_PROVIDER=ollama`          | `llama3`           |
-| Mock        | `GOON_LLM_PROVIDER=mock`            | (offline fixtures) |
-
-## Configuration
-
-All via environment (or `.env`):
-
-```ini
-GOON_LLM_PROVIDER=openai|anthropic|mock
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4o-mini
-ANTHROPIC_API_KEY=...
-CONFLUENCE_BASE_URL=https://acme.atlassian.net/wiki
-CONFLUENCE_EMAIL=you@acme.com
-CONFLUENCE_API_TOKEN=...
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=123456
-GOON_MAX_STEPS=5
-GOON_MEMORY_PATH=~/.goon/memory.json
-```
-
-## Architecture
-
-```
-goon/
-├── main.go                          # entry: defers to cmd.Execute
-├── cmd/
-│   ├── root.go                      # flags, .env, signal-aware ctx, subcommand dispatch
-│   ├── start.go                     # `goon start` — autonomous daemon
-│   ├── stop.go status.go train.go   # cmds backed by the same memory file as the daemon
-│   ├── update.go uninstall.go config.go
-│   └── pidfile.go                   # ~/.goon/goon.pid bookkeeping
-├── internal/
-│   ├── llm/                         # Provider interface + impls
-│   │   ├── llm.go openai.go anthropic.go ollama.go mock.go
-│   ├── tools/                       # tool registry — what the agent can call
-│   │   ├── tools.go run_command.go read_file.go
-│   │   ├── confluence.go telegram.go
-│   │   └── ask_user.go              # queues questions to memory
-│   ├── boards/                      # ticket sources
-│   │   ├── board.go                 # interface + Ticket + status mapping
-│   │   ├── jira.go github.go        # adapters
-│   ├── githost/                     # PR / MR creation
-│   │   ├── githost.go github.go gitlab.go bitbucket.go
-│   ├── workflow/                    # the autonomous pipeline
-│   │   ├── workflow.go              # Triage → Plan → Execute → Test → Verify×N → PR → Notify
-│   │   └── parse.go                 # strict-JSON triage parser
-│   ├── daemon/                      # poll loop, status persistence
-│   │   └── daemon.go
-│   ├── web/                         # htmx UI (single embedded page)
-│   │   ├── server.go
-│   │   ├── getenv.go
-│   │   └── static/                  # index.html + htmx.min.js (embedded)
-│   ├── safety/safety.go             # regex blocklist
-│   ├── executor/executor.go         # mode-aware execution + confirmation
-│   ├── agent/                       # multi-step loop, prompt, context engine
-│   │   ├── agent.go context.go prompt.go
-│   └── memory/memory.go             # interactions, questions, workflows, tickets, status
-└── pkg/                             # reserved for public packages
-```
-
-### Daemon poll loop (in pseudo-code)
-
-```go
-for ; !ctx.Done(); <-ticker.C {
-    tickets := board.List(ctx)
-    for t := range tickets { memory.SeenTicket(t) }
-
-    pick := pickMostRecentlyUpdatedOpenTicket(tickets)
-    if pick == nil || hasUnansweredQuestion(pick) { continue }
-    if memory.HasOpenWorkflowFor(pick) || memory.HasCompletedWorkflowFor(pick) { continue }
-
-    workflow.Run(ctx, pick)   // see workflow phases below
-}
-```
-
-### Workflow phases
-
-1. **Triage** — one focused LLM call, strict-JSON, returns `{steps:[…], repo}`.
-2. **Plan** — already inside Triage in v1; persisted to `Workflow.Plan`.
-3. **Execute** — for each plan step, the existing agent loop is run with that step as the task. Each tool call is safety-validated.
-4. **Test** — best-effort `make test` (or `go test ./...`) inside the repo.
-5. **Verify** — re-run the agent `GOON_VERIFY_RUNS` more times (default 3, max 10) to catch regressions before opening a PR.
-6. **OpenPR** — pushes `goon/<ticket-key>` and creates a PR/MR via `internal/githost`.
-7. **Notify** — Telegram message with a link to the PR.
-
-The board ticket gets a comment ("✓ goon completed this ticket. PR: …") and is transitioned to **In Review** if the board adapter supports it.
-
-## The contract
-
-The LLM **must** emit exactly one JSON object. The agent feeds parse errors
-back into the chat so the model can self-correct.
+The LLM **must** emit exactly one JSON object. Parse errors get fed back
+so the model self-corrects.
 
 ```json
 {
@@ -553,190 +582,180 @@ back into the chat so the model can self-correct.
 }
 ```
 
-Allowed `tool` values are exactly the registered tools. Unknown tools are
-rejected and surfaced back to the model.
+### Safety
 
-## Safety
+`internal/safety` blocks (regex) the most dangerous patterns regardless
+of mode: `rm -rf /`, `rm -rf ~`, `mkfs.*`, `dd of=/dev/*`, fork bombs,
+`shutdown`/`reboot`/`halt`, `chmod -R 777 /`, `curl … | sh`. Hooks go
+through the same validator. In `--run` mode the executor also asks
+`y/N` before any mutating tool.
 
-`internal/safety` blocks (regex) the most dangerous patterns regardless of
-mode: `rm -rf /`, `rm -rf ~`, `rm -rf $HOME`, `mkfs.*`, `dd of=/dev/*`,
-fork bombs, `shutdown`/`reboot`/`halt`, recursive `chmod -R 777 /`, and
-`curl … | sh`. The list is intentionally short and conservative — extend
-in `safety.go` as you discover new patterns.
+---
 
-In `--run` mode the executor also asks `y/N` before any mutating tool
-(`run_command`, `telegram`).
+## Logs
 
-## Telegram adapter
-
-```sh
-export TELEGRAM_BOT_TOKEN=123:abc
-export TELEGRAM_CHAT_ID=987654321
-./goon "tell my Telegram bot we shipped" --auto
-```
-
-Internally the model emits:
-```json
-{"tool":"telegram","args":{"text":"We shipped 🎉"}}
-```
-The executor calls `https://api.telegram.org/bot$TOKEN/sendMessage`.
-
-## Atlassian (Jira + Confluence) — share one set of credentials
-
-Jira and Confluence both live under the same Atlassian Account, so they use
-the **same email and API token**. goon lets you set them once via shared
-`ATLASSIAN_*` env vars and falls back to them automatically:
+Default location: `./storage/logs/goon.log`. Rotates at 10 MB; keeps 3
+rotations. Mirrored to stderr in real time when running in the
+foreground.
 
 ```sh
-# Set once — covers Jira AND Confluence
-export ATLASSIAN_BASE_URL=https://acme.atlassian.net
-export ATLASSIAN_EMAIL=me@acme.com
-export ATLASSIAN_API_TOKEN=...     # id.atlassian.com/manage-profile/security/api-tokens
+goon logs                # last 100 lines, then exit
+goon logs --tail=500
+goon logs --follow       # tail -f equivalent
+goon logs --clear        # truncate (keeps rotations)
+goon logs --path
+
+GOON_LOG_FORMAT=json goon start | jq 'select(.level=="ERROR")'
 ```
 
-That's it. Both products work — Jira as the daemon's board source, Confluence
-as a tool the agent can call. Internally:
+| event | level | example attrs |
+|---|---|---|
+| LLM prompt / response   | debug | provider, message count, raw |
+| Tool call / execution   | info  | tool, args, ok, latency_ms |
+| HTTP request            | info  | component, method, url, status, latency_ms |
+| Workflow start / end    | info  | wf, ticket, state, stage, pr_url |
+| Daemon poll             | info  | poll_start, poll_end, duration_ms |
+| Telegram bot events     | info  | chat, user, command |
 
-- `JIRA_BASE_URL` defaults to `ATLASSIAN_BASE_URL`
-- `JIRA_EMAIL` / `JIRA_API_TOKEN` default to `ATLASSIAN_EMAIL` / `ATLASSIAN_API_TOKEN`
-- `CONFLUENCE_BASE_URL` defaults to `ATLASSIAN_BASE_URL` + `/wiki` (the Cloud convention)
-- `CONFLUENCE_EMAIL` / `CONFLUENCE_API_TOKEN` default to the shared values
+Tokens are auto-redacted: `bot$TOKEN/...` becomes `bot***/...`,
+`user:pass@host` becomes `***@host`.
 
-**Per-product overrides** still win when set — useful for self-hosted Data
-Center installs where Jira and Confluence live on different hosts:
+---
+
+## Self-update
+
+Once `goon` is on your `PATH` it can rebuild itself. **Requires `git` and
+`go` on `PATH`** — self-update clones the upstream repo and rebuilds, so
+both tools must be installed. (If you originally got the binary from a
+release archive without Go installed, use `goon uninstall` then
+re-download the new release instead.)
 
 ```sh
-export ATLASSIAN_EMAIL=me@acme.com           # auth shared
-export ATLASSIAN_API_TOKEN=...
-export JIRA_BASE_URL=https://jira.internal/  # Jira on its own server
-export CONFLUENCE_BASE_URL=https://wiki.internal/  # Confluence elsewhere
+goon update                         # latest commit on master
+goon update v0.2.0                  # tag
+goon update feature/new-tool        # branch
+goon update 3288a2c02b              # specific commit
 ```
 
-### Using Confluence as a tool
+Clones [github.com/harisaginting/goon](https://github.com/harisaginting/goon)
+to a temp dir, checks out the requested ref, runs `go build`, and
+atomically replaces the running binary. Override the upstream:
 
 ```sh
-./goon "find the Q3 roadmap on Confluence and summarize the goals"
+GOON_UPSTREAM=https://github.com/yourfork/goon goon update
 ```
 
-The model picks `confluence` with `op=search` to find pages, then
-`op=get_page` to fetch the body, then `finish` with a summary.
+---
 
-## Logs — every prompt, tool call, HTTP request, workflow phase
-
-Everything goon does that touches the outside world or makes a non-trivial
-decision is captured to a structured log file. Default location:
+## Architecture (brief)
 
 ```
-~/.goon/logs/goon.log
+goon/
+├── main.go
+├── cmd/                       CLI entry points + subcommand handlers
+├── internal/
+│   ├── agent/                 multi-step LLM↔tool loop, system prompt
+│   ├── atlassian/             shared env helper for Jira + Confluence
+│   ├── boards/                ticket sources (jira, github)
+│   ├── checkup/               `goon doctor` provider probes
+│   ├── daemon/                poll loop + resume detection
+│   ├── executor/              {dry-run | run | auto | explain} modes
+│   ├── githost/               PR adapters (github, gitlab, bitbucket) + PRReviewer
+│   ├── llm/                   provider adapters (openai, anthropic, ollama, mock)
+│   ├── logx/                  slog wrapper, log rotation, HTTP transport
+│   ├── memory/                passive runtime store (memory.json)
+│   ├── notes/                 active markdown notes (./storage/memory/)
+│   ├── safety/                command validator
+│   ├── storage/               single source of truth for state paths
+│   ├── telegram/              inbound bot — auth, /commands, chat, PR review
+│   ├── tools/                 Tool interface + builtins + memory_* tools
+│   ├── web/                   optional web UI (htmx, single embedded page)
+│   └── workflow/              Engine.Run state machine + declarative stages
+└── examples/
 ```
 
-Rotates at 10 MB; keeps 3 rotations (`goon.log.1`, `.2`, `.3`). Mirrored to
-stderr in real time when goon runs in the foreground.
+The workflow engine is a **resumable state machine**. When a gate fires,
+it queues a question, sets `wf.State=WFAwaitingApproval` + the current
+stage, and exits. The daemon's `Memory.ResumableWorkflow()` catches that
+on the next tick once the user answers, and `Engine.Run` re-enters at
+the same stage.
 
-### What gets logged
-
-| event              | level | example attrs                                                           |
-|--------------------|-------|-------------------------------------------------------------------------|
-| LLM prompt         | debug | provider, message count, task                                           |
-| LLM response       | debug | provider, raw_bytes, raw (truncated)                                    |
-| Tool call (parsed) | info  | tool, args, rationale                                                   |
-| Tool execution     | info  | tool, args, ok, latency_ms, stdout_bytes                                |
-| Tool stdout/stderr | debug | full output (truncated to 4 KB)                                         |
-| HTTP request       | info  | component, method, url, status, req_bytes, resp_bytes, latency_ms       |
-| HTTP body          | debug | request body + response body (truncated)                                |
-| Workflow start/end | info  | wf, ticket, state, pr_url, duration_ms                                  |
-| Daemon poll        | info  | poll_start, poll_end, duration_ms                                       |
-| HTTP errors (≥500) | error | full error message + URL                                                |
-
-Sensitive bits are redacted automatically: Telegram bot tokens in URLs
-become `/bot***/...`; basic-auth `user:pass@host` becomes `***@host`.
-
-### Browse logs
-
-```sh
-goon logs                    # last 100 lines, then exit
-goon logs --tail=500         # last 500 lines
-goon logs --follow           # tail -f equivalent
-goon logs --path             # print the file path
-goon logs --clear            # truncate (keeps rotations)
-```
-
-### Pipe to your log stack
-
-```sh
-GOON_LOG_FORMAT=json goon start    # newline-delimited JSON
-tail -f ~/.goon/logs/goon.log | jq 'select(.level=="ERROR")'
-tail -f ~/.goon/logs/goon.log | vector --config /etc/vector/cowork.toml
-```
-
-### Knobs
-
-```
-GOON_LOG_FILE     ~/.goon/logs/goon.log    where the file lives
-GOON_LOG_LEVEL    info                     debug | info | warn | error
-GOON_LOG_FORMAT   text                     text | json
-```
-
-`debug` captures full prompt text, full LLM responses, full HTTP request and
-response bodies (each truncated to 4 KB). Useful for debugging a single
-workflow; not recommended for steady-state production.
-
-## Memory
-
-`~/.goon/memory.json` (override with `GOON_MEMORY_PATH`) holds the last
-200 interactions and a per-command counter. The agent injects the top-5
-frequent commands into the prompt so the model can match your style.
+---
 
 ## Testing
 
-The full test suite uses a deterministic mock LLM and `httptest` servers
-so it runs offline:
+The full suite uses a deterministic mock LLM and `httptest` servers so
+it runs offline:
 
 ```sh
-make check        # vet + go test -race ./...
+make check           # vet + go test -race ./...
+go test ./...        # plain
 ```
 
-What is covered:
+Coverage includes: tool-call parser (plain JSON, fenced JSON, prose,
+nested braces), safety blocklist, executor mode behavior (dry-run,
+y/N, auto, --explain), agent loop (finish, multi-step, JSON
+self-repair, max-steps), memory (append, frequency, persistence,
+disabled mode), workflow gates + resume, daemon resume path, Telegram
+bot dispatch (auth, /status, /queue/answer, /prs, /approve, refusal),
+HTTP shapes for Telegram + Confluence + GitHub.
 
-- `tools.ParseToolCall`: plain JSON, fenced JSON, prose around JSON,
-  nested braces, empty-tool rejection, missing-JSON rejection.
-- `safety.Default`: blocks `rm -rf /`, `mkfs`, `dd`, fork bombs,
-  pipe-to-shell, recursive chmod of `/`; allows benign commands.
-- `executor`: dry-run does not execute; `--run` honors y/N; `--auto`
-  skips the prompt; safety wins over mode; `--explain` never mutates.
-- `agent`: finish-immediately, multi-step + tool result feedback, JSON
-  self-repair, dangerous-command back-off, max-steps bound, unknown-tool
-  recovery.
-- `memory`: append, recent-summary, frequency, persistence across
-  reopens, no-op disabled mode.
-- `tools.Telegram` / `tools.Confluence`: full HTTP request shape against
-  `httptest.Server`, error and config-missing paths.
+---
 
-## Acceptance test (manual)
+## Run on the fly (no install)
+
+If you have Go 1.21+ you can skip the build step entirely:
 
 ```sh
-./goon "find all .log files under /tmp and delete them" --run
+go run . "list every .go file under internal"          # one-shot
+go run . start --web=:8080                             # daemon
+go run . workflow init                                 # any subcommand
 ```
 
-Expected:
-1. Step 1: `list_dir` or `run_command` (`find /tmp -name '*.log'`)
-2. Confirmation prompt for the destructive step
-3. Step 2: `rm` of the matched files (only if you say `y`)
-4. Step 3: `finish` with a summary
+> Don't prefix with `goon` when using `go run .` — `go run .` IS goon,
+> so `go run . goon workflow init` would be "ask the agent to do
+> workflow init". Goon catches this and strips the redundant prefix
+> with a hint, but the cleaner form is just `go run . workflow init`.
+
+There are Makefile shortcuts:
+
+```sh
+make run         TASK='list every .go file under internal'   # dry-run
+make run-auto    TASK='tidy go.mod'
+make run-explain TASK='delete every .log older than 30 days'
+```
+
+You can also run from anywhere on disk without cloning:
+
+```sh
+go run github.com/harisaginting/goon@latest "summarize the .go files" --explain
+go run github.com/harisaginting/goon@v0.2.0  "tidy go.mod" --auto
+```
+
+> Add a shell alias for shorthand:
+> `alias goon='go run github.com/harisaginting/goon@latest'`
+
+---
 
 ## Failure modes the agent guards against
 
-- Executing raw LLM text — every step must parse as a `ToolCall`.
-- Skipping JSON parsing — bad JSON is fed back as a parse-error message.
-- No validation layer — `run_command` always passes through `safety`.
-- Infinite loop — `MaxSteps` (default 5, max 50).
+- **Executing raw LLM text** — every step must parse as a `ToolCall`.
+- **Skipping JSON parsing** — bad JSON is fed back as a parse-error message.
+- **No validation** — `run_command` always passes through `safety`.
+- **Infinite loop** — `MaxSteps` (default 5, max 50).
+- **Unattended runaway** — every code-touching workflow pauses at
+  `approve_plan` until you say yes (unless you opted into `auto_approve`).
 
-## Extensions
+## Extending
 
-Add a new tool by implementing `tools.Tool` and registering it in
+Add a new tool by implementing `tools.Tool` and registering in
 `DefaultRegistry`. The model picks it up automatically through the
 manifest line in the system prompt.
 
+Add a new board / git-host / LLM by implementing the matching interface
+in `internal/boards`, `internal/githost`, or `internal/llm` and routing
+in the corresponding `NewFromEnv`.
+
 ## License
 
-MIT — go nuts.
+MIT.

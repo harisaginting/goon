@@ -9,18 +9,17 @@
 package executor
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/safety"
 	"github.com/harisaginting/goon/internal/tools"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // Mode controls execution behavior.
@@ -114,11 +113,9 @@ func (e *Executor) Execute(ctx context.Context, t tools.Tool, call tools.ToolCal
 
 	// run mode: prompt before mutating tools.
 	if e.opts.Mode == ModeRun && isMutating(call.Tool) {
-		yes, err := confirm(e.opts.Stdin, e.opts.Stdout, fmt.Sprintf(
-			"Execute %s args=%v ? (y/N) ", call.Tool, call.Args))
-		if err != nil {
-			return tools.Result{ToolName: call.Tool, Err: err}, err
-		}
+		yes := util.ConfirmTTY(
+			fmt.Sprintf("Execute %s args=%v ? (y/N) ", call.Tool, call.Args),
+			e.opts.Stdin, e.opts.Stdout)
 		if !yes {
 			return tools.Result{ToolName: call.Tool, Stdout: "[skipped by user]"}, errors.New("user declined")
 		}
@@ -166,15 +163,4 @@ func isMutating(name string) bool {
 		return true
 	}
 	return false
-}
-
-func confirm(stdin io.Reader, stdout io.Writer, prompt string) (bool, error) {
-	fmt.Fprint(stdout, prompt)
-	br := bufio.NewReader(stdin)
-	line, err := br.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return false, err
-	}
-	line = strings.ToLower(strings.TrimSpace(line))
-	return line == "y" || line == "yes", nil
 }

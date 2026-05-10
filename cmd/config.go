@@ -25,7 +25,9 @@ type configKey struct {
 var knownConfigKeys = []configKey{
 	{Name: "GOON_LLM_PROVIDER", Default: "openai", Group: "agent"},
 	{Name: "GOON_MAX_STEPS", Default: "5", Group: "agent"},
-	{Name: "GOON_MEMORY_PATH", Default: "~/.goon/memory.json", Group: "agent"},
+	{Name: "GOON_STORAGE_DIR", Default: "./storage", Group: "agent"},
+	{Name: "GOON_MEMORY_PATH", Default: "$GOON_STORAGE_DIR/memory.json", Group: "agent"},
+	{Name: "GOON_MEMORY_DIR", Default: "$GOON_STORAGE_DIR/memory", Group: "agent"},
 	{Name: "GOON_UPSTREAM", Default: "https://github.com/harisaginting/goon", Group: "agent"},
 
 	{Name: "GOON_BOARD", Default: "", Group: "daemon"},
@@ -33,7 +35,9 @@ var knownConfigKeys = []configKey{
 	{Name: "GOON_POLL_SECONDS", Default: "300", Group: "daemon"},
 	{Name: "GOON_VERIFY_RUNS", Default: "3", Group: "daemon"},
 	{Name: "GOON_REPO_MAP", Default: "", Group: "daemon"},
-	{Name: "GOON_PID_FILE", Default: "~/.goon/goon.pid", Group: "daemon"},
+	{Name: "GOON_PID_FILE", Default: "$GOON_STORAGE_DIR/goon.pid", Group: "daemon"},
+	{Name: "GOON_LOG_FILE", Default: "$GOON_STORAGE_DIR/logs/goon.log", Group: "daemon"},
+	{Name: "GOON_WORKFLOW_FILE", Default: "./workflow.json", Group: "daemon"},
 
 	{Name: "OPENAI_API_KEY", Sensitive: true, Group: "openai"},
 	{Name: "OPENAI_MODEL", Default: "gpt-4o-mini", Group: "openai"},

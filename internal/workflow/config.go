@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/harisaginting/goon/internal/logx"
 )
 
 // WorkflowConfig is the user-customizable description of how the workflow
@@ -46,6 +49,16 @@ import (
 type WorkflowConfig struct {
 	Version int `json:"version,omitempty"`
 
+	// Name identifies which workflow this file represents. Surfaced at startup
+	// (`goon start` and `goon workflow show`) and on every per-ticket
+	// `workflow.start` log line so operators can tell at a glance which
+	// pipeline is in use. Defaults to "default" when omitted.
+	Name string `json:"name,omitempty"`
+
+	// Description is an optional human-readable summary of what this
+	// workflow does. Printed by `goon workflow show`.
+	Description string `json:"description,omitempty"`
+
 	// BranchPrefix is prepended to the lowercased ticket key. Default "goon/".
 	BranchPrefix string `json:"branch_prefix,omitempty"`
 
@@ -55,6 +68,13 @@ type WorkflowConfig struct {
 
 	// VerifyRuns overrides GOON_VERIFY_RUNS / the package default. 0 = inherit.
 	VerifyRuns int `json:"verify_runs,omitempty"`
+
+	// AutoApprove, when true, skips the user-approval gates (confirm_repo,
+	// approve_plan) so the daemon runs fully unattended. Useful for trusted
+	// pipelines or CI-driven runs. Env var GOON_AUTO_APPROVE=1 also works
+	// (env wins over file). Default false — gates fire and the workflow
+	// pauses until the user replies via `goon train` or the web UI.
+	AutoApprove bool `json:"auto_approve,omitempty"`
 
 	// PRTitleTemplate / PRBodyTemplate are Go text/template strings.
 	PRTitleTemplate string `json:"pr_title_template,omitempty"`
@@ -139,19 +159,34 @@ var AllHooks = []string{
 	HookOnFailure,
 }
 
-// DefaultConfig returns the built-in workflow shape.
+// DefaultConfig returns the built-in workflow shape — the source of truth
+// for what `goon workflow init` writes and what every loaded config is
+// merged on top of.
+//
+// The 9 phases are: triage → confirm_repo → approve_plan → execute → test
+// → verify → update_memory → open_pr → notify. The two gates pause the
+// workflow for user approval; auto_approve=true (or env GOON_AUTO_APPROVE)
+// skips them for unattended runs.
 func DefaultConfig() WorkflowConfig {
 	return WorkflowConfig{
-		Version:         1,
+		Version:     1,
+		Name:        "default",
+		Description: "Goon's all-purpose pipeline: triage → confirm_repo (gate) → approve_plan (gate) → execute → test → verify → update_memory → open_pr → notify. Set auto_approve=true to skip the gates for unattended runs.",
 		BranchPrefix:    "goon/",
+		VerifyRuns:      0, // 0 = inherit package var (default 3, env GOON_VERIFY_RUNS)
+		AutoApprove:     false,
 		PRTitleTemplate: "[{{.Key}}] {{.Title}}",
 		PRBodyTemplate: `Resolves {{.Key}}.
 
-Plan:
+## Plan
 {{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}
 {{end}}
-— opened by goon 🤖`,
-		ExtraLabels: nil,
+
+Branch: ` + "`{{.Branch}}`" + `
+Project: ` + "`{{.Project}}`" + `
+
+— opened autonomously by goon 🤖`,
+		ExtraLabels: []string{"goon", "auto"},
 		Hooks: map[string][]string{
 			HookBeforeTriage:  nil,
 			HookBeforeExecute: nil,
@@ -179,11 +214,18 @@ func (c WorkflowConfig) Hook(name string) []string {
 // match wins:
 //
 //  1. $GOON_WORKFLOW_FILE
-//  2. <repoDir>/.goon/workflow.json     (when repoDir != "")
-//  3. ./.goon/workflow.json
-//  4. $XDG_CONFIG_HOME/goon/workflow.json
-//  5. ~/.config/goon/workflow.json
-//  6. ~/.goon/workflow.json
+//  2. ./workflow.json                   (repo root — the new default)
+//  3. <repoDir>/workflow.json           (when repoDir != "" and != ".")
+//  4. <repoDir>/.goon/workflow.json     (legacy per-repo location)
+//  5. ./.goon/workflow.json             (legacy current-dir location)
+//  6. $XDG_CONFIG_HOME/goon/workflow.json
+//  7. ~/.config/goon/workflow.json
+//  8. ~/.goon/workflow.json
+//
+// The legacy ~/.goon and .goon/ paths are kept for backwards compat —
+// people who set them up before still work — but new installs land their
+// workflow at the project root, so it's grep-able and version-controllable
+// next to the code.
 //
 // Returns DefaultConfig() if none found. The found values are merged on top
 // of the defaults so partial files are valid.
@@ -212,14 +254,23 @@ func LoadConfig(repoDir string) (WorkflowConfig, string, error) {
 
 // candidatePaths returns the filesystem locations LoadConfig consults in
 // order. Returned paths may not exist.
+//
+// Order is intentional: ./workflow.json (repo root) wins over every legacy
+// location because that's where new installs put it. Legacy paths
+// (.goon/workflow.json, ~/.config/goon/, ~/.goon/) are kept so older
+// setups keep working — but they're tried last.
 func candidatePaths(repoDir string) []string {
 	out := []string{}
 	if v := strings.TrimSpace(os.Getenv("GOON_WORKFLOW_FILE")); v != "" {
 		out = append(out, v)
 	}
-	if strings.TrimSpace(repoDir) != "" {
-		out = append(out, filepath.Join(repoDir, ".goon", "workflow.json"))
+	// Repo-root workflow.json — the canonical new default.
+	out = append(out, "workflow.json")
+	if rd := strings.TrimSpace(repoDir); rd != "" && rd != "." {
+		out = append(out, filepath.Join(rd, "workflow.json"))
+		out = append(out, filepath.Join(rd, ".goon", "workflow.json"))
 	}
+	// Legacy locations, last-resort. New installs shouldn't write here.
 	out = append(out, filepath.Join(".goon", "workflow.json"))
 	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
 		out = append(out, filepath.Join(xdg, "goon", "workflow.json"))
@@ -233,20 +284,75 @@ func candidatePaths(repoDir string) []string {
 	return out
 }
 
-// DefaultConfigFilePath returns the canonical path goon writes to with
-// `goon workflow init`.
-func DefaultConfigFilePath() string {
-	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
-		return filepath.Join(xdg, "goon", "workflow.json")
+// Announce loads the workflow config and writes a one-line banner to w
+// telling the operator which workflow is in use and where it came from.
+// It also emits a structured `workflow.loaded` log line via logx so the
+// same information is captured to disk.
+//
+// Returns the resolved config and the source path (empty when defaults
+// were used) so callers can pass them onward without re-reading the file.
+//
+// This is called from `goon start` so the very first thing a user sees on
+// the daemon's stdout is the active workflow name.
+func Announce(repoDir string, w io.Writer) (WorkflowConfig, string) {
+	cfg, source, err := LoadConfig(repoDir)
+	name := cfg.Name
+	if name == "" {
+		name = "default"
+		cfg.Name = name
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		return filepath.Join(home, ".config", "goon", "workflow.json")
+	if err != nil {
+		fmt.Fprintf(w, "→ workflow: %q (config error: %v — falling back to defaults)\n", name, err)
+		logx.Warn("workflow.loaded", "name", name, "source", source, "error", err.Error())
+		return cfg, source
 	}
-	return ".goon/workflow.json"
+	switch {
+	case source == "":
+		fmt.Fprintf(w, "→ workflow: %q (built-in defaults — `goon workflow init` to customize)\n", name)
+	case len(cfg.Stages) > 0:
+		fmt.Fprintf(w, "→ workflow: %q — %d stage(s) — %s\n", name, len(cfg.Stages), source)
+	default:
+		fmt.Fprintf(w, "→ workflow: %q — %s\n", name, source)
+	}
+	if cfg.Description != "" {
+		fmt.Fprintf(w, "  %s\n", cfg.Description)
+	}
+	logx.Info("workflow.loaded",
+		"name", name,
+		"source", source,
+		"stages", len(cfg.Stages),
+		"hooks", len(cfg.Hooks),
+	)
+	return cfg, source
 }
 
-// SaveDefault writes the DefaultConfig to path (creating parent dirs). Used
-// by `goon workflow init`. Refuses to overwrite an existing file.
+// DefaultConfigFilePath returns the canonical path `goon workflow init`
+// writes to. The new default is ./workflow.json — repo-local, easy to
+// commit alongside the project. $GOON_WORKFLOW_FILE overrides if set so
+// users can keep a custom location pinned.
+func DefaultConfigFilePath() string {
+	if v := strings.TrimSpace(os.Getenv("GOON_WORKFLOW_FILE")); v != "" {
+		return v
+	}
+	abs, err := filepath.Abs("workflow.json")
+	if err != nil {
+		return "workflow.json"
+	}
+	return abs
+}
+
+// SaveDefault writes a comprehensive starter workflow.json. Used by
+// `goon workflow init`. Refuses to overwrite an existing file (notes are
+// precious — never blow away a user's customizations).
+//
+// The written file is intentionally richer than DefaultConfig() — every
+// hook is pre-filled with a benign, self-documenting `echo` command so a
+// new user can read the file top-to-bottom and learn what each hook does
+// without consulting the docs. Replace, comment-out (by deleting the
+// array entry), or leave as-is.
+//
+// For preset variants (declarative stages, marketing brief, sales lead,
+// fully unattended), see examples/workflows/.
 func SaveDefault(path string) error {
 	if path == "" {
 		return errors.New("save default: empty path")
@@ -257,13 +363,7 @@ func SaveDefault(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	cfg := DefaultConfig()
-	// Seed all hook keys with empty arrays so the JSON shape is obvious.
-	for _, h := range AllHooks {
-		if cfg.Hooks[h] == nil {
-			cfg.Hooks[h] = []string{}
-		}
-	}
+	cfg := starterConfig()
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
@@ -271,11 +371,59 @@ func SaveDefault(path string) error {
 	return os.WriteFile(path, append(data, '\n'), 0o644)
 }
 
+// starterConfig returns the kitchen-sink config that `goon workflow init`
+// writes. It builds on DefaultConfig() but pre-fills every hook with a
+// benign echo command so a first-time user can read the JSON
+// top-to-bottom and learn the hook surface without bouncing to docs.
+//
+// The starter intentionally:
+//   - sets verify_runs=3 explicitly (matches the package default, but
+//     having it in the file makes the override point obvious)
+//   - includes every hook key, even unused ones, with empty arrays
+//   - sets auto_approve=false explicitly (so the gates fire by default
+//     and the user opts in to unattended mode by flipping it to true)
+//   - sticks to ASCII shell commands that work on POSIX and `cmd /C`
+//     on Windows (where the safety.ShellCommand helper picks the
+//     right interpreter).
+func starterConfig() WorkflowConfig {
+	cfg := DefaultConfig()
+	cfg.VerifyRuns = 3
+	cfg.Hooks = map[string][]string{
+		HookBeforeTriage: {
+			"echo \"→ goon picked up {{.Key}} — {{.Title}}\"",
+		},
+		HookBeforeExecute: {},
+		HookAfterExecute: {
+			"echo \"✓ all plan steps completed for {{.Key}}\"",
+		},
+		HookBeforeTest:   {},
+		HookAfterTest:    {},
+		HookBeforeVerify: {},
+		HookAfterVerify:  {},
+		HookBeforePR: {
+			"echo \"→ opening PR for {{.Key}} on branch {{.Branch}}\"",
+		},
+		HookAfterPR: {
+			"echo \"✓ PR opened for {{.Key}}\"",
+		},
+		HookOnFailure: {
+			"echo \"workflow failed for {{.Key}} — see goon logs --tail=50\" >&2",
+		},
+	}
+	return cfg
+}
+
 // merge overlays partial onto base, only touching fields that are non-zero
 // in partial.
 func merge(base *WorkflowConfig, partial WorkflowConfig) {
 	if partial.Version != 0 {
 		base.Version = partial.Version
+	}
+	if partial.Name != "" {
+		base.Name = partial.Name
+	}
+	if partial.Description != "" {
+		base.Description = partial.Description
 	}
 	if partial.BranchPrefix != "" {
 		base.BranchPrefix = partial.BranchPrefix
@@ -285,6 +433,9 @@ func merge(base *WorkflowConfig, partial WorkflowConfig) {
 	}
 	if partial.VerifyRuns != 0 {
 		base.VerifyRuns = partial.VerifyRuns
+	}
+	if partial.AutoApprove {
+		base.AutoApprove = partial.AutoApprove
 	}
 	if partial.PRTitleTemplate != "" {
 		base.PRTitleTemplate = partial.PRTitleTemplate

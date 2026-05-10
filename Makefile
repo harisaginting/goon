@@ -10,6 +10,18 @@ ifeq ($(GO_BIN),)
 GO_BIN       := $(shell go env GOPATH)/bin
 endif
 
+# Version stamping. VERSION can be overridden:
+#   make build VERSION=v0.2.0
+# COMMIT and DATE auto-resolve from git when available.
+MOD_PATH     := github.com/harisaginting/goon
+VERSION      ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT       := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+DATE         := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS      := -s -w \
+                -X $(MOD_PATH)/cmd.version=$(VERSION) \
+                -X $(MOD_PATH)/cmd.commit=$(COMMIT) \
+                -X $(MOD_PATH)/cmd.date=$(DATE)
+
 .PHONY: all build test vet fmt clean tidy check \
         run run-auto run-explain \
         install install-system install-user install-go \
@@ -18,7 +30,7 @@ endif
 all: check build
 
 build:
-	go build -trimpath -ldflags='-s -w' -o $(BIN) .
+	go build -trimpath -ldflags='$(LDFLAGS)' -o $(BIN) .
 
 # --- Run on the fly (no build, no install) ----------------------------------
 # Pass the task in the TASK variable. Examples:

@@ -16,6 +16,7 @@ import (
 
 	"github.com/harisaginting/goon/internal/atlassian"
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // Jira reads tickets from Atlassian Cloud's REST API v3.
@@ -91,7 +92,9 @@ type jiraIssue struct {
 }
 
 // jiraPageSize is the per-page cap. The /rest/api/3/search/jql endpoint
-// allows up to 5000 but we keep it at 100 to stay polite and predictable.
+// allows up to 5000 but we keep it small (10) because the daemon picks
+// only one ticket per poll tick — fetching more would just waste API
+// quota and risk surprising the user with a stale rolled-back result.
 const jiraPageSize = 10
 
 // List runs the configured JQL and returns matching tickets. Caps at
@@ -254,14 +257,7 @@ func (j *Jira) do(ctx context.Context, method, url string, body io.Reader) ([]by
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("jira http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		return nil, fmt.Errorf("jira http %d: %s", resp.StatusCode, util.Truncate(string(raw), 400))
 	}
 	return raw, nil
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
 }

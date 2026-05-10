@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -112,3 +113,62 @@ func TestMemory_PersistenceWithEngineerData(t *testing.T) {
 		t.Fatal("status did not persist")
 	}
 }
+
+func TestMemory_TicketsPrune(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := New(filepath.Join(dir, "memory.json"))
+	// Insert maxTicketSnapshots+50 unique tickets with monotonic LastSeen.
+	base := time.Now().Add(-24 * time.Hour)
+	total := maxTicketSnapshots + 50
+	for i := 0; i < total; i++ {
+		m.SeenTicket(TicketSnapshot{
+			ID:       fmt.Sprintf("T-%04d", i),
+			LastSeen: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	tks := m.ListTickets()
+	if len(tks) != maxTicketSnapshots {
+		t.Fatalf("expected ticket cap of %d, got %d", maxTicketSnapshots, len(tks))
+	}
+	// The 50 oldest (T-0000..T-0049) should have been evicted.
+	for _, tk := range tks {
+		if tk.ID == "T-0000" || tk.ID == "T-0049" {
+			t.Errorf("oldest ticket %q should have been pruned", tk.ID)
+		}
+	}
+}
+
+func TestMemory_AuthorizeChatPrunesOldest(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := New(filepath.Join(dir, "memory.json"))
+	for i := 0; i < maxTelegramAuth+10; i++ {
+		m.AuthorizeChat(int64(i+1), "user", "User")
+	}
+	got := m.AuthorizedChats()
+	if len(got) != maxTelegramAuth {
+		t.Fatalf("expected auth cap of %d, got %d", maxTelegramAuth, len(got))
+	}
+}
+
+func TestMemory_PruneStaleAuth(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := New(filepath.Join(dir, "memory.json"))
+	// Hand-roll two entries with explicit AuthorizedAt so we don't depend on
+	// time.Now() ordering in the test.
+	m.AuthorizeChat(1, "old", "Old")
+	m.AuthorizeChat(2, "new", "New")
+	m.mu.Lock()
+	m.store.TelegramAuth[0].AuthorizedAt = time.Now().Add(-48 * time.Hour)
+	m.mu.Unlock()
+	dropped := m.PruneStaleAuth(24 * time.Hour)
+	if dropped != 1 {
+		t.Fatalf("expected 1 drop, got %d", dropped)
+	}
+	if !m.IsChatAuthorized(2) {
+		t.Error("recent auth should survive prune")
+	}
+	if m.IsChatAuthorized(1) {
+		t.Error("stale auth should have been dropped")
+	}
+}
+

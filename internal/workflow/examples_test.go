@@ -50,28 +50,24 @@ func loadExample(t *testing.T, name string) WorkflowConfig {
 	return cfg
 }
 
-// TestExample_Engineering runs the engineering preset end-to-end against a
-// mock LLM. Walks each stage, asserting that prior-stage output flows into
-// the next stage's prompt/task as expected.
+// TestExample_Engineering runs the engineering-stages preset end-to-end
+// against a mock LLM. Walks each stage, asserting that prior-stage output
+// flows into the next stage's prompt/task as expected.
 func TestExample_Engineering(t *testing.T) {
-	cfg := loadExample(t, "engineering.json")
+	cfg := loadExample(t, "engineering-stages.json")
 
 	// Replies, in order:
-	//  1. triage llm     → JSON plan with two steps
-	//  2. execute agent  → finish on first step
-	//  3. test agent     → finish ("green")
-	//  4. verify agent   → finish ×3 (Repeat: 3)
-	//  5. verify agent   → finish
-	//  6. verify agent   → finish
-	//  7. summarize llm  → JSON {"summary":"..."}
+	//  1. triage llm    → JSON plan with two steps
+	//  2. execute agent → finish
+	//  3. verify agent  → finish (pass 1/3)
+	//  4. verify agent  → finish (pass 2/3)
+	//  5. verify agent  → finish (pass 3/3)
 	replies := []string{
 		`{"steps":[{"title":"add OAuth handler"},{"title":"wire route"}]}`,
 		`{"tool":"finish","args":{"message":"step done"}}`,
-		`{"tool":"finish","args":{"message":"green"}}`,
 		`{"tool":"finish","args":{"message":"verified"}}`,
 		`{"tool":"finish","args":{"message":"verified"}}`,
 		`{"tool":"finish","args":{"message":"verified"}}`,
-		`{"summary":"Added OAuth login endpoint and wired the route."}`,
 	}
 	r, mock, out := newRunner(t, replies)
 
@@ -93,39 +89,24 @@ func TestExample_Engineering(t *testing.T) {
 		t.Errorf("steps len = %d; want 2", len(steps))
 	}
 
-	// execute / test / verify stages stored the rendered task strings
+	// execute stage stored the rendered task string
 	if _, ok := state.Stages["execute"].(string); !ok {
 		t.Errorf("execute output type = %T (want string)", state.Stages["execute"])
 	}
 
-	// summarize stage stored the parsed JSON
-	summary, ok := state.Stages["summarize"].(map[string]any)
-	if !ok {
-		t.Fatalf("summarize output type = %T", state.Stages["summarize"])
-	}
-	if _, ok := summary["summary"].(string); !ok {
-		t.Errorf("summary missing 'summary' string field: %#v", summary)
-	}
-
-	// Trace the recorded prompts/tasks. The summarize prompt must contain the
+	// Trace the recorded prompts/tasks. The execute task must contain the
 	// triage steps interpolated via the {{range}} block.
-	var sawExecutePrompt, sawSummarizePrompt bool
+	var sawExecutePrompt bool
 	for i := range mock.LastMsgs {
 		c := mock.LastMsgs[i].Content
 		if strings.Contains(c, "add OAuth handler") && strings.Contains(c, "wire route") {
 			if strings.Contains(c, "Implement ticket") {
 				sawExecutePrompt = true
 			}
-			if strings.Contains(c, "Summarize") {
-				sawSummarizePrompt = true
-			}
 		}
 	}
 	if !sawExecutePrompt {
 		t.Errorf("execute task did not interpolate the triage steps")
-	}
-	if !sawSummarizePrompt {
-		t.Errorf("summarize prompt did not interpolate the triage steps")
 	}
 }
 
@@ -166,10 +147,10 @@ func TestExample_MarketingBrief(t *testing.T) {
 		t.Errorf("review prompt fell back to Go's map[] format (json helper did not run):\n%s", reviewPrompt)
 	}
 
-	// The publish task should have rendered the {{.Description}} ticket field.
+	// The publish task should have rendered the ticket key.
 	publishTask := mock.LastMsgs[2].Content
-	if !strings.Contains(publishTask, "campaign/launch") {
-		t.Errorf("publish task missing branch:\n%s", publishTask)
+	if !strings.Contains(publishTask, "ENG-1") {
+		t.Errorf("publish task missing ticket key:\n%s", publishTask)
 	}
 }
 

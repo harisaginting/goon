@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
@@ -10,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // runUninstall removes the running goon binary and (optionally) its local
@@ -19,12 +20,15 @@ import (
 // Flags:
 //
 //	--yes    skip the y/N confirmation
-//	--purge  also remove ~/.goon, ~/.config/goon, $XDG_CONFIG_HOME/goon
+//	--purge  also remove legacy global state dirs (~/.goon, ~/.config/goon,
+//	         $XDG_CONFIG_HOME/goon). Per-project ./storage/ is NOT removed
+//	         — that's the user's to clean up with `rm -rf storage`, since
+//	         goon doesn't know which CWD they intend.
 func runUninstall(_ context.Context, args []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	fs := flag.NewFlagSet("uninstall", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
-	purge := fs.Bool("purge", false, "also remove ~/.goon and ~/.config/goon")
+	purge := fs.Bool("purge", false, "also remove legacy ~/.goon and ~/.config/goon (per-project ./storage/ is left alone)")
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: goon uninstall [--yes] [--purge]")
 		fs.PrintDefaults()
@@ -54,11 +58,7 @@ func runUninstall(_ context.Context, args []string, stdout, stderr io.Writer, st
 	}
 
 	if !*yes {
-		ok, err := confirm(stdin, stdout, "Continue? (y/N) ")
-		if err != nil {
-			return err
-		}
-		if !ok {
+		if !util.ConfirmTTY("Continue? (y/N) ", stdin, stdout) {
 			fmt.Fprintln(stdout, "aborted.")
 			return errors.New("uninstall: declined")
 		}
@@ -106,15 +106,3 @@ func exists(p string) bool {
 	return err == nil
 }
 
-// confirm prompts and returns true on "y" / "yes" (case-insensitive).
-// It is duplicated from the executor package to keep cmd self-contained.
-func confirm(stdin io.Reader, stdout io.Writer, prompt string) (bool, error) {
-	fmt.Fprint(stdout, prompt)
-	br := bufio.NewReader(stdin)
-	line, err := br.ReadString('\n')
-	if err != nil && err != io.EOF {
-		return false, err
-	}
-	line = strings.ToLower(strings.TrimSpace(line))
-	return line == "y" || line == "yes", nil
-}

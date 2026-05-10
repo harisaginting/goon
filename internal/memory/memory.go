@@ -1,5 +1,6 @@
 // Package memory holds short-term in-process state and a long-term JSON file
-// at ~/.goon/memory.json (override with GOON_MEMORY_PATH).
+// at ./storage/memory.json (override with GOON_MEMORY_PATH; the storage
+// root itself is overridable via GOON_STORAGE_DIR).
 package memory
 
 import (
@@ -8,8 +9,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/harisaginting/goon/internal/storage"
 )
 
 // Interaction is one user turn + outcome.
@@ -49,34 +53,45 @@ type PlanStep struct {
 type WorkflowState string
 
 const (
-	WFTriaging  WorkflowState = "triaging"
-	WFPlanning  WorkflowState = "planning"
-	WFExecuting WorkflowState = "executing"
-	WFTesting   WorkflowState = "testing"
-	WFVerifying WorkflowState = "verifying"
-	WFOpeningPR WorkflowState = "opening_pr"
-	WFNotifying WorkflowState = "notifying"
-	WFDone      WorkflowState = "done"
-	WFBlocked   WorkflowState = "blocked"
-	WFFailed    WorkflowState = "failed"
+	WFTriaging         WorkflowState = "triaging"
+	WFPlanning         WorkflowState = "planning"
+	WFAwaitingApproval WorkflowState = "awaiting_approval"
+	WFExecuting        WorkflowState = "executing"
+	WFTesting          WorkflowState = "testing"
+	WFVerifying        WorkflowState = "verifying"
+	WFUpdatingMemory   WorkflowState = "updating_memory"
+	WFOpeningPR        WorkflowState = "opening_pr"
+	WFNotifying        WorkflowState = "notifying"
+	WFDone             WorkflowState = "done"
+	WFBlocked          WorkflowState = "blocked"
+	WFFailed           WorkflowState = "failed"
 )
 
 // Workflow tracks a single ticket's run from triage through PR.
+//
+// When State == WFAwaitingApproval, Stage records which gate fired
+// ("confirm_repo", "approve_plan", …) and PendingQuestionID points at the
+// memory.Question the daemon is waiting for the user to answer. On the
+// next poll cycle the daemon resumes the workflow from Stage once the
+// question has an answer.
 type Workflow struct {
-	ID         string        `json:"id"`
-	TicketID   string        `json:"ticket_id"`
-	TicketKey  string        `json:"ticket_key,omitempty"`
-	Title      string        `json:"title,omitempty"`
-	StartedAt  time.Time     `json:"started_at"`
-	UpdatedAt  time.Time     `json:"updated_at"`
-	State      WorkflowState `json:"state"`
-	Repo       string        `json:"repo,omitempty"`
-	Branch     string        `json:"branch,omitempty"`
-	Plan       []PlanStep    `json:"plan,omitempty"`
-	PRURL      string        `json:"pr_url,omitempty"`
-	VerifyRuns int           `json:"verify_runs"`
-	Note       string        `json:"note,omitempty"`
-	Error      string        `json:"error,omitempty"`
+	ID                string            `json:"id"`
+	TicketID          string            `json:"ticket_id"`
+	TicketKey         string            `json:"ticket_key,omitempty"`
+	Title             string            `json:"title,omitempty"`
+	StartedAt         time.Time         `json:"started_at"`
+	UpdatedAt         time.Time         `json:"updated_at"`
+	State             WorkflowState     `json:"state"`
+	Stage             string            `json:"stage,omitempty"`
+	PendingQuestionID string            `json:"pending_question_id,omitempty"`
+	Approvals         map[string]string `json:"approvals,omitempty"`
+	Repo              string            `json:"repo,omitempty"`
+	Branch            string            `json:"branch,omitempty"`
+	Plan              []PlanStep        `json:"plan,omitempty"`
+	PRURL             string            `json:"pr_url,omitempty"`
+	VerifyRuns        int               `json:"verify_runs"`
+	Note              string            `json:"note,omitempty"`
+	Error             string            `json:"error,omitempty"`
 }
 
 // TicketSnapshot is what we last saw for a ticket — used to dedupe polls and
@@ -90,6 +105,18 @@ type TicketSnapshot struct {
 	Status    string    `json:"status,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
+}
+
+// ChatAuth records a Telegram chat that has authenticated against the bot
+// (by sending `/auth <secret>` once). The chat ID is then trusted for every
+// subsequent message until the user runs `/logout` or an operator removes
+// the entry. Persisted in memory.json so authentication survives restarts.
+type ChatAuth struct {
+	ChatID       int64     `json:"chat_id"`
+	Username     string    `json:"username,omitempty"`
+	DisplayName  string    `json:"display_name,omitempty"`
+	AuthorizedAt time.Time `json:"authorized_at"`
+	LastSeen     time.Time `json:"last_seen,omitempty"`
 }
 
 // DaemonStatus is a tiny live-status snapshot for the UI / `goon status`.
@@ -114,24 +141,26 @@ type Memory struct {
 }
 
 type storeFile struct {
-	History   []Interaction             `json:"history"`
-	Counts    map[string]int            `json:"command_counts"`
-	Questions []Question                `json:"questions,omitempty"`
-	Workflows []Workflow                `json:"workflows,omitempty"`
-	Tickets   map[string]TicketSnapshot `json:"tickets,omitempty"`
-	Status    DaemonStatus              `json:"status,omitempty"`
-	NextQID   int64                     `json:"next_qid,omitempty"`
+	History     []Interaction             `json:"history"`
+	Counts      map[string]int            `json:"command_counts"`
+	Questions   []Question                `json:"questions,omitempty"`
+	Workflows   []Workflow                `json:"workflows,omitempty"`
+	Tickets     map[string]TicketSnapshot `json:"tickets,omitempty"`
+	Status      DaemonStatus              `json:"status,omitempty"`
+	NextQID     int64                     `json:"next_qid,omitempty"`
+	TelegramAuth []ChatAuth               `json:"telegram_auth,omitempty"`
 }
 
 // New opens (or creates) the memory file. If path is empty it defaults to
-// ~/.goon/memory.json.
+// <storage.Root()>/memory.json (i.e. ./storage/memory.json by default,
+// or whatever GOON_STORAGE_DIR points to).
+//
+// The old fallback to ~/.goon/memory.json was removed when we moved to
+// per-project storage; users wanting global state can set
+// GOON_STORAGE_DIR or GOON_MEMORY_PATH explicitly.
 func New(path string) (*Memory, error) {
 	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return nil, err
-		}
-		path = filepath.Join(home, ".goon", "memory.json")
+		path = storage.Path("memory.json")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -383,6 +412,70 @@ func (m *Memory) ListWorkflows(n int) []Workflow {
 	return all
 }
 
+// OpenWorkflowFor returns the active (non-terminal) workflow for a ticket,
+// if one exists. The most recently-updated open workflow wins so the daemon
+// resumes the latest run after a crash + restart.
+func (m *Memory) OpenWorkflowFor(ticketID string) (Workflow, bool) {
+	if m == nil {
+		return Workflow{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var best Workflow
+	found := false
+	for _, w := range m.store.Workflows {
+		if w.TicketID != ticketID {
+			continue
+		}
+		if terminal(w.State) {
+			continue
+		}
+		if !found || w.UpdatedAt.After(best.UpdatedAt) {
+			best = w
+			found = true
+		}
+	}
+	return best, found
+}
+
+// ResumableWorkflow returns the most recently-updated open workflow that is
+// awaiting approval AND whose pending question has been answered. The daemon
+// calls this every tick before picking a fresh ticket so paused workflows
+// resume as soon as the user replies via `goon train` or the web UI.
+//
+// Returns ok=false if nothing is ready to resume.
+func (m *Memory) ResumableWorkflow() (Workflow, bool) {
+	if m == nil {
+		return Workflow{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	answered := map[string]bool{}
+	for _, q := range m.store.Questions {
+		if !q.Pending() {
+			answered[q.ID] = true
+		}
+	}
+	var best Workflow
+	found := false
+	for _, w := range m.store.Workflows {
+		if w.State != WFAwaitingApproval {
+			continue
+		}
+		if w.PendingQuestionID == "" {
+			continue
+		}
+		if !answered[w.PendingQuestionID] {
+			continue
+		}
+		if !found || w.UpdatedAt.After(best.UpdatedAt) {
+			best = w
+			found = true
+		}
+	}
+	return best, found
+}
+
 // HasOpenWorkflowFor returns true if there is a non-terminal workflow for
 // the given ticket id.
 func (m *Memory) HasOpenWorkflowFor(ticketID string) bool {
@@ -421,7 +514,16 @@ func terminal(s WorkflowState) bool {
 
 // --- Ticket snapshot API ---------------------------------------------------
 
-// SeenTicket updates the last-seen snapshot for a ticket id.
+// maxTicketSnapshots caps how many ticket snapshots we keep on disk. The
+// daemon writes a snapshot for every ticket it sees on every poll tick;
+// without a cap, a busy backlog grows memory.json unboundedly. 500 is
+// enough to cover several months of unique tickets per project before
+// the oldest get evicted, which is plenty for dedupe purposes.
+const maxTicketSnapshots = 500
+
+// SeenTicket updates the last-seen snapshot for a ticket id. When the
+// ticket map exceeds maxTicketSnapshots, the oldest entries (by
+// LastSeen) are dropped to keep memory.json bounded.
 func (m *Memory) SeenTicket(s TicketSnapshot) {
 	if m == nil {
 		return
@@ -435,7 +537,37 @@ func (m *Memory) SeenTicket(s TicketSnapshot) {
 		s.LastSeen = time.Now()
 	}
 	m.store.Tickets[s.ID] = s
+	if len(m.store.Tickets) > maxTicketSnapshots {
+		pruneOldestTickets(m.store.Tickets, maxTicketSnapshots)
+	}
 	m.flush()
+}
+
+// pruneOldestTickets evicts entries with the oldest LastSeen until the
+// map size is at most cap. O(n log n) per call; only invoked when the
+// map crosses the threshold, so amortized cost stays low.
+func pruneOldestTickets(m map[string]TicketSnapshot, cap int) {
+	if len(m) <= cap {
+		return
+	}
+	type kv struct {
+		id   string
+		seen time.Time
+	}
+	all := make([]kv, 0, len(m))
+	for id, t := range m {
+		all = append(all, kv{id, t.LastSeen})
+	}
+	// Insertion sort — list rarely exceeds the cap by more than a few.
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].seen.Before(all[j-1].seen); j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	drop := len(all) - cap
+	for i := 0; i < drop; i++ {
+		delete(m, all[i].id)
+	}
 }
 
 // ListTickets returns all known ticket snapshots.
@@ -448,6 +580,209 @@ func (m *Memory) ListTickets() []TicketSnapshot {
 	out := make([]TicketSnapshot, 0, len(m.store.Tickets))
 	for _, t := range m.store.Tickets {
 		out = append(out, t)
+	}
+	return out
+}
+
+// GetTicket fetches a ticket snapshot by id or by Key (case-insensitive
+// match on Key, exact match on ID). Returns ok=false when neither matches.
+// Useful for the Telegram bot's `/ticket <id-or-key>` lookup — users
+// usually have the human-friendly Key on hand, not the wire ID.
+func (m *Memory) GetTicket(idOrKey string) (TicketSnapshot, bool) {
+	if m == nil {
+		return TicketSnapshot{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if t, ok := m.store.Tickets[idOrKey]; ok {
+		return t, true
+	}
+	want := strings.ToLower(strings.TrimSpace(idOrKey))
+	for _, t := range m.store.Tickets {
+		if strings.ToLower(t.Key) == want || strings.ToLower(t.ID) == want {
+			return t, true
+		}
+	}
+	return TicketSnapshot{}, false
+}
+
+// WorkflowsForTicket returns every workflow record (open + completed +
+// failed) for the ticket id, most-recently-updated first. Used by the
+// Telegram bot's detail view to show what goon did or is doing.
+func (m *Memory) WorkflowsForTicket(ticketID string) []Workflow {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []Workflow{}
+	for _, w := range m.store.Workflows {
+		if w.TicketID == ticketID {
+			out = append(out, w)
+		}
+	}
+	// Sort by UpdatedAt descending (insertion sort — workflows-per-ticket
+	// is small).
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].UpdatedAt.After(out[j-1].UpdatedAt); j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out
+}
+
+// --- Telegram chat auth API ------------------------------------------------
+
+// maxTelegramAuth caps the number of authorized Telegram chats kept in
+// memory.json. Goon's auth model is single-user, so going above this is
+// almost always a misconfiguration (replayed /auth from automation, a
+// shared bot, etc.) — capping here protects memory.json from drifting
+// to megabytes.
+const maxTelegramAuth = 100
+
+// AuthorizeChat marks chatID as a trusted Telegram conversation. Idempotent
+// — repeated calls update display fields and refresh AuthorizedAt. When
+// the auth list exceeds maxTelegramAuth, the oldest entries (by
+// AuthorizedAt) are evicted so the file stays bounded.
+func (m *Memory) AuthorizeChat(chatID int64, username, displayName string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	for i := range m.store.TelegramAuth {
+		if m.store.TelegramAuth[i].ChatID == chatID {
+			m.store.TelegramAuth[i].Username = username
+			m.store.TelegramAuth[i].DisplayName = displayName
+			m.store.TelegramAuth[i].AuthorizedAt = now
+			m.store.TelegramAuth[i].LastSeen = now
+			m.flush()
+			return
+		}
+	}
+	m.store.TelegramAuth = append(m.store.TelegramAuth, ChatAuth{
+		ChatID:       chatID,
+		Username:     username,
+		DisplayName:  displayName,
+		AuthorizedAt: now,
+		LastSeen:     now,
+	})
+	if len(m.store.TelegramAuth) > maxTelegramAuth {
+		m.store.TelegramAuth = pruneOldestAuth(m.store.TelegramAuth, maxTelegramAuth)
+	}
+	m.flush()
+}
+
+// pruneOldestAuth drops entries with the oldest AuthorizedAt until the
+// slice length is at most cap.
+func pruneOldestAuth(in []ChatAuth, cap int) []ChatAuth {
+	if len(in) <= cap {
+		return in
+	}
+	out := make([]ChatAuth, len(in))
+	copy(out, in)
+	// Insertion sort by AuthorizedAt asc — small slice, so simple wins.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].AuthorizedAt.Before(out[j-1].AuthorizedAt); j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
+	}
+	return out[len(out)-cap:]
+}
+
+// PruneStaleAuth drops authorized chats whose AuthorizedAt is older than
+// maxAge. Returns the number of entries removed. Currently unused by the
+// daemon but exposed so an admin command (or a periodic sweep) can tidy
+// up forgotten Telegram authorizations without manual edits.
+func (m *Memory) PruneStaleAuth(maxAge time.Duration) int {
+	if m == nil || maxAge <= 0 {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cutoff := time.Now().Add(-maxAge)
+	kept := m.store.TelegramAuth[:0]
+	dropped := 0
+	for _, a := range m.store.TelegramAuth {
+		if a.AuthorizedAt.Before(cutoff) {
+			dropped++
+			continue
+		}
+		kept = append(kept, a)
+	}
+	if dropped > 0 {
+		m.store.TelegramAuth = kept
+		m.flush()
+	}
+	return dropped
+}
+
+// IsChatAuthorized reports whether chatID has previously authenticated.
+func (m *Memory) IsChatAuthorized(chatID int64) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, c := range m.store.TelegramAuth {
+		if c.ChatID == chatID {
+			return true
+		}
+	}
+	return false
+}
+
+// TouchChat records when an authorized chat last sent a message. Best-effort:
+// silently does nothing for unauthorized chats.
+func (m *Memory) TouchChat(chatID int64) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.store.TelegramAuth {
+		if m.store.TelegramAuth[i].ChatID == chatID {
+			m.store.TelegramAuth[i].LastSeen = time.Now()
+			m.flush()
+			return
+		}
+	}
+}
+
+// RevokeChat removes chatID from the allowlist (logout). Returns true when
+// an entry was removed.
+func (m *Memory) RevokeChat(chatID int64) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i, c := range m.store.TelegramAuth {
+		if c.ChatID == chatID {
+			m.store.TelegramAuth = append(m.store.TelegramAuth[:i], m.store.TelegramAuth[i+1:]...)
+			m.flush()
+			return true
+		}
+	}
+	return false
+}
+
+// AuthorizedChats returns the current list of trusted chats (most recently
+// seen first).
+func (m *Memory) AuthorizedChats() []ChatAuth {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]ChatAuth, len(m.store.TelegramAuth))
+	copy(out, m.store.TelegramAuth)
+	// Sort by LastSeen desc (insertion sort is fine — list is small).
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0 && out[j].LastSeen.After(out[j-1].LastSeen); j-- {
+			out[j], out[j-1] = out[j-1], out[j]
+		}
 	}
 	return out
 }
@@ -511,6 +846,16 @@ func (m *Memory) flush() {
 		if err := json.Unmarshal(data, &disk); err == nil {
 			m.store = mergeStores(disk, m.store)
 		}
+	}
+	// Re-apply caps after merge — a freshly-merged store can exceed the
+	// caps when disk holds entries we don't have in memory yet (e.g.
+	// after a fresh process loads an old, unbounded memory.json that
+	// pre-dates this pruning logic).
+	if len(m.store.Tickets) > maxTicketSnapshots {
+		pruneOldestTickets(m.store.Tickets, maxTicketSnapshots)
+	}
+	if len(m.store.TelegramAuth) > maxTelegramAuth {
+		m.store.TelegramAuth = pruneOldestAuth(m.store.TelegramAuth, maxTelegramAuth)
 	}
 	data, err := json.MarshalIndent(m.store, "", "  ")
 	if err != nil {

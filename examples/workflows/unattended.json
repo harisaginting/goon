@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "name": "unattended",
+  "description": "Fully unattended engineering pipeline. Sets auto_approve=true, so confirm_repo and approve_plan fire and pass automatically. Use this for trusted CI runs / a long-lived daemon you don't want to babysit. Pair with sensible test_command + before_pr fmt/lint hooks so 'unattended' doesn't mean 'unaccountable'.",
+  "branch_prefix": "goon/",
+  "test_command": "",
+  "verify_runs": 5,
+  "auto_approve": true,
+  "pr_title_template": "[{{.Key}}] {{.Title}} (auto)",
+  "pr_body_template": "Resolves {{.Key}}.\n\nThis PR was produced by goon running in unattended mode (auto_approve=true). Please review carefully — no human gated this work.\n\n## Plan\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n\n— opened autonomously by goon 🤖",
+  "extra_labels": ["goon", "auto", "unattended", "needs-careful-review"],
+  "hooks": {
+    "before_pr": [
+      "go fmt ./... || true",
+      "go vet ./... || true"
+    ],
+    "on_failure": [
+      "echo 'unattended workflow failed for {{.Key}} — see goon logs --tail=100' >&2"
+    ]
+  }
+}

@@ -35,7 +35,10 @@ goon-backup-*.tar.gz
 .env.local
 *.env.local
 
-# Local goon state — overrides should live outside the repo
+# Local goon state — overrides should live outside the repo.
+# `storage/` is the new per-project root (logs, memory.json, memory/, goon.pid).
+# `.goon/` is the legacy location and stays ignored for backwards compat.
+storage/
 .goon/
 
 # Editor / OS noise

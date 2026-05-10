@@ -12,7 +12,7 @@ import (
 	"github.com/harisaginting/goon/internal/safety"
 )
 
-func newRunner() (*HookRunner, *bytes.Buffer) {
+func newHookRunner() (*HookRunner, *bytes.Buffer) {
 	var buf bytes.Buffer
 	r := &HookRunner{Stdout: &buf, Stderr: &buf, Validator: safety.Default()}
 	return r, &buf
@@ -31,7 +31,7 @@ func sampleCtx() HookCtx {
 
 func TestHookRunner_RunsCommandsInOrder(t *testing.T) {
 	dir := t.TempDir()
-	r, buf := newRunner()
+	r, buf := newHookRunner()
 	hctx := sampleCtx()
 	hctx.Repo = dir // run in tmp
 	cmds := []string{
@@ -53,7 +53,7 @@ func TestHookRunner_RunsCommandsInOrder(t *testing.T) {
 
 func TestHookRunner_StopsOnFirstError(t *testing.T) {
 	dir := t.TempDir()
-	r, _ := newRunner()
+	r, _ := newHookRunner()
 	hctx := sampleCtx()
 	hctx.Repo = dir
 	cmds := []string{
@@ -70,7 +70,7 @@ func TestHookRunner_StopsOnFirstError(t *testing.T) {
 }
 
 func TestHookRunner_BlocksDangerousCommand(t *testing.T) {
-	r, _ := newRunner()
+	r, _ := newHookRunner()
 	hctx := sampleCtx()
 	cmds := []string{"rm -rf /"}
 	err := r.Run(context.Background(), "before_pr", cmds, hctx)
@@ -81,7 +81,7 @@ func TestHookRunner_BlocksDangerousCommand(t *testing.T) {
 
 func TestHookRunner_ExportsTicketEnv(t *testing.T) {
 	dir := t.TempDir()
-	r, buf := newRunner()
+	r, buf := newHookRunner()
 	hctx := sampleCtx()
 	hctx.Repo = dir
 	out := filepath.Join(dir, "env.txt")
@@ -154,7 +154,7 @@ func TestRenderTemplate_BadSyntax(t *testing.T) {
 }
 
 func TestHookRunner_NoCmds_NoOp(t *testing.T) {
-	r, _ := newRunner()
+	r, _ := newHookRunner()
 	if err := r.Run(context.Background(), "noop", nil, sampleCtx()); err != nil {
 		t.Errorf("nil cmds should be no-op: %v", err)
 	}

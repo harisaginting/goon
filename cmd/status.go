@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/harisaginting/goon/internal/memory"
@@ -88,31 +89,12 @@ func ticketLabel(q memory.Question) string {
 
 func oneLine(s string) string {
 	for _, r := range []string{"\r\n", "\n", "\r"} {
-		s = replaceAll(s, r, " ")
+		s = strings.ReplaceAll(s, r, " ")
 	}
 	if len(s) > 80 {
 		return s[:80] + "…"
 	}
 	return s
-}
-
-func replaceAll(s, old, new string) string {
-	for {
-		i := indexOf(s, old)
-		if i < 0 {
-			return s
-		}
-		s = s[:i] + new + s[i+len(old):]
-	}
-}
-
-func indexOf(s, sep string) int {
-	for i := 0; i+len(sep) <= len(s); i++ {
-		if s[i:i+len(sep)] == sep {
-			return i
-		}
-	}
-	return -1
 }
 
 func truncFixed(s string, n int) string {

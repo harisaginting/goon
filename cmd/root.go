@@ -85,6 +85,14 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runWorkflow(ctx, sargs, stdout, stderr)
 		case "logs":
 			return runLogs(ctx, sargs, stdout, stderr)
+		case "memory":
+			return runMemory(ctx, sargs, stdout, stderr, stdin)
+		case "help":
+			printUsage(stdout)
+			return nil
+		case "version":
+			printVersion(stdout)
+			return nil
 		}
 	}
 
@@ -99,18 +107,8 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 		versionFlag = fs.Bool("version", false, "print version and exit")
 	)
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "Usage:\n")
-		fmt.Fprintf(stderr, "  goon \"<natural-language task>\" [flags]    one-shot agent run\n")
-		fmt.Fprintf(stderr, "  goon start [--web=:8080] [--once]         autonomous daemon (poll → triage → plan → exec → verify → PR → notify)\n")
-		fmt.Fprintf(stderr, "  goon stop                                 stop the running daemon\n")
-		fmt.Fprintf(stderr, "  goon status                               daemon status, pending questions, recent workflows\n")
-		fmt.Fprintf(stderr, "  goon train [--list|--all|answer <id> <a>] answer questions queued by the agent\n")
-		fmt.Fprintf(stderr, "  goon doctor [--json] [--quiet]            verify every provider with a live probe\n")
-		fmt.Fprintf(stderr, "  goon workflow <show|path|init|edit|hooks> manage the per-workflow customization file\n")
-		fmt.Fprintf(stderr, "  goon update [<ref>]                       self-update from upstream master, branch, tag, or commit\n")
-		fmt.Fprintf(stderr, "  goon uninstall [--yes] [--purge]          remove the binary (and optionally state)\n")
-		fmt.Fprintf(stderr, "  goon config <action> [args]               show / get / set / unset / path / edit\n\n")
-		fmt.Fprintf(stderr, "Flags (for one-shot agent run):\n")
+		printUsage(stderr)
+		fmt.Fprintf(stderr, "\nFlags (for one-shot agent run):\n")
 		fs.PrintDefaults()
 	}
 
@@ -123,7 +121,7 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	}
 
 	if *versionFlag {
-		fmt.Fprintln(stdout, "goon 0.1.0")
+		printVersion(stdout)
 		return nil
 	}
 
@@ -192,19 +190,60 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	return ag.Run(ctx, input)
 }
 
+// printUsage writes goon's command surface in a stable order. Both the
+// flag parser's auto-generated help and the explicit `goon help` /
+// `goon --help` subcommand share this so there is exactly one source
+// of truth for first-run UX.
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "goon — autonomous AI engineer")
+	fmt.Fprintln(w, FullVersion())
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, `  goon "<natural-language task>" [flags]              one-shot agent run`)
+	fmt.Fprintln(w, "  goon start [--web=:8080] [--once] [--no-pr]         autonomous daemon")
+	fmt.Fprintln(w, "  goon stop                                           stop the running daemon")
+	fmt.Fprintln(w, "  goon status                                         daemon + queue snapshot")
+	fmt.Fprintln(w, "  goon doctor [--json] [--quiet]                      live-probe every provider")
+	fmt.Fprintln(w, "  goon train [--list|--all|answer <id> <a>]           answer questions queued by the agent")
+	fmt.Fprintln(w, "  goon workflow <show|path|init|edit|hooks>           customize the per-ticket workflow")
+	fmt.Fprintln(w, "  goon memory <list|read|write|append|search|edit|delete|path|init>  manage markdown notes")
+	fmt.Fprintln(w, "  goon logs [--tail=N|--follow|--clear|--path]        browse the structured log file")
+	fmt.Fprintln(w, "  goon config <show|get|set|unset|path|edit>          ~/.config/goon/.env")
+	fmt.Fprintln(w, "  goon update [<ref>]                                 rebuild from upstream (needs git + go)")
+	fmt.Fprintln(w, "  goon uninstall [--yes] [--purge]                    remove the binary (+ optional state)")
+	fmt.Fprintln(w, "  goon help | --help | -h                             show this help")
+	fmt.Fprintln(w, "  goon version | --version | -v                       show version + build info")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Quick start:")
+	fmt.Fprintln(w, "  cp .env.example .env && edit it, then `goon doctor` to verify, then `goon start --web=:8080`")
+	fmt.Fprintln(w, "  Full docs at http://localhost:8080/docs once the daemon is running")
+}
+
 // splitSubcommand checks if argv starts with a recognized subcommand token
 // (a single word, no spaces, no leading "-"). It returns ("", nil) when the
 // first arg is a quoted task or a flag, so the agent path keeps working.
+//
+// "help" / "--help" / "-h" are treated as subcommand-like — they print
+// usage and exit. Without this dispatch, `goon help` would be sent to the
+// LLM as a literal task, which is a brutal first-run footgun.
 func splitSubcommand(argv []string) (string, []string) {
 	if len(argv) == 0 {
 		return "", nil
 	}
 	first := argv[0]
+	// Help routing — consume `help`, `--help`, `-h`, `-help` here so the
+	// flag parser handles them, not the agent.
+	switch first {
+	case "help", "--help", "-h", "-help":
+		return "help", argv[1:]
+	case "version", "--version", "-v":
+		return "version", argv[1:]
+	}
 	if first == "" || strings.HasPrefix(first, "-") || strings.ContainsAny(first, " \t") {
 		return "", nil
 	}
 	switch first {
-	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs":
+	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory":
 		return first, argv[1:]
 	}
 	return "", nil

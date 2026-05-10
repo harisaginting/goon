@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // We can't easily delete the running test binary, so these tests build a
@@ -51,11 +53,7 @@ func TestUninstall_DeclineAborts(t *testing.T) {
 	// the confirm path directly.
 	in := strings.NewReader("n\n")
 	var out bytes.Buffer
-	ok, err := confirm(in, &out, "Continue? (y/N) ")
-	if err != nil {
-		t.Fatalf("confirm: %v", err)
-	}
-	if ok {
+	if util.ConfirmTTY("Continue? (y/N) ", in, &out) {
 		t.Fatal("expected confirm to return false on 'n'")
 	}
 	// File still exists because we never reached the removal step.
@@ -67,11 +65,7 @@ func TestUninstall_DeclineAborts(t *testing.T) {
 func TestUninstall_AcceptYes(t *testing.T) {
 	in := strings.NewReader("y\n")
 	var out bytes.Buffer
-	ok, err := confirm(in, &out, "Continue? (y/N) ")
-	if err != nil {
-		t.Fatalf("confirm: %v", err)
-	}
-	if !ok {
+	if !util.ConfirmTTY("Continue? (y/N) ", in, &out) {
 		t.Fatal("expected confirm to return true on 'y'")
 	}
 }

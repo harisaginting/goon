@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // GitLab opens merge requests via the GitLab REST API.
@@ -101,7 +102,7 @@ func (g *GitLab) do(ctx context.Context, method, urlStr string, body io.Reader) 
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("gitlab http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		return nil, fmt.Errorf("gitlab http %d: %s", resp.StatusCode, util.Truncate(string(raw), 400))
 	}
 	return raw, nil
 }

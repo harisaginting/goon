@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/harisaginting/goon/internal/util"
 )
 
 func TestIsCommitHash(t *testing.T) {
@@ -132,11 +134,11 @@ func mustWrite(t *testing.T, path, content string) {
 
 func TestEnvOr(t *testing.T) {
 	t.Setenv("GOON_TEST_KEY_X1", "")
-	if got := envOr("GOON_TEST_KEY_X1", "fallback"); got != "fallback" {
+	if got := util.EnvOr("GOON_TEST_KEY_X1", "fallback"); got != "fallback" {
 		t.Errorf("empty env: got %q want fallback", got)
 	}
 	t.Setenv("GOON_TEST_KEY_X1", "  set  ")
-	if got := envOr("GOON_TEST_KEY_X1", "fallback"); got != "set" {
+	if got := util.EnvOr("GOON_TEST_KEY_X1", "fallback"); got != "set" {
 		t.Errorf("trimmed env: got %q want set", got)
 	}
 }

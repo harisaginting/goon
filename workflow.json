@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "name": "default",
+  "description": "Goon's all-purpose engineering pipeline. triage → confirm_repo (gate) → approve_plan (gate) → execute → test → verify → update_memory → open_pr → notify. The two gates pause the workflow for your approval. Set auto_approve=true (or env GOON_AUTO_APPROVE=1) for unattended runs.",
+  "branch_prefix": "goon/",
+  "test_command": "",
+  "verify_runs": 3,
+  "auto_approve": false,
+  "pr_title_template": "[{{.Key}}] {{.Title}}",
+  "pr_body_template": "Resolves {{.Key}}.\n\n## Plan\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n\nBranch: `{{.Branch}}`\nProject: `{{.Project}}`\n\n— opened autonomously by goon 🤖",
+  "extra_labels": ["goon", "auto"],
+  "hooks": {
+    "before_triage": [
+      "echo '→ goon picked up {{.Key}} — {{.Title}}'"
+    ],
+    "before_execute": [],
+    "after_execute": [],
+    "before_test": [],
+    "after_test": [],
+    "before_verify": [],
+    "after_verify": [],
+    "before_pr": [],
+    "after_pr": [],
+    "on_failure": [
+      "echo 'workflow failed for {{.Key}} — see goon logs --tail=50' >&2"
+    ]
+  }
+}

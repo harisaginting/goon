@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // Upstream defaults — overridable via env so forks can self-update.
@@ -29,7 +31,7 @@ const (
 //
 // Requires `git` and `go` on PATH.
 func runUpdate(ctx context.Context, args []string, stdout, stderr io.Writer) error {
-	repo := envOr("GOON_UPSTREAM", defaultUpstreamRepo)
+	repo := util.EnvOr("GOON_UPSTREAM", defaultUpstreamRepo)
 	ref := defaultUpstreamRef
 	if len(args) > 0 && strings.TrimSpace(args[0]) != "" {
 		ref = strings.TrimSpace(args[0])
@@ -178,11 +180,3 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-// envOr is a tiny local helper duplicated here so cmd has zero internal deps
-// outside of the agent runtime imports.
-func envOr(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
-}

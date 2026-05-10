@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // GitHub uses GitHub Issues as the ticket board.
@@ -113,13 +114,11 @@ func (g *GitHub) List(ctx context.Context) ([]Ticket, error) {
 		if err := json.Unmarshal(body, &raw); err != nil {
 			return nil, fmt.Errorf("github decode %s: %w", repo, err)
 		}
-		var kept int
 		for _, is := range raw {
 			if is.PullRequest != nil {
 				continue // /issues includes PRs; skip them
 			}
 			all = append(all, g.toTicket(repo, is))
-			kept++
 		}
 		if len(raw) >= ghPageSize {
 			fmt.Fprintf(os.Stderr,
@@ -127,7 +126,6 @@ func (g *GitHub) List(ctx context.Context) ([]Ticket, error) {
 					"Tighten GITHUB_LABEL or GITHUB_ASSIGNEE.\n",
 				repo, len(raw), ghPageSize)
 		}
-		_ = kept
 	}
 	return all, nil
 }
@@ -236,7 +234,7 @@ func (g *GitHub) do(ctx context.Context, method, url string, body io.Reader) ([]
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("github http %d: %s", resp.StatusCode, truncate(string(raw), 400))
+		return nil, fmt.Errorf("github http %d: %s", resp.StatusCode, util.Truncate(string(raw), 400))
 	}
 	return raw, nil
 }

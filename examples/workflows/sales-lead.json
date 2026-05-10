@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "name": "sales-lead",
+  "description": "Qualify → draft → push-to-CRM pipeline for inbound leads. Cold leads short-circuit.",
   "branch_prefix": "lead/",
   "pr_title_template": "",
   "pr_body_template": "",

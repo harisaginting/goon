@@ -36,6 +36,8 @@ import (
 	"github.com/harisaginting/goon/internal/atlassian"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/storage"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // Result is the outcome of one component's probe.
@@ -123,15 +125,20 @@ func client(timeout time.Duration) *http.Client {
 // httpClient is overridable in tests so we can target an httptest server.
 var httpClient = client(8 * time.Second)
 
+// newReq is a thin wrapper around http.NewRequestWithContext. If
+// construction fails (extremely rare — bad method / bad URL), it returns
+// a non-nil but unusable Request paired with the error so callers can
+// safely check the error before reading req.Header. Probe helpers detect
+// the error and report it as "request: ..." in the result detail.
 func newReq(ctx context.Context, method, url string, body io.Reader) (*http.Request, error) {
-	return http.NewRequestWithContext(ctx, method, url, body)
-}
-
-func envOr(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
+	if err != nil {
+		// Return a placeholder so a caller that forgets the err check
+		// still gets a non-nil request and panics later in a clearer
+		// place — but the documented contract is "always check err".
+		return &http.Request{Header: http.Header{}}, fmt.Errorf("checkup newReq: %w", err)
 	}
-	return fallback
+	return req, nil
 }
 
 // --- memory ---------------------------------------------------------------
@@ -139,11 +146,9 @@ func envOr(key, fallback string) string {
 func checkMemory() Result {
 	path := os.Getenv("GOON_MEMORY_PATH")
 	if path == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return Result{Component: "memory", OK: false, Detail: "no home dir: " + err.Error()}
-		}
-		path = filepath.Join(home, ".goon", "memory.json")
+		// Mirror internal/memory.New's default so `goon doctor` reports the
+		// same path the agent will actually use.
+		path = storage.Path("memory.json")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return Result{Component: "memory", OK: false, Detail: "cannot create dir: " + err.Error()}
@@ -187,8 +192,12 @@ func probeOpenAI(ctx context.Context) Result {
 		r.Detail = "OPENAI_API_KEY is not set"
 		return r
 	}
-	base := envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
-	req, _ := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/models", nil)
+	base := util.EnvOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
+	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/models", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("Authorization", "Bearer "+key)
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -198,11 +207,11 @@ func probeOpenAI(ctx context.Context) Result {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		body, _ := io.ReadAll(resp.Body)
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(body), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(body), 120))
 		return r
 	}
 	r.OK = true
-	r.Detail = fmt.Sprintf("auth OK · model=%s", envOr("OPENAI_MODEL", "gpt-4o-mini"))
+	r.Detail = fmt.Sprintf("auth OK · model=%s", util.EnvOr("OPENAI_MODEL", "gpt-4o-mini"))
 	return r
 }
 
@@ -213,11 +222,15 @@ func probeAnthropic(ctx context.Context) Result {
 		r.Detail = "ANTHROPIC_API_KEY is not set"
 		return r
 	}
-	base := envOr("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
-	body := []byte(`{"model":"` + envOr("ANTHROPIC_MODEL", "claude-sonnet-4-5") +
+	base := util.EnvOr("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+	body := []byte(`{"model":"` + util.EnvOr("ANTHROPIC_MODEL", "claude-sonnet-4-5") +
 		`","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := newReq(ctx, http.MethodPost,
+	req, err := newReq(ctx, http.MethodPost,
 		strings.TrimRight(base, "/")+"/messages", strings.NewReader(string(body)))
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", key)
 	req.Header.Set("anthropic-version", "2023-06-01")
@@ -229,19 +242,23 @@ func probeAnthropic(ctx context.Context) Result {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	r.OK = true
-	r.Detail = fmt.Sprintf("auth OK · model=%s", envOr("ANTHROPIC_MODEL", "claude-sonnet-4-5"))
+	r.Detail = fmt.Sprintf("auth OK · model=%s", util.EnvOr("ANTHROPIC_MODEL", "claude-sonnet-4-5"))
 	return r
 }
 
 func probeOllama(ctx context.Context) Result {
 	r := Result{Component: "llm", Name: "ollama"}
-	base := envOr("OLLAMA_BASE_URL", "http://localhost:11434")
-	model := envOr("OLLAMA_MODEL", "llama3")
-	req, _ := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/api/tags", nil)
+	base := util.EnvOr("OLLAMA_BASE_URL", "http://localhost:11434")
+	model := util.EnvOr("OLLAMA_MODEL", "llama3")
+	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/api/tags", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		r.Detail = "cannot reach " + base + ": " + err.Error()
@@ -250,7 +267,7 @@ func probeOllama(ctx context.Context) Result {
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		raw, _ := io.ReadAll(resp.Body)
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	var parsed struct {
@@ -267,14 +284,19 @@ func probeOllama(ctx context.Context) Result {
 			break
 		}
 	}
+	// Server reachable but the configured model isn't pulled — that's a
+	// real failure, not a "skipped". The agent loop will hard-fail at
+	// first generate() call, so flag it red here so users see it during
+	// `goon doctor`.
+	if !hasModel {
+		r.OK = false
+		r.Detail = fmt.Sprintf("server OK · %d model(s) installed · model %q not pulled — run: ollama pull %s",
+			len(parsed.Models), model, model)
+		return r
+	}
 	r.OK = true
 	r.Detail = fmt.Sprintf("server OK · %d model(s) installed · target=%s",
 		len(parsed.Models), model)
-	if !hasModel && len(parsed.Models) > 0 {
-		r.OK = true // server reachable counts as OK; advise pull
-		r.Detail += fmt.Sprintf(" · NOTE: model %q not pulled — run `ollama pull %s`",
-			model, model)
-	}
 	return r
 }
 
@@ -305,7 +327,11 @@ func probeJira(ctx context.Context) Result {
 		r.Detail = "set JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN (or shared ATLASSIAN_* equivalents)"
 		return r
 	}
-	req, _ := newReq(ctx, http.MethodGet, c.BaseURL+"/rest/api/3/myself", nil)
+	req, err := newReq(ctx, http.MethodGet, c.BaseURL+"/rest/api/3/myself", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Basic "+
 		base64.StdEncoding.EncodeToString([]byte(c.Email+":"+c.APIToken)))
@@ -317,7 +343,7 @@ func probeJira(ctx context.Context) Result {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	var who struct {
@@ -342,7 +368,7 @@ func probeGitHubBoard(ctx context.Context) Result {
 		r.Detail = "GITHUB_REPOS is not set (need owner/repo[,...])"
 		return r
 	}
-	api := envOr("GITHUB_API_URL", "https://api.github.com")
+	api := util.EnvOr("GITHUB_API_URL", "https://api.github.com")
 	r2 := pingGitHub(ctx, api, tok)
 	if !r2.OK {
 		r.Detail = r2.Detail
@@ -359,11 +385,22 @@ func probeGitHubBoard(ctx context.Context) Result {
 func checkGitHost(ctx context.Context) Result {
 	name := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_GIT_HOST")))
 	if name == "" {
+		// If a board is configured but no git host is, that's a config gap
+		// — the daemon will run the workflow happily but skip the PR step,
+		// which usually surprises users. Surface it as a yellow ⚠ skip
+		// (OK + Skipped + an actionable Detail) instead of a silent ✓.
+		board := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_BOARD")))
+		if board != "" && board != "mock" {
+			return Result{
+				Component: "git_host", OK: true, Skipped: true,
+				Detail: "GOON_GIT_HOST is empty — set GOON_GIT_HOST=github|gitlab|bitbucket plus matching auth (e.g. GITHUB_TOKEN) to enable PR creation",
+			}
+		}
 		return Result{Component: "git_host", OK: true, Skipped: true, Detail: "not configured (PR creation will be skipped)"}
 	}
 	switch name {
 	case "github":
-		api := envOr("GITHUB_API_URL", "https://api.github.com")
+		api := util.EnvOr("GITHUB_API_URL", "https://api.github.com")
 		tok := os.Getenv("GITHUB_TOKEN")
 		if tok == "" {
 			return Result{Component: "git_host", Name: "github", Detail: "GITHUB_TOKEN is not set"}
@@ -386,7 +423,11 @@ func checkGitHost(ctx context.Context) Result {
 
 func pingGitHub(ctx context.Context, api, tok string) Result {
 	r := Result{}
-	req, _ := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -398,7 +439,7 @@ func pingGitHub(ctx context.Context, api, tok string) Result {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	var who struct {
@@ -417,8 +458,12 @@ func probeGitLab(ctx context.Context) Result {
 		r.Detail = "GITLAB_TOKEN is not set"
 		return r
 	}
-	api := envOr("GITLAB_API_URL", "https://gitlab.com/api/v4")
-	req, _ := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	api := util.EnvOr("GITLAB_API_URL", "https://gitlab.com/api/v4")
+	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("PRIVATE-TOKEN", tok)
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -428,7 +473,7 @@ func probeGitLab(ctx context.Context) Result {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	var who struct {
@@ -449,8 +494,12 @@ func probeBitbucket(ctx context.Context) Result {
 		r.Detail = "set BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD"
 		return r
 	}
-	api := envOr("BITBUCKET_API_URL", "https://api.bitbucket.org/2.0")
-	req, _ := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	api := util.EnvOr("BITBUCKET_API_URL", "https://api.bitbucket.org/2.0")
+	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	req.Header.Set("Accept", "application/json")
 	if tok != "" {
 		req.Header.Set("Authorization", "Bearer "+tok)
@@ -466,7 +515,7 @@ func probeBitbucket(ctx context.Context) Result {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
 		return r
 	}
 	var who struct {
@@ -491,8 +540,12 @@ func checkTelegram(ctx context.Context) Result {
 		return Result{} // skip entirely
 	}
 	r := Result{Component: "telegram", Name: "bot"}
-	api := envOr("TELEGRAM_API_BASE_URL", "https://api.telegram.org")
-	req, _ := newReq(ctx, http.MethodGet, fmt.Sprintf("%s/bot%s/getMe", api, tok), nil)
+	api := util.EnvOr("TELEGRAM_API_BASE_URL", "https://api.telegram.org")
+	req, err := newReq(ctx, http.MethodGet, fmt.Sprintf("%s/bot%s/getMe", api, tok), nil)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		r.Detail = err.Error()
@@ -525,13 +578,6 @@ func checkTelegram(ctx context.Context) Result {
 	r.OK = true
 	r.Detail = fmt.Sprintf("auth OK as @%s · chat=%s", parsed.Result.Username, chat)
 	return r
-}
-
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "…"
 }
 
 // AllOK returns true iff every non-skipped result is OK. Used by `goon doctor`

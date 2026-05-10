@@ -1,34 +1,43 @@
 {
-  "version": 2,
+  "version": 1,
+  "name": "engineering",
+  "description": "All-purpose engineering pipeline. Uses goon's built-in 9-phase flow (triage → confirm_repo → approve_plan → execute → test → verify → update_memory → open_pr → notify) with every hook populated. Recommended starting point for any code-tickets workflow.",
   "branch_prefix": "goon/",
-  "test_command": "make test",
+  "test_command": "",
   "verify_runs": 3,
+  "auto_approve": false,
   "pr_title_template": "[{{.Key}}] {{.Title}}",
-  "pr_body_template": "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
-  "extra_labels": ["auto"],
-  "stages": [
-    {
-      "name": "triage",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.1,
-      "max_tokens": 800,
-      "prompt": "You are GOON's planner. Break this ticket into 3-7 ordered atomic engineering steps that an autonomous agent can do one-by-one. Each step must finish in <= 5 tool calls.\n\nReply with EXACTLY ONE JSON object: {\"steps\":[{\"title\":\"...\"}, ...]}.\nNo prose, no fences, no comments.\n\nTICKET:\nkey: {{.Key}}\ntitle: {{.Title}}\nproject: {{.Project}}"
-    },
-    {
-      "name": "execute",
-      "type": "agent",
-      "task": "Implement ticket {{.Key}} ({{.Title}}). Plan:\n{{range .Stages.triage.steps}}- {{.title}}\n{{end}}"
-    },
-    {
-      "name": "verify",
-      "type": "agent",
-      "repeat": 3,
-      "task": "Verify the implementation for ticket {{.Key}} ({{.Title}}) is correct. List any defects via finish."
-    }
-  ],
+  "pr_body_template": "Resolves {{.Key}}.\n\n## Plan\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n\n## Metadata\n- branch: `{{.Branch}}`\n- project: `{{.Project}}`\n- ticket: {{.URL}}\n\n— opened autonomously by goon 🤖",
+  "extra_labels": ["goon", "auto", "needs-review"],
   "hooks": {
-    "before_pr": ["go fmt ./...", "go vet ./..."],
-    "on_failure": ["echo 'workflow failed for {{.Key}}: $(date)' >> ~/.goon/failures.log"]
+    "before_triage": [
+      "echo '→ goon picked up {{.Key}} — {{.Title}}'"
+    ],
+    "before_execute": [
+      "git fetch origin || true",
+      "git checkout -B {{.Branch}}"
+    ],
+    "after_execute": [
+      "echo '✓ all plan steps completed for {{.Key}}'"
+    ],
+    "before_test": [
+      "echo '→ running tests for {{.Key}}'"
+    ],
+    "after_test": [
+      "echo '✓ tests green for {{.Key}}'"
+    ],
+    "before_verify": [],
+    "after_verify": [],
+    "before_pr": [
+      "go fmt ./... || true",
+      "go vet ./... || true",
+      "git diff --stat"
+    ],
+    "after_pr": [
+      "echo '✓ PR opened for {{.Key}} — $TICKET_URL'"
+    ],
+    "on_failure": [
+      "echo 'workflow failed for {{.Key}} — see goon logs --tail=50' >&2"
+    ]
   }
 }

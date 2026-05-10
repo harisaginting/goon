@@ -9,9 +9,11 @@
 //
 // # Where the log goes
 //
-// By default: ~/.goon/logs/goon.log (override with GOON_LOG_FILE).
-// Files rotate when they exceed 10 MB, keeping the 3 most recent rotations
-// (goon.log, goon.log.1, goon.log.2, goon.log.3 — oldest is dropped).
+// By default: ./storage/logs/goon.log (override with GOON_LOG_FILE).
+// Resolution falls back through the storage package, so $GOON_STORAGE_DIR
+// also relocates the log directory. Files rotate when they exceed 10 MB,
+// keeping the 3 most recent rotations (goon.log, goon.log.1, .2, .3 —
+// oldest is dropped).
 //
 // Set GOON_LOG_LEVEL=debug to capture full request/response bodies (truncated
 // to 4 KB). Default level is "info".
@@ -39,6 +41,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/harisaginting/goon/internal/storage"
 )
 
 // Defaults — keep these synced with .env.example documentation.
@@ -49,17 +53,17 @@ const (
 
 // Default log file path resolution. Env vars win:
 //   - GOON_LOG_FILE: absolute or ~-prefixed path
-//   - else: ~/.goon/logs/goon.log
-//   - if HOME isn't resolvable: ./.goon/logs/goon.log (so even containers work)
+//   - else: <storage.Root()>/logs/goon.log (i.e. ./storage/logs/goon.log
+//     by default, or wherever GOON_STORAGE_DIR points)
+//
+// $HOME is intentionally NOT consulted as a fallback. The old default of
+// ~/.goon/logs/goon.log mixed state across projects in surprising ways.
+// See internal/storage for the rationale.
 func defaultLogPath() string {
 	if v := strings.TrimSpace(os.Getenv("GOON_LOG_FILE")); v != "" {
 		return expandTilde(v)
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".goon", "logs", "goon.log")
-	}
-	return filepath.Join(home, ".goon", "logs", "goon.log")
+	return storage.Path("logs", "goon.log")
 }
 
 func expandTilde(p string) string {

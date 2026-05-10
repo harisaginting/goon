@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "name": "engineering-full",
+  "description": "Full 5-stage engineering pipeline: triage → execute → test → verify → summarize. Suitable as a starter for code teams.",
 
   "branch_prefix": "goon/",
   "test_command": "make test",

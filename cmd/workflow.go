@@ -61,10 +61,11 @@ func printWorkflowHelp(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Resolution order (first match wins):")
 	fmt.Fprintln(w, "  1. $GOON_WORKFLOW_FILE")
-	fmt.Fprintln(w, "  2. ./.goon/workflow.json")
-	fmt.Fprintln(w, "  3. $XDG_CONFIG_HOME/goon/workflow.json")
-	fmt.Fprintln(w, "  4. ~/.config/goon/workflow.json")
-	fmt.Fprintln(w, "  5. ~/.goon/workflow.json")
+	fmt.Fprintln(w, "  2. ./workflow.json                (repo root — recommended)")
+	fmt.Fprintln(w, "  3. ./.goon/workflow.json          (legacy)")
+	fmt.Fprintln(w, "  4. $XDG_CONFIG_HOME/goon/workflow.json")
+	fmt.Fprintln(w, "  5. ~/.config/goon/workflow.json")
+	fmt.Fprintln(w, "  6. ~/.goon/workflow.json          (legacy)")
 }
 
 func wfShow(stdout io.Writer) error {
@@ -72,11 +73,18 @@ func wfShow(stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	name := cfg.Name
+	if name == "" {
+		name = "default"
+	}
+	fmt.Fprintf(stdout, "name:        %s\n", name)
+	if cfg.Description != "" {
+		fmt.Fprintf(stdout, "description: %s\n", cfg.Description)
+	}
 	if source == "" {
-		fmt.Fprintf(stdout, "(no workflow.json found — using built-in defaults)\n")
-		fmt.Fprintf(stdout, "create one with:  goon workflow init\n\n")
+		fmt.Fprintf(stdout, "source:      (built-in defaults — `goon workflow init` to customize)\n\n")
 	} else {
-		fmt.Fprintf(stdout, "loaded from: %s\n\n", source)
+		fmt.Fprintf(stdout, "source:      %s\n\n", source)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

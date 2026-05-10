@@ -13,6 +13,7 @@ import (
 
 	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/safety"
 )
 
 // HookCtx is the data passed to template substitution + exported as env vars
@@ -93,7 +94,7 @@ func (r *HookRunner) Run(ctx context.Context, phase string, cmds []string, hctx 
 }
 
 func (r *HookRunner) runOne(ctx context.Context, cmd, cwd string, hctx HookCtx) error {
-	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c := safety.ShellCommand(ctx, cmd)
 	if cwd != "" {
 		if _, err := os.Stat(cwd); err == nil {
 			c.Dir = cwd

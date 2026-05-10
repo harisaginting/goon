@@ -1,5 +1,7 @@
 {
   "version": 2,
+  "name": "marketing-brief",
+  "description": "Brief → review → publish pipeline for marketing campaigns. Skips PR creation.",
   "branch_prefix": "campaign/",
   "pr_title_template": "",
   "pr_body_template": "",

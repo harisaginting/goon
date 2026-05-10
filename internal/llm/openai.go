@@ -83,43 +83,23 @@ func (o *OpenAI) Generate(ctx context.Context, messages []Message, opts Options)
 		jf := map[string]any{"type": "json_object"}
 		body.ResponseFmt = &jf
 	}
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
-			}
-		}
-		out, err := o.doRequest(ctx, body)
-		if err == nil {
-			return out, nil
-		}
-		lastErr = err
-		if !isRetryable(err) {
-			break
-		}
-	}
-	return "", lastErr
-}
-
-func (o *OpenAI) doRequest(ctx context.Context, body openAIChatRequest) (string, error) {
 	buf, err := json.Marshal(body)
 	if err != nil {
 		return "", err
 	}
 	url := strings.TrimRight(o.cfg.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+o.cfg.APIKey)
 
-	resp, err := o.http.Do(req)
+	resp, err := doWithRetry(ctx, o.http, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+o.cfg.APIKey)
+		return req, nil
+	}, 3)
 	if err != nil {
-		return "", &retryableError{err: err}
+		return "", fmt.Errorf("openai: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -127,10 +107,7 @@ func (o *OpenAI) doRequest(ctx context.Context, body openAIChatRequest) (string,
 	if err != nil {
 		return "", err
 	}
-	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-		return "", &retryableError{err: fmt.Errorf("openai http %d: %s", resp.StatusCode, string(raw))}
-	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("openai http %d: %s", resp.StatusCode, string(raw))
 	}
 
@@ -213,14 +190,4 @@ func (o *OpenAI) Stream(ctx context.Context, messages []Message, opts Options, o
 		return assembled.String(), err
 	}
 	return assembled.String(), nil
-}
-
-type retryableError struct{ err error }
-
-func (e *retryableError) Error() string { return e.err.Error() }
-func (e *retryableError) Unwrap() error { return e.err }
-
-func isRetryable(err error) bool {
-	var r *retryableError
-	return errors.As(err, &r)
 }

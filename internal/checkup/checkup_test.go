@@ -135,11 +135,17 @@ func TestProbeOllama_ModelNotPulled(t *testing.T) {
 	t.Setenv("OLLAMA_BASE_URL", ts.URL)
 	t.Setenv("OLLAMA_MODEL", "qwen2.5-coder")
 	r := probeOllama(context.Background())
-	if !r.OK {
-		t.Fatalf("expected server-reachable OK")
+	// Server reachable but the configured model isn't pulled — the agent
+	// loop will fail at first generate(), so doctor flags it red so the
+	// user sees the misconfig before launching `goon start`.
+	if r.OK {
+		t.Fatalf("expected fail when configured model isn't installed: %+v", r)
 	}
 	if !strings.Contains(r.Detail, "not pulled") {
 		t.Errorf("expected 'not pulled' note: %q", r.Detail)
+	}
+	if !strings.Contains(r.Detail, "ollama pull qwen2.5-coder") {
+		t.Errorf("expected actionable hint: %q", r.Detail)
 	}
 }
 

@@ -6,14 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+
+	"github.com/harisaginting/goon/internal/safety"
 )
 
-// RunCommand executes a shell command via "sh -c". Safety validation is
-// applied by the executor, NOT here — this tool is intentionally dumb.
+// RunCommand executes a shell command via the host shell ("sh -c" on POSIX,
+// "cmd /C" on Windows). Safety validation is applied by the executor, NOT
+// here — this tool is intentionally dumb.
 type RunCommand struct{}
 
 func (*RunCommand) Name() string        { return "run_command" }
-func (*RunCommand) Description() string { return "execute a shell command via sh -c" }
+func (*RunCommand) Description() string {
+	return "execute a shell command via the host shell (sh -c on POSIX, cmd /C on Windows)"
+}
 func (*RunCommand) Schema() map[string]string {
 	return map[string]string{"command": "shell command string"}
 }
@@ -23,7 +28,7 @@ func (*RunCommand) Run(ctx context.Context, args map[string]string) (Result, err
 	if cmd == "" {
 		return Result{ToolName: "run_command"}, errors.New(`run_command: "command" is required`)
 	}
-	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c := safety.ShellCommand(ctx, cmd)
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr

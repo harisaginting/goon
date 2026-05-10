@@ -6,12 +6,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"syscall"
 	"time"
 )
 
-// runStop sends SIGTERM to the daemon recorded in the pid file and waits up
-// to ~5 seconds for it to exit.
+// runStop asks the daemon recorded in the pid file to exit gracefully and
+// waits up to ~5 seconds. On POSIX we send SIGTERM; on Windows there is no
+// SIGTERM, so we send os.Interrupt (which Go's runtime translates into a
+// CTRL_BREAK_EVENT for the target console). If the process is still alive
+// after the grace period we hard-kill in both cases.
 func runStop(_ context.Context, _ []string, stdout, stderr io.Writer) error {
 	pidPath := pidFilePath()
 	pid, err := readPIDFile(pidPath)
@@ -32,7 +36,7 @@ func runStop(_ context.Context, _ []string, stdout, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := p.Signal(syscall.SIGTERM); err != nil {
+	if err := p.Signal(stopSignal()); err != nil {
 		if errors.Is(err, os.ErrProcessDone) {
 			removePIDFile(pidPath)
 			return nil
@@ -51,4 +55,15 @@ func runStop(_ context.Context, _ []string, stdout, stderr io.Writer) error {
 	_ = p.Kill()
 	removePIDFile(pidPath)
 	return nil
+}
+
+// stopSignal returns the platform-appropriate "graceful stop" signal.
+// On POSIX: SIGTERM. On Windows: os.Interrupt — sending syscall.SIGTERM via
+// os.Process.Signal on Windows returns "not supported", whereas
+// os.Interrupt is honoured (translated to CTRL_BREAK_EVENT).
+func stopSignal() os.Signal {
+	if runtime.GOOS == "windows" {
+		return os.Interrupt
+	}
+	return syscall.SIGTERM
 }

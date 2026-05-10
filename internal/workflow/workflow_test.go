@@ -36,6 +36,11 @@ func newEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githost
 		Board: board, Host: host,
 		Stdout: &out, Stderr: &out,
 		VerifyRunsOverride: 1, // keep tests fast
+		// Tests exercise the engine end-to-end without a human at the
+		// keyboard; auto-approve skips the new confirm_repo / approve_plan
+		// gates. Specific tests that exercise those gates create a separate
+		// engine and toggle this off.
+		AutoApprove: true,
 	}
 	return e, &out, host, board, mem
 }
@@ -333,5 +338,245 @@ func TestPickRepo(t *testing.T) {
 	}
 	if got := pickRepo(boards.Ticket{Project: "OTHER"}); got != "/r/default" {
 		t.Errorf("OTHER: %q", got)
+	}
+}
+
+// gatedEngine is like newEngine but with AutoApprove=false so the gate
+// pause/resume behaviour can be exercised end-to-end.
+func gatedEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githost.Mock, *boards.Mock, *memory.Memory) {
+	t.Helper()
+	mock := llm.NewMock(replies)
+	reg := tools.DefaultRegistry()
+	var out bytes.Buffer
+	exec := executor.New(executor.Options{
+		Mode:      executor.ModeAuto,
+		Validator: safety.Default(),
+		Stdin:     strings.NewReader(""),
+		Stdout:    &out,
+		Stderr:    &out,
+	})
+	mem := memory.Disabled()
+	host := githost.NewMock()
+	board := boards.NewMock(nil)
+	e := &Engine{
+		LLM: mock, Tools: reg, Executor: exec, Memory: mem,
+		Board: board, Host: host,
+		Stdout: &out, Stderr: &out,
+		VerifyRunsOverride: 1,
+		AutoApprove:        false,
+	}
+	return e, &out, host, board, mem
+}
+
+func TestEngine_PausesAtConfirmRepoGate(t *testing.T) {
+	replies := []string{
+		`{"steps":[{"title":"x"}],"repo":"o/r"}`,
+	}
+	e, out, host, _, mem := gatedEngine(t, replies)
+
+	wf, err := e.Run(context.Background(), boards.Ticket{
+		ID: "ENG-1", Source: "jira", Key: "ENG-1",
+		Title: "Add login", Project: "ENG",
+	})
+	if err != nil {
+		t.Fatalf("expected no error on pause, got %v\n%s", err, out.String())
+	}
+	if wf.State != memory.WFAwaitingApproval {
+		t.Fatalf("state = %q, want %q", wf.State, memory.WFAwaitingApproval)
+	}
+	if wf.Stage != "confirm_repo" {
+		t.Fatalf("stage = %q, want confirm_repo", wf.Stage)
+	}
+	if wf.PendingQuestionID == "" {
+		t.Fatal("PendingQuestionID not set")
+	}
+	if len(host.Opened) != 0 {
+		t.Fatalf("PR opened before approval: %v", host.Opened)
+	}
+	if len(mem.PendingQuestions()) != 1 {
+		t.Fatalf("expected 1 pending question, got %d", len(mem.PendingQuestions()))
+	}
+}
+
+func TestEngine_ResumesAfterApproval(t *testing.T) {
+	replies := []string{
+		// Run 1: triage
+		`{"steps":[{"title":"x"}],"repo":"o/r"}`,
+		// Run 3: execute step + verify pass + update_memory agent task
+		`{"tool":"finish","args":{"message":"step done"}}`,
+		`{"tool":"finish","args":{"message":"verified"}}`,
+		`{"tool":"finish","args":{"message":"noted"}}`,
+	}
+	e, out, host, _, mem := gatedEngine(t, replies)
+	ticket := boards.Ticket{
+		ID: "ENG-1", Source: "jira", Key: "ENG-1",
+		Title: "Add login", Project: "ENG",
+	}
+
+	// Run 1: triage runs, pauses at confirm_repo.
+	wf, err := e.Run(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("run1: %v\n%s", err, out.String())
+	}
+	if wf.Stage != "confirm_repo" {
+		t.Fatalf("run1 stage = %q want confirm_repo (state=%s err=%s)", wf.Stage, wf.State, wf.Error)
+	}
+
+	// Answer the confirm_repo question.
+	pending := mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("after run1 pending = %d", len(pending))
+	}
+	if !mem.AnswerQuestion(pending[0].ID, "yes") {
+		t.Fatal("answer 1 failed")
+	}
+
+	// Run 2: confirm_repo passes, pauses at approve_plan.
+	wf, err = e.Run(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("run2: %v\n%s", err, out.String())
+	}
+	if wf.Stage != "approve_plan" {
+		t.Fatalf("run2 stage = %q want approve_plan (state=%s err=%s)", wf.Stage, wf.State, wf.Error)
+	}
+	if got := wf.Approvals["confirm_repo"]; got != "yes" {
+		t.Fatalf("confirm_repo approval = %q want yes", got)
+	}
+
+	// Answer the approve_plan question.
+	pending = mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("after run2 pending = %d", len(pending))
+	}
+	if !mem.AnswerQuestion(pending[0].ID, "yes") {
+		t.Fatal("answer 2 failed")
+	}
+
+	// Run 3: should run to completion.
+	wf, err = e.Run(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("run3: %v\n%s", err, out.String())
+	}
+	if wf.State != memory.WFDone {
+		t.Fatalf("run3 state = %q err=%q", wf.State, wf.Error)
+	}
+	if len(host.Opened) != 1 {
+		t.Errorf("expected 1 PR, got %d", len(host.Opened))
+	}
+	if got := wf.Approvals["approve_plan"]; got != "yes" {
+		t.Errorf("approve_plan approval = %q want yes", got)
+	}
+}
+
+func TestEngine_RejectedPlanFailsWorkflow(t *testing.T) {
+	replies := []string{
+		`{"steps":[{"title":"x"}],"repo":"o/r"}`,
+	}
+	e, out, host, _, mem := gatedEngine(t, replies)
+	ticket := boards.Ticket{
+		ID: "ENG-2", Source: "jira", Key: "ENG-2",
+		Title: "Bad idea", Project: "ENG",
+	}
+
+	// Run 1: triage runs, pauses at confirm_repo.
+	if _, err := e.Run(context.Background(), ticket); err != nil {
+		t.Fatalf("run1: %v\n%s", err, out.String())
+	}
+	pending := mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("pending after run1: %d", len(pending))
+	}
+	mem.AnswerQuestion(pending[0].ID, "yes") // confirm repo
+
+	// Run 2: pauses at approve_plan; user rejects.
+	if _, err := e.Run(context.Background(), ticket); err != nil {
+		t.Fatalf("run2: %v\n%s", err, out.String())
+	}
+	pending = mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("pending after run2: %d", len(pending))
+	}
+	mem.AnswerQuestion(pending[0].ID, "no")
+
+	// Run 3: should fail at approve_plan.
+	wf, err := e.Run(context.Background(), ticket)
+	if err == nil {
+		t.Fatalf("expected rejection error, got none\n%s", out.String())
+	}
+	if wf.State != memory.WFFailed {
+		t.Fatalf("state = %q want failed", wf.State)
+	}
+	if !strings.Contains(wf.Error, "approve_plan") {
+		t.Errorf("error = %q should mention approve_plan", wf.Error)
+	}
+	if len(host.Opened) != 0 {
+		t.Errorf("PR should not be opened on rejection, got %d", len(host.Opened))
+	}
+}
+
+func TestParseRepoChange(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantPath string
+		wantOK   bool
+	}{
+		{"yes", "", false},
+		{"no", "", false},
+		{"change=/repo/eng", "/repo/eng", true},
+		{"repo=~/code/x", "~/code/x", true},
+		{"/abs/path", "/abs/path", true},
+		{"./relative", "./relative", true},
+		{"some-bare-word", "", false},
+		{"path with space", "", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		got, ok := parseRepoChange(tc.in)
+		if got != tc.wantPath || ok != tc.wantOK {
+			t.Errorf("parseRepoChange(%q) = (%q, %v) want (%q, %v)",
+				tc.in, got, ok, tc.wantPath, tc.wantOK)
+		}
+	}
+}
+
+func TestIsYes(t *testing.T) {
+	yesCases := []string{"yes", "YES", "y", "ok", "Approve", "lgtm", "go", "ship", "auto:approved", "  Yes  "}
+	for _, s := range yesCases {
+		if !isYes(s) {
+			t.Errorf("isYes(%q) = false, want true", s)
+		}
+	}
+	noCases := []string{"no", "n", "reject", "maybe", "later", ""}
+	for _, s := range noCases {
+		if isYes(s) {
+			t.Errorf("isYes(%q) = true, want false", s)
+		}
+	}
+}
+
+func TestIsAutoApprove(t *testing.T) {
+	e := &Engine{}
+	cfg := WorkflowConfig{}
+	t.Setenv("GOON_AUTO_APPROVE", "")
+	if e.isAutoApprove(cfg) {
+		t.Error("default should be false")
+	}
+	e.AutoApprove = true
+	if !e.isAutoApprove(cfg) {
+		t.Error("Engine.AutoApprove ignored")
+	}
+	e.AutoApprove = false
+	cfg.AutoApprove = true
+	if !e.isAutoApprove(cfg) {
+		t.Error("cfg.AutoApprove ignored")
+	}
+	cfg.AutoApprove = false
+	t.Setenv("GOON_AUTO_APPROVE", "1")
+	if !e.isAutoApprove(cfg) {
+		t.Error("env var ignored")
+	}
+	t.Setenv("GOON_AUTO_APPROVE", "no")
+	if e.isAutoApprove(cfg) {
+		t.Error("env=no should not enable")
 	}
 }

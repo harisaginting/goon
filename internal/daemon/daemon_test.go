@@ -18,6 +18,9 @@ import (
 )
 
 func TestDaemon_PollPicksAndRunsWorkflow(t *testing.T) {
+	// Skip the user-approval gates so this end-to-end test runs to completion
+	// in a single tick. Production daemons leave gates on by default.
+	t.Setenv("GOON_AUTO_APPROVE", "1")
 	mem := memory.Disabled()
 	board := boards.NewMock([]boards.Ticket{
 		{
@@ -31,6 +34,7 @@ func TestDaemon_PollPicksAndRunsWorkflow(t *testing.T) {
 		`{"steps":[{"title":"add login"}]}`,
 		`{"tool":"finish","args":{"message":"done"}}`,
 		`{"tool":"finish","args":{"message":"verified"}}`,
+		`{"tool":"finish","args":{"message":"noted"}}`, // update_memory phase
 	})
 	var out bytes.Buffer
 	exec := executor.New(executor.Options{
@@ -133,6 +137,75 @@ func TestDaemon_StatusLifecycle(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if mem.GetStatus().Running {
 		t.Fatal("expected running=false after cancel")
+	}
+}
+
+func TestDaemon_ResumesPausedWorkflow(t *testing.T) {
+	// Pre-seed memory with a paused workflow whose pending question has been
+	// answered. The daemon should pick it up via ResumableWorkflow() before
+	// looking at fresh tickets, fetch the ticket via board.Get, and call
+	// engine.Run to drive it forward. With GOON_AUTO_APPROVE=1 the resumed
+	// workflow runs to completion in this single tick.
+	t.Setenv("GOON_AUTO_APPROVE", "1")
+	mem := memory.Disabled()
+	mem.UpsertWorkflow(memory.Workflow{
+		ID:                "wf-paused",
+		TicketID:          "ENG-1",
+		TicketKey:         "ENG-1",
+		Title:             "Add login",
+		State:             memory.WFAwaitingApproval,
+		Stage:             "confirm_repo",
+		PendingQuestionID: "q-1",
+		Plan:              []memory.PlanStep{{Index: 0, Title: "x"}},
+		Repo:              "/tmp/nope",
+	})
+	mem.AskQuestion(memory.Question{ID: "q-1", TicketID: "ENG-1", Question: "Confirm repo"})
+	mem.AnswerQuestion("q-1", "yes")
+
+	board := boards.NewMock([]boards.Ticket{
+		{
+			ID: "ENG-1", Source: "jira", Key: "ENG-1",
+			Title: "Add login", Status: boards.StatusInProgress, Project: "ENG",
+			UpdatedAt: time.Now(),
+		},
+	})
+	host := githost.NewMock()
+	// With auto-approve, gates pass instantly. Resume runs from confirm_repo,
+	// breezes through approve_plan, then needs LLM for execute / verify /
+	// update_memory. Triage is skipped because Plan is already populated.
+	mock := llm.NewMock([]string{
+		`{"tool":"finish","args":{"message":"done"}}`,
+		`{"tool":"finish","args":{"message":"verified"}}`,
+		`{"tool":"finish","args":{"message":"noted"}}`,
+	})
+	var out bytes.Buffer
+	exec := executor.New(executor.Options{
+		Mode: executor.ModeAuto, Validator: safety.Default(),
+		Stdin: strings.NewReader(""), Stdout: &out, Stderr: &out,
+	})
+	d := New(Options{
+		LLM: mock, Tools: tools.DefaultRegistry(), Executor: exec,
+		Memory: mem, Board: board, Host: host,
+		Stdout: &out, Stderr: &out,
+		PollInterval:       50 * time.Millisecond,
+		VerifyRunsOverride: 1,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+	defer cancel()
+	_ = d.Run(ctx)
+
+	wf, ok := mem.GetWorkflow("wf-paused")
+	if !ok {
+		t.Fatalf("workflow disappeared:\n%s", out.String())
+	}
+	if wf.State != memory.WFDone {
+		t.Fatalf("resumed workflow not done: state=%q err=%q\n%s", wf.State, wf.Error, out.String())
+	}
+	if !strings.Contains(out.String(), "resuming") {
+		t.Errorf("expected 'resuming' in output:\n%s", out.String())
+	}
+	if len(host.Opened) != 1 {
+		t.Errorf("expected 1 PR opened, got %d", len(host.Opened))
 	}
 }
 

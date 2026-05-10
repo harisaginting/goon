@@ -25,6 +25,12 @@ header {
 h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
 h1 .robot { color: var(--accent); }
 .subtitle { color: var(--muted); font-size: 13px; }
+.docs-link {
+  margin-left: auto;
+  color: var(--muted); text-decoration: none; font-size: 13px;
+  padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border);
+}
+.docs-link:hover { color: var(--accent); border-color: var(--accent); }
 main { padding: 20px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
 section.card {
@@ -128,6 +134,7 @@ footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px
 <header>
   <h1><span class="robot">🤖</span> goon</h1>
   <span class="subtitle">autonomous AI engineer</span>
+  <a href="/docs" class="docs-link" target="_blank" rel="noopener" title="Open the embedded documentation">📖 docs</a>
 </header>
 
 <div hx-get="/fragments/setup" hx-trigger="load, every 5s, configChanged from:body" hx-swap="innerHTML"></div>
@@ -158,6 +165,6 @@ footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px
     <div hx-get="/fragments/config" hx-trigger="load, configChanged from:body">loading config…</div>
   </section>
 </main>
-<footer>goon · same memory as the CLI · all data lives at <code>~/.goon/memory.json</code></footer>
+<footer>goon · same memory as the CLI · all data lives at <code>./storage/memory.json</code></footer>
 </body>
 </html>

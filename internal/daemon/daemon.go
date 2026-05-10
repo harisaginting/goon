@@ -17,9 +17,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -260,8 +260,47 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 
 	prov, board, host := d.Snapshot()
 	if prov == nil || board == nil {
-		fmt.Fprintf(d.opts.Stdout, "[poll] waiting for config — open the web UI to configure goon\n")
+		// Tell the user what to do, regardless of whether --web is on. The
+		// web UI link is one option; `goon doctor` also surfaces missing
+		// providers + the exact env vars to set.
+		st := d.opts.Memory.GetStatus()
+		fix := "run `goon doctor` to see which providers are missing"
+		if st.WebAddr != "" {
+			fix = "open http://" + strings.TrimPrefix(st.WebAddr, ":") + " or run `goon doctor`"
+		}
+		fmt.Fprintf(d.opts.Stdout, "[poll] waiting for config — %s\n", fix)
 		return
+	}
+
+	eng := &workflow.Engine{
+		LLM: prov, Tools: d.opts.Tools, Executor: d.opts.Executor,
+		Memory: d.opts.Memory, Board: board, Host: host,
+		Stdout: d.opts.Stdout, Stderr: d.opts.Stderr, Debug: d.opts.Debug,
+		VerifyRunsOverride: d.opts.VerifyRunsOverride,
+	}
+
+	// Resume path — a previously-paused workflow whose approval question is
+	// now answered takes priority over picking up new tickets. We process at
+	// most one workflow per tick to keep the daemon's behaviour predictable.
+	if wf, ok := d.opts.Memory.ResumableWorkflow(); ok {
+		t, err := board.Get(ctx, wf.TicketID)
+		if err != nil {
+			fmt.Fprintf(d.opts.Stderr, "[poll] cannot resume %s: %v\n", wf.ID, err)
+		} else {
+			fmt.Fprintf(d.opts.Stdout, "[poll] resuming %s at %s — %s\n", wf.TicketKey, wf.Stage, wf.Title)
+			st = d.opts.Memory.GetStatus()
+			st.LastTicket = wf.TicketID
+			st.ActiveWorkflow = wf.ID
+			d.opts.Memory.SetStatus(st)
+			resumed, runErr := eng.Run(ctx, t)
+			st = d.opts.Memory.GetStatus()
+			st.ActiveWorkflow = resumed.ID
+			d.opts.Memory.SetStatus(st)
+			if runErr != nil {
+				fmt.Fprintf(d.opts.Stderr, "[poll] workflow %s failed: %v\n", resumed.ID, runErr)
+			}
+			return
+		}
 	}
 
 	tickets, err := board.List(ctx)
@@ -292,12 +331,6 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 	st.LastTicket = pick.ID
 	d.opts.Memory.SetStatus(st)
 
-	eng := &workflow.Engine{
-		LLM: prov, Tools: d.opts.Tools, Executor: d.opts.Executor,
-		Memory: d.opts.Memory, Board: board, Host: host,
-		Stdout: d.opts.Stdout, Stderr: d.opts.Stderr, Debug: d.opts.Debug,
-		VerifyRunsOverride: d.opts.VerifyRunsOverride,
-	}
 	wf, runErr := eng.Run(ctx, *pick)
 	st = d.opts.Memory.GetStatus()
 	st.ActiveWorkflow = wf.ID
@@ -313,21 +346,19 @@ func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
 	var best *boards.Ticket
 	for i := range tickets {
 		t := &tickets[i]
-		log.Println("====== status", t.Status)
+		logx.Info("========", t.Title, t.Status)
 		if t.Status != boards.StatusOpen && t.Status != boards.StatusUnknown && t.Status != boards.StatusInProgress {
-			log.Println("====== 1")
 			continue
 		}
+		logx.Info("========", t.Title, t.Status, d.opts.Memory.HasOpenWorkflowFor(t.ID))
 		if d.opts.Memory.HasOpenWorkflowFor(t.ID) {
-			log.Println("====== 2")
 			continue
 		}
+		logx.Info("========", t.Title, t.Status, d.opts.Memory.HasCompletedWorkflowFor(t.ID))
 		if d.opts.Memory.HasCompletedWorkflowFor(t.ID) {
-			log.Println("====== 3")
 			continue
 		}
 		if best == nil || t.UpdatedAt.After(best.UpdatedAt) {
-			log.Println("====== 4")
 			best = t
 		}
 	}

@@ -81,13 +81,15 @@ func (o *Ollama) Generate(ctx context.Context, messages []Message, opts Options)
 		return "", err
 	}
 	url := strings.TrimRight(o.cfg.BaseURL, "/") + "/api/chat"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := o.http.Do(req)
+	resp, err := doWithRetry(ctx, o.http, func() (*http.Request, error) {
+		req, rerr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
+		if rerr != nil {
+			return nil, rerr
+		}
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	}, 3)
 	if err != nil {
 		return "", fmt.Errorf("ollama: %w", err)
 	}
@@ -97,7 +99,7 @@ func (o *Ollama) Generate(ctx context.Context, messages []Message, opts Options)
 	if err != nil {
 		return "", err
 	}
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("ollama http %d: %s", resp.StatusCode, truncate(string(raw), 400))
 	}
 

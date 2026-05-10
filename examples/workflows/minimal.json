@@ -1,0 +1,5 @@
+{
+  "version": 1,
+  "name": "minimal",
+  "description": "Smallest working workflow. Everything not set inherits from goon's built-in defaults: 9-phase pipeline with two approval gates, branch_prefix=goon/, verify_runs=3."
+}

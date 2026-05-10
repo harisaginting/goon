@@ -1,16 +1,27 @@
 // Package workflow implements goon's autonomous engineering pipeline.
 //
-//	Triage   — classify the ticket, pick a target repo
-//	Plan     — produce an ordered TODO list
-//	Execute  — run the existing agent loop on each TODO
-//	Test     — run the repo's test command (best-effort)
-//	Verify   — re-run the agent N times to double-check the work
-//	OpenPR   — push the branch and create a PR / MR
-//	Notify   — Telegram message with a link to the PR
+//	Triage         — classify the ticket, propose a target repo + plan
+//	ConfirmRepo    — gate: ask the user to confirm/override the repo
+//	ApprovePlan    — gate: ask the user to approve the work + test plan
+//	Execute        — run the agent loop on each plan step
+//	Test           — run the repo's test command (best-effort)
+//	Verify         — re-run the agent N times to double-check the work
+//	UpdateMemory   — distil learnings into the markdown notes store (PINNED.md / topic notes)
+//	OpenPR         — push the branch and create a PR / MR
+//	Notify         — Telegram message with a link to the PR
 //
-// Each phase is a focused LLM call with strict-JSON output, run on top of the
-// existing agent / executor / safety layers. Workflow state is persisted to
-// memory after every phase so a crash mid-flight leaves a recoverable trail.
+// The pipeline is a resumable state machine. ConfirmRepo and ApprovePlan
+// queue questions in memory and pause the workflow (state =
+// WFAwaitingApproval). The daemon picks the workflow up again on a later
+// tick once the user replies via `goon train` or the web UI.
+//
+// Set workflow.json `auto_approve: true` (or env GOON_AUTO_APPROVE=1) to
+// skip the gates entirely for fully unattended runs.
+//
+// Each phase is a focused LLM call with strict-JSON output, run on top of
+// the existing agent / executor / safety layers. Workflow state is persisted
+// to memory after every phase so a crash mid-flight leaves a recoverable
+// trail.
 package workflow
 
 import (
@@ -82,185 +93,565 @@ type Engine struct {
 	// Config — when zero, LoadConfig is consulted lazily inside Run().
 	// Provide explicitly to skip on-disk config loading (useful in tests).
 	Config WorkflowConfig
+
+	// AutoApprove, when true, skips every user-approval gate. Tests use
+	// this to keep the existing happy-path assertions; in production the
+	// equivalent knob is cfg.AutoApprove or env var GOON_AUTO_APPROVE.
+	AutoApprove bool
 }
 
-// Run runs the workflow for one ticket. It returns the final Workflow record.
-// Any error is also recorded inside the Workflow.
+// errPaused is the sentinel a phase returns when it asks the user a question
+// and needs to wait for an answer. Run() catches it and returns the workflow
+// in WFAwaitingApproval state without firing the on_failure hook.
+var errPaused = errors.New("workflow paused: awaiting user answer")
+
+// phase is one entry in the built-in pipeline.
+type phase struct {
+	name string
+	fn   func(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error
+}
+
+// phaseCtx is shared state for the duration of a single Run() call. It
+// carries the resolved WorkflowConfig, the hook runner, the branch name and
+// the auto-approve flag so phase functions don't need a long arg list.
+type phaseCtx struct {
+	cfg         WorkflowConfig
+	hr          *HookRunner
+	branch      string
+	autoApprove bool
+}
+
+// Run runs (or resumes) the workflow for one ticket. It returns the final
+// Workflow record. Any error is also recorded inside the Workflow.
 //
-// At every phase boundary we look up user-defined hook commands from the
-// loaded WorkflowConfig and run them sequentially. A failed hook fails the
-// phase (except on_failure, which is best-effort).
+// The pipeline is a resumable state machine:
+//
+//	triage → confirm_repo → approve_plan → execute → test → verify →
+//	  update_memory → open_pr → notify
+//
+// confirm_repo and approve_plan use ask_user-style gates (queue a Question
+// in memory, set wf.State=WFAwaitingApproval, and return — the daemon picks
+// the workflow up again on a later tick once the user replies). update_memory
+// runs an agent task that distils what the workflow learned into the markdown
+// notes store (PINNED.md / topic notes). Set cfg.AutoApprove or env var
+// GOON_AUTO_APPROVE=1 to skip the gates entirely for unattended runs.
+//
+// Hooks fire at the same boundaries as before so existing workflow.json
+// configs keep working unchanged.
 func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, error) {
-	wf := memory.Workflow{
-		ID:        fmt.Sprintf("wf-%d", time.Now().UnixNano()),
-		TicketID:  t.ID,
-		TicketKey: t.Key,
-		Title:     t.Title,
-		StartedAt: time.Now(),
-		State:     memory.WFTriaging,
+	cfg := e.resolveConfig()
+	wfName := cfg.Name
+	if wfName == "" {
+		wfName = "default"
 	}
+	branch := branchName(cfg.BranchPrefix, t.Key)
+
+	// Resume if we already have an open workflow for this ticket; otherwise
+	// initialise a fresh record.
+	wf, resuming := e.openOrInitWorkflow(t, branch)
 	e.save(wf)
-	logx.Info("workflow.start", "wf", wf.ID, "ticket", t.Key, "title", t.Title)
+
+	logx.Info("workflow.start",
+		"wf", wf.ID, "name", wfName,
+		"ticket", t.Key, "title", t.Title,
+		"stages", len(cfg.Stages), "stage", wf.Stage,
+		"resuming", resuming,
+	)
+	if e.Stdout != nil {
+		if resuming {
+			fmt.Fprintf(e.Stdout, "[workflow] %s resuming %s at %s — %q\n", wfName, t.Key, wf.Stage, t.Title)
+		} else {
+			fmt.Fprintf(e.Stdout, "[workflow] %s started for %s — %q\n", wfName, t.Key, t.Title)
+		}
+	}
 	defer func() {
-		logx.Info("workflow.end", "wf", wf.ID, "ticket", t.Key,
-			"state", string(wf.State), "pr_url", wf.PRURL,
+		logx.Info("workflow.end", "wf", wf.ID, "name", wfName, "ticket", t.Key,
+			"state", string(wf.State), "stage", wf.Stage, "pr_url", wf.PRURL,
 			"duration_ms", time.Since(wf.StartedAt).Milliseconds())
 	}()
 
-	// Resolve config: explicit Config wins; otherwise load from disk.
-	cfg := e.Config
-	if cfg.Version == 0 {
-		loaded, _, _ := LoadConfig("")
-		cfg = loaded
-	}
 	hr := &HookRunner{
 		Stdout: e.Stdout, Stderr: e.Stderr,
 		Validator: safety.Default(),
 	}
 
-	branch := branchName(cfg.BranchPrefix, t.Key)
-	wf.Branch = branch
-
 	// --- Declarative stages mode ---------------------------------------------
-	// When the user provides cfg.Stages, the built-in 7-phase pipeline is
-	// replaced wholesale with their declared sequence. Hooks (before_triage,
-	// on_failure, etc.) and PR/notify still fire so existing config keys keep
-	// working; the *body* of the workflow is now whatever the user wrote.
+	// When the user provides cfg.Stages, the built-in pipeline is replaced
+	// wholesale with their declared sequence. Approval gates do NOT fire here
+	// — declarative pipelines are an explicit opt-in to a fully-custom flow.
 	if len(cfg.Stages) > 0 {
 		return e.runStages(ctx, wf, t, cfg, hr, branch)
 	}
 
-	// before_triage hook
-	hctx := FromTicket(t, "", branch, nil)
-	if err := hr.Run(ctx, HookBeforeTriage, cfg.Hook(HookBeforeTriage), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_triage", err)
+	pctx := &phaseCtx{
+		cfg:         cfg,
+		hr:          hr,
+		branch:      branch,
+		autoApprove: e.isAutoApprove(cfg),
 	}
 
-	// 1. Triage.
-	plan, repo, err := e.triage(ctx, t)
-	if err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "triage", err)
+	phases := []phase{
+		{name: "triage", fn: e.phaseTriage},
+		{name: "confirm_repo", fn: e.phaseConfirmRepo},
+		{name: "approve_plan", fn: e.phaseApprovePlan},
+		{name: "execute", fn: e.phaseExecute},
+		{name: "test", fn: e.phaseTest},
+		{name: "verify", fn: e.phaseVerify},
+		{name: "update_memory", fn: e.phaseUpdateMemory},
+		{name: "open_pr", fn: e.phaseOpenPR},
+		{name: "notify", fn: e.phaseNotify},
 	}
-	wf.Repo = repo
-	wf.Plan = plan
-	wf.State = memory.WFPlanning
-	e.save(wf)
-
-	// before_execute hook
-	hctx = FromTicket(t, repo, branch, plan)
-	if err := hr.Run(ctx, HookBeforeExecute, cfg.Hook(HookBeforeExecute), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_execute", err)
+	start := indexOfPhase(phases, wf.Stage)
+	if start < 0 {
+		start = 0
 	}
 
-	wf.State = memory.WFExecuting
-	e.save(wf)
-
-	// 3. Execute each plan step.
-	for i := range wf.Plan {
+	for i := start; i < len(phases); i++ {
 		select {
 		case <-ctx.Done():
-			return e.fail(wf, "executing", ctx.Err())
+			return e.fail(wf, phases[i].name, ctx.Err())
 		default:
 		}
-		step := wf.Plan[i]
-		if step.Done {
+		wf.Stage = phases[i].name
+		e.save(wf)
+		err := phases[i].fn(ctx, &wf, t, pctx)
+		if err == nil {
 			continue
 		}
-		if err := e.executeStep(ctx, wf.TicketKey, step.Title); err != nil {
-			wf.Plan[i].Note = err.Error()
-			e.save(wf)
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "executing", err)
+		if errors.Is(err, errPaused) {
+			// Gate paused us; state already saved by the gate.
+			return wf, nil
 		}
-		wf.Plan[i].Done = true
-		e.save(wf)
-	}
-
-	// after_execute hook
-	hctx = FromTicket(t, repo, branch, wf.Plan)
-	if err := hr.Run(ctx, HookAfterExecute, cfg.Hook(HookAfterExecute), hctx); err != nil {
+		hctx := FromTicket(t, wf.Repo, branch, wf.Plan)
 		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "after_execute", err)
+		return e.fail(wf, phases[i].name, err)
 	}
 
-	// 4. Test phase.
-	wf.State = memory.WFTesting
-	e.save(wf)
-	if err := hr.Run(ctx, HookBeforeTest, cfg.Hook(HookBeforeTest), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_test", err)
-	}
-	testErr := e.runTests(ctx, repo, cfg.TestCommand)
-	if testErr != nil {
-		// Tests failing is logged but not fatal — the verify pass catches real regressions.
-		fmt.Fprintf(e.Stderr, "tests failed (non-fatal): %v\n", testErr)
-	} else {
-		if err := hr.Run(ctx, HookAfterTest, cfg.Hook(HookAfterTest), hctx); err != nil {
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "after_test", err)
-		}
-	}
-
-	// 5. Verify N times.
-	wf.State = memory.WFVerifying
-	wf.VerifyRuns = e.verifyN(cfg)
-	e.save(wf)
-	if err := hr.Run(ctx, HookBeforeVerify, cfg.Hook(HookBeforeVerify), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_verify", err)
-	}
-	for i := 0; i < wf.VerifyRuns; i++ {
-		select {
-		case <-ctx.Done():
-			return e.fail(wf, "verifying", ctx.Err())
-		default:
-		}
-		if err := e.verifyOnce(ctx, t); err != nil {
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "verifying", fmt.Errorf("verify pass %d: %w", i+1, err))
-		}
-	}
-	if err := hr.Run(ctx, HookAfterVerify, cfg.Hook(HookAfterVerify), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "after_verify", err)
-	}
-
-	// 6. Open PR.
-	wf.State = memory.WFOpeningPR
-	e.save(wf)
-	if err := hr.Run(ctx, HookBeforePR, cfg.Hook(HookBeforePR), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_pr", err)
-	}
-	if e.Host != nil {
-		pr, err := e.openPR(ctx, t, wf, repo, cfg)
-		if err != nil {
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "opening_pr", err)
-		}
-		wf.PRURL = pr.URL
-		wf.Branch = pr.Branch
-	}
-	if err := hr.Run(ctx, HookAfterPR, cfg.Hook(HookAfterPR), hctx); err != nil {
-		// after_pr failure is non-fatal — PR is already up
-		fmt.Fprintf(e.Stderr, "after_pr hook failed (non-fatal): %v\n", err)
-	}
-
-	// 7. Notify.
-	wf.State = memory.WFNotifying
-	e.save(wf)
-	e.notify(ctx, t, wf)
-
+	wf.Stage = "done"
 	wf.State = memory.WFDone
+	wf.PendingQuestionID = ""
 	e.save(wf)
 	if e.Board != nil {
 		_ = e.Board.Comment(ctx, t.ID, fmt.Sprintf("✓ goon completed this ticket. PR: %s", wf.PRURL))
 		_ = e.Board.Transition(ctx, t.ID, boards.StatusInReview)
 	}
 	return wf, nil
+}
+
+// openOrInitWorkflow looks up an open workflow for the ticket and returns it
+// (with resuming=true). If none exists it returns a fresh Workflow record
+// pre-stamped with the ticket fields and starting stage.
+func (e *Engine) openOrInitWorkflow(t boards.Ticket, branch string) (memory.Workflow, bool) {
+	if e.Memory != nil {
+		if existing, ok := e.Memory.OpenWorkflowFor(t.ID); ok {
+			if existing.Branch == "" {
+				existing.Branch = branch
+			}
+			return existing, true
+		}
+	}
+	return memory.Workflow{
+		ID:        fmt.Sprintf("wf-%d", time.Now().UnixNano()),
+		TicketID:  t.ID,
+		TicketKey: t.Key,
+		Title:     t.Title,
+		StartedAt: time.Now(),
+		State:     memory.WFTriaging,
+		Stage:     "triage",
+		Branch:    branch,
+		Approvals: map[string]string{},
+	}, false
+}
+
+// resolveConfig returns the explicit Engine.Config when set, otherwise loads
+// from disk via LoadConfig. Mirrors the inline behavior of the old Run().
+func (e *Engine) resolveConfig() WorkflowConfig {
+	cfg := e.Config
+	if cfg.Version == 0 {
+		loaded, _, _ := LoadConfig("")
+		cfg = loaded
+	}
+	return cfg
+}
+
+// isAutoApprove reports whether approval gates should be skipped for this
+// run. Precedence: Engine field → cfg.AutoApprove → GOON_AUTO_APPROVE env.
+func (e *Engine) isAutoApprove(cfg WorkflowConfig) bool {
+	if e.AutoApprove {
+		return true
+	}
+	if cfg.AutoApprove {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("GOON_AUTO_APPROVE"))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	}
+	return false
+}
+
+// indexOfPhase returns the index of the phase named stage, or -1 when not
+// found. An empty stage string returns 0 so a fresh workflow starts at the
+// top of the pipeline.
+func indexOfPhase(phases []phase, stage string) int {
+	if stage == "" {
+		return 0
+	}
+	for i, p := range phases {
+		if p.name == stage {
+			return i
+		}
+	}
+	return -1
+}
+
+// gate queues a question for the user and returns (answer, true, nil) if the
+// answer is already on file, or ("", false, nil) when the workflow needs to
+// pause and wait. Callers should bail out with errPaused when ready=false.
+//
+// On a positive answer the workflow's PendingQuestionID is cleared so the
+// daemon's ResumableWorkflow() doesn't pick it up again.
+func (e *Engine) gate(ctx context.Context, wf *memory.Workflow, t boards.Ticket, stage, question string) (string, bool, error) {
+	_ = ctx
+	if e.Memory == nil {
+		// No memory backend → can't queue/resume. Treat as auto-approved so
+		// callers using memory.Disabled() (one-shot agent) don't deadlock.
+		return "auto:no-memory", true, nil
+	}
+	if ans, ok := e.Memory.FindAnswer(t.ID, question); ok {
+		// Resume path: the answer is here; clear the pending marker.
+		wf.PendingQuestionID = ""
+		return ans, true, nil
+	}
+	qid := e.Memory.AskQuestion(memory.Question{
+		TicketID: t.ID, WorkflowID: wf.ID, Question: question,
+	})
+	wf.State = memory.WFAwaitingApproval
+	wf.Stage = stage
+	wf.PendingQuestionID = qid
+	e.save(*wf)
+	if e.Stdout != nil {
+		fmt.Fprintf(e.Stdout,
+			"[workflow] paused at %s — awaiting %s (run `goon train` to answer)\n",
+			stage, qid)
+	}
+	return "", false, nil
+}
+
+// --- phase implementations ---------------------------------------------------
+
+func (e *Engine) phaseTriage(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	if len(wf.Plan) > 0 {
+		// Already triaged on a previous run — skip on resume.
+		return nil
+	}
+	hctx := FromTicket(t, "", p.branch, nil)
+	if err := p.hr.Run(ctx, HookBeforeTriage, p.cfg.Hook(HookBeforeTriage), hctx); err != nil {
+		return err
+	}
+	wf.State = memory.WFTriaging
+	e.save(*wf)
+	plan, repo, err := e.triage(ctx, t)
+	if err != nil {
+		return err
+	}
+	wf.Plan = plan
+	wf.Repo = repo
+	wf.State = memory.WFPlanning
+	e.save(*wf)
+	return nil
+}
+
+func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	if p.autoApprove {
+		ensureApproval(wf, "confirm_repo", "auto:approved")
+		return nil
+	}
+	if existing := approvalAnswer(wf, "confirm_repo"); existing != "" {
+		return nil
+	}
+	suggested := wf.Repo
+	if suggested == "" {
+		suggested = pickRepo(t)
+		wf.Repo = suggested
+	}
+	q := fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
+		t.Key, t.Title, suggested)
+	ans, ready, err := e.gate(ctx, wf, t, "confirm_repo", q)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return errPaused
+	}
+	if newRepo, ok := parseRepoChange(ans); ok {
+		wf.Repo = newRepo
+	} else if !isYes(ans) {
+		return fmt.Errorf("user rejected repo: %s", ans)
+	}
+	ensureApproval(wf, "confirm_repo", ans)
+	wf.State = memory.WFPlanning
+	e.save(*wf)
+	return nil
+}
+
+func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	if p.autoApprove {
+		ensureApproval(wf, "approve_plan", "auto:approved")
+		return nil
+	}
+	if existing := approvalAnswer(wf, "approve_plan"); existing != "" {
+		return nil
+	}
+	q := "Approve work + test plan for " + t.Key + "?\n" +
+		formatPlanForApproval(wf.Plan) +
+		"Reply: yes / no"
+	ans, ready, err := e.gate(ctx, wf, t, "approve_plan", q)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return errPaused
+	}
+	if !isYes(ans) {
+		return fmt.Errorf("user rejected plan: %s", ans)
+	}
+	ensureApproval(wf, "approve_plan", ans)
+	// Clear the "awaiting" state on resume — the next phase (execute) sets
+	// its own state but we don't want a brief window where Stage="execute"
+	// but State=WFAwaitingApproval if the user runs `goon status`.
+	wf.State = memory.WFPlanning
+	e.save(*wf)
+	return nil
+}
+
+func (e *Engine) phaseExecute(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	allDone := true
+	anyDone := false
+	for _, s := range wf.Plan {
+		if s.Done {
+			anyDone = true
+		} else {
+			allDone = false
+		}
+	}
+	if allDone && len(wf.Plan) > 0 {
+		return nil
+	}
+	if !anyDone {
+		if err := p.hr.Run(ctx, HookBeforeExecute, p.cfg.Hook(HookBeforeExecute), hctx); err != nil {
+			return err
+		}
+	}
+	wf.State = memory.WFExecuting
+	e.save(*wf)
+	for i := range wf.Plan {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if wf.Plan[i].Done {
+			continue
+		}
+		if err := e.executeStep(ctx, wf.TicketKey, wf.Plan[i].Title); err != nil {
+			wf.Plan[i].Note = err.Error()
+			e.save(*wf)
+			return err
+		}
+		wf.Plan[i].Done = true
+		e.save(*wf)
+	}
+	if err := p.hr.Run(ctx, HookAfterExecute, p.cfg.Hook(HookAfterExecute), hctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) phaseTest(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	wf.State = memory.WFTesting
+	e.save(*wf)
+	if err := p.hr.Run(ctx, HookBeforeTest, p.cfg.Hook(HookBeforeTest), hctx); err != nil {
+		return err
+	}
+	testErr := e.runTests(ctx, wf.Repo, p.cfg.TestCommand)
+	if testErr != nil {
+		// Tests failing is logged but not fatal — verify catches real regressions.
+		if e.Stderr != nil {
+			fmt.Fprintf(e.Stderr, "tests failed (non-fatal): %v\n", testErr)
+		}
+		return nil
+	}
+	if err := p.hr.Run(ctx, HookAfterTest, p.cfg.Hook(HookAfterTest), hctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) phaseVerify(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	wf.State = memory.WFVerifying
+	if wf.VerifyRuns == 0 {
+		wf.VerifyRuns = e.verifyN(p.cfg)
+	}
+	e.save(*wf)
+	if err := p.hr.Run(ctx, HookBeforeVerify, p.cfg.Hook(HookBeforeVerify), hctx); err != nil {
+		return err
+	}
+	for i := 0; i < wf.VerifyRuns; i++ {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := e.verifyOnce(ctx, t); err != nil {
+			return fmt.Errorf("verify pass %d: %w", i+1, err)
+		}
+	}
+	if err := p.hr.Run(ctx, HookAfterVerify, p.cfg.Hook(HookAfterVerify), hctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// phaseUpdateMemory runs a focused agent task that asks the LLM to distil
+// what it learned during execution into persistent markdown notes. This is
+// where goon's "active memory" gets steady-state updates: conventions
+// discovered, file layouts learned, names that matter, gotchas to avoid.
+//
+// Failures here are non-fatal — the workflow continues to PR even if the
+// memory update misbehaves, because losing a learning is preferable to
+// blocking a finished ticket.
+func (e *Engine) phaseUpdateMemory(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	_ = p
+	wf.State = memory.WFUpdatingMemory
+	e.save(*wf)
+	if e.LLM == nil || e.Tools == nil || e.Executor == nil {
+		// No agent runtime — silently skip.
+		return nil
+	}
+	a := agent.New(agent.Options{
+		LLM: e.LLM, Tools: e.Tools, Executor: e.Executor, Memory: e.Memory,
+		Stdout: e.Stdout, Stderr: e.Stderr, Debug: e.Debug,
+	})
+	task := fmt.Sprintf(`Reflect on what you just learned implementing %s — %q.
+Use memory_append (preferred) or memory_write to capture durable knowledge:
+- conventions discovered
+- file layouts and names that matter
+- bugs avoided / gotchas
+- API/CLI quirks worth remembering
+One topic per .md file (kebab-case names). Anything broadly invariant goes in PINNED.md.
+Skip notes that are trivial or only apply to this single ticket. Call finish when done.`, t.Key, t.Title)
+	if err := a.Run(ctx, task); err != nil {
+		if e.Stderr != nil {
+			fmt.Fprintf(e.Stderr, "memory update failed (non-fatal): %v\n", err)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) phaseOpenPR(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	if e.Host == nil {
+		return nil
+	}
+	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	wf.State = memory.WFOpeningPR
+	e.save(*wf)
+	if err := p.hr.Run(ctx, HookBeforePR, p.cfg.Hook(HookBeforePR), hctx); err != nil {
+		return err
+	}
+	pr, err := e.openPR(ctx, t, *wf, wf.Repo, p.cfg)
+	if err != nil {
+		return err
+	}
+	wf.PRURL = pr.URL
+	wf.Branch = pr.Branch
+	e.save(*wf)
+	if err := p.hr.Run(ctx, HookAfterPR, p.cfg.Hook(HookAfterPR), hctx); err != nil {
+		// after_pr failure is non-fatal — PR is already up.
+		if e.Stderr != nil {
+			fmt.Fprintf(e.Stderr, "after_pr hook failed (non-fatal): %v\n", err)
+		}
+	}
+	return nil
+}
+
+func (e *Engine) phaseNotify(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	_ = p
+	wf.State = memory.WFNotifying
+	e.save(*wf)
+	e.notify(ctx, t, *wf)
+	return nil
+}
+
+// approvalAnswer returns the recorded answer for stage, or "" if none.
+func approvalAnswer(wf *memory.Workflow, stage string) string {
+	if wf == nil || wf.Approvals == nil {
+		return ""
+	}
+	return wf.Approvals[stage]
+}
+
+// ensureApproval records ans under stage in wf.Approvals (creating the map
+// if needed). Used by both auto-approve and the post-gate happy path.
+func ensureApproval(wf *memory.Workflow, stage, ans string) {
+	if wf == nil {
+		return
+	}
+	if wf.Approvals == nil {
+		wf.Approvals = map[string]string{}
+	}
+	wf.Approvals[stage] = ans
+}
+
+// parseRepoChange recognises an answer like "change=/path/to/repo",
+// "repo=/path", "use=/path", or a bare path with a slash/dot/colon and
+// returns (path, true). Plain "yes" or "no" returns ("", false).
+func parseRepoChange(ans string) (string, bool) {
+	s := strings.TrimSpace(ans)
+	for _, prefix := range []string{"change=", "repo=", "use=", "path="} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+			break
+		}
+	}
+	if s == "" || isYes(s) {
+		return "", false
+	}
+	if strings.EqualFold(s, "no") || strings.EqualFold(s, "n") || strings.EqualFold(s, "reject") {
+		return "", false
+	}
+	if strings.ContainsAny(s, " \t\n") {
+		return "", false
+	}
+	// Heuristic: path-like answers contain at least one of / . : ~
+	if !strings.ContainsAny(s, "/.:~") {
+		return "", false
+	}
+	return s, true
+}
+
+// isYes treats any of yes/y/ok/approve/lgtm/etc. (case-insensitive) — and
+// any "auto:..." marker — as approval.
+func isYes(s string) bool {
+	low := strings.ToLower(strings.TrimSpace(s))
+	switch low {
+	case "y", "yes", "ok", "approve", "approved", "confirm", "confirmed", "lgtm", "go", "ship":
+		return true
+	}
+	return strings.HasPrefix(low, "auto:")
+}
+
+// formatPlanForApproval renders a numbered list of plan steps for the user
+// to review at the approve_plan gate.
+func formatPlanForApproval(plan []memory.PlanStep) string {
+	var b strings.Builder
+	for i, s := range plan {
+		fmt.Fprintf(&b, "  %d. %s\n", i+1, s.Title)
+	}
+	return b.String()
 }
 
 // runFailureHook fires the on_failure hook list as a best-effort. Errors are
@@ -554,7 +945,7 @@ func (e *Engine) runStages(ctx context.Context, wf memory.Workflow, t boards.Tic
 
 	wf.State = memory.WFDone
 	e.save(wf)
-	if e.Board != nil {
+	if e.Board != nil && wf.PRURL != "" {
 		_ = e.Board.Comment(ctx, t.ID, fmt.Sprintf("✓ goon completed this ticket. PR: %s", wf.PRURL))
 		_ = e.Board.Transition(ctx, t.ID, boards.StatusInReview)
 	}

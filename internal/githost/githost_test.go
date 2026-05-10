@@ -3,6 +3,7 @@ package githost
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,6 +212,143 @@ func TestBitbucket_NewFromEnv_RequiresAuth(t *testing.T) {
 	t.Setenv("BITBUCKET_TOKEN", "tok")
 	if _, err := NewBitbucketFromEnv(); err != nil {
 		t.Fatalf("token-only should work: %v", err)
+	}
+}
+
+func TestBitbucket_ListPRs(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/repositories/myteam/myrepo/pullrequests") {
+			t.Errorf("path: %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("state") != "OPEN" {
+			t.Errorf("state filter: %q", r.URL.Query().Get("state"))
+		}
+		_, _ = w.Write([]byte(`{
+		  "values": [
+		    {"id": 7, "title": "Fix login", "description": "body",
+		     "state": "OPEN",
+		     "links": {"html": {"href": "https://bb/pr/7"}},
+		     "author": {"display_name": "Alice"},
+		     "source": {"branch": {"name": "feat/login"}}},
+		    {"id": 9, "title": "Add metrics", "description": "",
+		     "state": "OPEN",
+		     "links": {"html": {"href": "https://bb/pr/9"}},
+		     "author": {"display_name": "Bob"},
+		     "source": {"branch": {"name": "feat/metrics"}}}
+		  ]
+		}`))
+	}))
+	defer ts.Close()
+	b := &Bitbucket{Token: "TOK", APIURL: ts.URL, HTTP: ts.Client()}
+	prs, err := b.ListPRs(context.Background(), []string{"myteam/myrepo"})
+	if err != nil {
+		t.Fatalf("ListPRs: %v", err)
+	}
+	if len(prs) != 2 {
+		t.Fatalf("got %d PRs", len(prs))
+	}
+	if prs[0].Number != 7 || prs[0].Author != "Alice" || prs[0].Repo != "myteam/myrepo" {
+		t.Errorf("first PR: %+v", prs[0])
+	}
+	if prs[1].URL != "https://bb/pr/9" {
+		t.Errorf("second PR url: %q", prs[1].URL)
+	}
+}
+
+func TestBitbucket_GetPRDetails(t *testing.T) {
+	const wantDiff = "diff --git a/x b/x\n+hello\n"
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pullrequests/42/diff"):
+			if r.Header.Get("Accept") != "text/plain" {
+				t.Errorf("diff Accept header: %q", r.Header.Get("Accept"))
+			}
+			_, _ = w.Write([]byte(wantDiff))
+		case strings.HasSuffix(r.URL.Path, "/pullrequests/42"):
+			_, _ = w.Write([]byte(`{
+			  "id": 42, "title": "t", "description": "d", "state": "OPEN",
+			  "links": {"html": {"href": "https://bb/pr/42"}},
+			  "author": {"display_name": "Alice"},
+			  "source": {"branch": {"name": "feat/x"}}
+			}`))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+	b := &Bitbucket{Token: "TOK", APIURL: ts.URL, HTTP: ts.Client()}
+	pr, diff, err := b.GetPRDetails(context.Background(), "w/r", 42)
+	if err != nil {
+		t.Fatalf("GetPRDetails: %v", err)
+	}
+	if pr.Number != 42 || pr.Title != "t" || pr.Author != "Alice" {
+		t.Errorf("PR: %+v", pr)
+	}
+	if diff != wantDiff {
+		t.Errorf("diff mismatch:\n%q", diff)
+	}
+}
+
+func TestBitbucket_CommentPR(t *testing.T) {
+	var got map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/pullrequests/7/comments") {
+			t.Errorf("path: %s", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		_, _ = w.Write([]byte(`{"id": 1}`))
+	}))
+	defer ts.Close()
+	b := &Bitbucket{Token: "TOK", APIURL: ts.URL, HTTP: ts.Client()}
+	if err := b.CommentPR(context.Background(), "w/r", 7, "looks good"); err != nil {
+		t.Fatalf("CommentPR: %v", err)
+	}
+	content, _ := got["content"].(map[string]any)
+	if content["raw"] != "looks good" {
+		t.Errorf("payload: %+v", got)
+	}
+}
+
+func TestBitbucket_ApproveAndDecline(t *testing.T) {
+	var seenApprove, seenChanges bool
+	var commentBodies []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/pullrequests/7/approve"):
+			seenApprove = true
+		case strings.HasSuffix(r.URL.Path, "/pullrequests/7/request-changes"):
+			seenChanges = true
+		case strings.HasSuffix(r.URL.Path, "/pullrequests/7/comments"):
+			var c map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&c)
+			content, _ := c["content"].(map[string]any)
+			commentBodies = append(commentBodies, fmt.Sprint(content["raw"]))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+	b := &Bitbucket{Token: "TOK", APIURL: ts.URL, HTTP: ts.Client()}
+
+	if err := b.ApprovePR(context.Background(), "w/r", 7, "lgtm"); err != nil {
+		t.Fatalf("ApprovePR: %v", err)
+	}
+	if err := b.RequestChangesPR(context.Background(), "w/r", 7, "needs tests"); err != nil {
+		t.Fatalf("RequestChangesPR: %v", err)
+	}
+
+	if !seenApprove {
+		t.Error("/approve was not called")
+	}
+	if !seenChanges {
+		t.Error("/request-changes was not called")
+	}
+	if len(commentBodies) != 2 {
+		t.Fatalf("expected 2 comments (preceding approve + decline), got %v", commentBodies)
+	}
+	if commentBodies[0] != "lgtm" || commentBodies[1] != "needs tests" {
+		t.Errorf("comment bodies: %v", commentBodies)
 	}
 }
 
