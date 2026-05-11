@@ -29,8 +29,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
@@ -45,11 +47,12 @@ type Options struct {
 	Secret     string // GOON_TELEGRAM_SECRET
 	APIBaseURL string // override for tests; defaults to https://api.telegram.org
 
-	Memory   *memory.Memory   // required: persistent state for auth + Q&A
-	LLM      llm.Provider     // optional: enables /run + plain-text chat
-	Tools    *tools.Registry  // optional: enables /run
+	Memory   *memory.Memory     // required: persistent state for auth + Q&A
+	LLM      llm.Provider       // optional: enables /run + plain-text chat
+	Tools    *tools.Registry    // optional: enables /run
 	Executor *executor.Executor // optional: enables /run
-	Host     githost.Host     // optional: enables /prs /review /approve /decline /comment
+	Host     githost.Host       // optional: enables /prs /review /approve /decline /comment
+	Board    boards.Board       // optional: enables /refresh + chat auto-refresh of ticket cache
 
 	// GoonExe is the absolute path to the goon binary used for full CLI
 	// parity (`/<subcmd>` shells out to `goon <subcmd>`). Defaults to
@@ -332,6 +335,16 @@ func (b *Bot) SendChunked(ctx context.Context, chatID int64, text string) {
 			cut := strings.LastIndex(chunk[:maxLen], "\n")
 			if cut <= 0 {
 				cut = maxLen
+			}
+			// Rune-aware: byte-cut at maxLen can land mid-UTF-8
+			// (CJK / emoji in Jira titles, accented chars). Walk
+			// back to the nearest rune start so Telegram's UTF-8
+			// validator accepts every chunk.
+			for cut > 0 && !utf8.RuneStart(chunk[cut]) {
+				cut--
+			}
+			if cut <= 0 {
+				cut = maxLen // truly degenerate input — give up
 			}
 			chunk = chunk[:cut]
 		}

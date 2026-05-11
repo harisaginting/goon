@@ -103,6 +103,9 @@ type TicketSnapshot struct {
 	Title     string    `json:"title,omitempty"`
 	URL       string    `json:"url,omitempty"`
 	Status    string    `json:"status,omitempty"`
+	Assignee  string    `json:"assignee,omitempty"`
+	Labels    []string  `json:"labels,omitempty"`
+	Project   string    `json:"project,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
 }
@@ -120,8 +123,17 @@ type ChatAuth struct {
 }
 
 // DaemonStatus is a tiny live-status snapshot for the UI / `goon status`.
+//
+// Paused is the source of truth for the pause/resume control surface:
+// CLI (`goon pause` / `goon resume`), web UI (POST /api/daemon/pause),
+// and Telegram bot (`/pause` / `/resume`) all flip this single flag.
+// The daemon's poll loop reads it every tick (via memory.Reload) and
+// skips pollAndRun when true. Already-running workflows are unaffected
+// — Pause is the equivalent of "stop picking up new work," not "kill
+// in-flight tasks."
 type DaemonStatus struct {
 	Running        bool      `json:"running"`
+	Paused         bool      `json:"paused,omitempty"`
 	StartedAt      time.Time `json:"started_at,omitempty"`
 	LastPoll       time.Time `json:"last_poll,omitempty"`
 	LastTicket     string    `json:"last_ticket,omitempty"`
@@ -141,14 +153,24 @@ type Memory struct {
 }
 
 type storeFile struct {
-	History     []Interaction             `json:"history"`
-	Counts      map[string]int            `json:"command_counts"`
-	Questions   []Question                `json:"questions,omitempty"`
-	Workflows   []Workflow                `json:"workflows,omitempty"`
-	Tickets     map[string]TicketSnapshot `json:"tickets,omitempty"`
-	Status      DaemonStatus              `json:"status,omitempty"`
-	NextQID     int64                     `json:"next_qid,omitempty"`
-	TelegramAuth []ChatAuth               `json:"telegram_auth,omitempty"`
+	History      []Interaction             `json:"history"`
+	Counts       map[string]int            `json:"command_counts"`
+	Questions    []Question                `json:"questions,omitempty"`
+	Workflows    []Workflow                `json:"workflows,omitempty"`
+	Tickets      map[string]TicketSnapshot `json:"tickets,omitempty"`
+	Status       DaemonStatus              `json:"status,omitempty"`
+	NextQID      int64                     `json:"next_qid,omitempty"`
+	TelegramAuth []ChatAuth                `json:"telegram_auth,omitempty"`
+
+	// RepoChoices remembers the resolved repo path per project key
+	// (Jira project, GitHub "owner/repo"). Populated when the
+	// confirm_repo gate succeeds — the next ticket from the same
+	// project skips the gate's "where do I work?" branch and uses
+	// the learned path. Env GOON_REPO_MAP exact matches still win
+	// over learned values; learned wins over the "*" wildcard
+	// fallback so a single explicit confirmation overrides a vague
+	// default.
+	RepoChoices map[string]string `json:"repo_choices,omitempty"`
 }
 
 // New opens (or creates) the memory file. If path is empty it defaults to
@@ -162,12 +184,29 @@ func New(path string) (*Memory, error) {
 	if path == "" {
 		path = storage.Path("memory.json")
 	}
+	// Catch the easy first-run footgun: GOON_MEMORY_PATH pointed at a
+	// directory (most often the notes dir at ./storage/memory). The
+	// stdlib's "is a directory" error doesn't tell the user which env
+	// var to fix, and the names differ by one character, so spell it
+	// out explicitly. Stat-first means we never call os.ReadFile on a
+	// directory and can produce an actionable message.
+	if info, statErr := os.Stat(path); statErr == nil && info.IsDir() {
+		def := storage.Path("memory.json")
+		notesDir := storage.Path("memory")
+		return nil, fmt.Errorf(
+			"memory: configured path %q is a directory, not a JSON file.\n"+
+				"  GOON_MEMORY_PATH must point at a .json file (default: %s).\n"+
+				"  The active notes directory is configured via GOON_MEMORY_DIR (default: %s).\n"+
+				"  Likely fix: unset GOON_MEMORY_PATH, or set it to %q.",
+			path, def, notesDir, path+".json")
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
 	m := &Memory{path: path, store: storeFile{
-		Counts:  map[string]int{},
-		Tickets: map[string]TicketSnapshot{},
+		Counts:      map[string]int{},
+		Tickets:     map[string]TicketSnapshot{},
+		RepoChoices: map[string]string{},
 	}}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &m.store)
@@ -177,8 +216,11 @@ func New(path string) (*Memory, error) {
 		if m.store.Tickets == nil {
 			m.store.Tickets = map[string]TicketSnapshot{}
 		}
+		if m.store.RepoChoices == nil {
+			m.store.RepoChoices = map[string]string{}
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, fmt.Errorf("memory: read %s: %w", path, err)
 	}
 	return m, nil
 }
@@ -264,7 +306,14 @@ func (m *Memory) FrequentCommands(k int) []string {
 
 // --- Question API ----------------------------------------------------------
 
+// maxQuestions caps the question history. Re-plan loops + months of
+// uptime would otherwise grow the queue unbounded. We keep the most
+// recent N (mix of pending + answered) — pending always wins eviction
+// because the user might still need to see them.
+const maxQuestions = 500
+
 // AskQuestion records a new pending question and returns its id.
+// Older answered questions are evicted when the cap is exceeded.
 func (m *Memory) AskQuestion(q Question) string {
 	if m == nil {
 		return ""
@@ -279,8 +328,39 @@ func (m *Memory) AskQuestion(q Question) string {
 		q.ID = fmt.Sprintf("q-%d", m.store.NextQID)
 	}
 	m.store.Questions = append(m.store.Questions, q)
+	m.pruneQuestions()
 	m.flush()
 	return q.ID
+}
+
+// pruneQuestions caps the question slice. Caller must hold m.mu.
+// Eviction order: oldest answered first; if everything is pending,
+// keep all (operators need to see them).
+func (m *Memory) pruneQuestions() {
+	if len(m.store.Questions) <= maxQuestions {
+		return
+	}
+	// Drop oldest answered first.
+	kept := make([]Question, 0, maxQuestions)
+	answered := make([]Question, 0, len(m.store.Questions))
+	for _, q := range m.store.Questions {
+		if q.Pending() {
+			kept = append(kept, q)
+		} else {
+			answered = append(answered, q)
+		}
+	}
+	// Sort answered by AnsweredAt asc; keep newest until we hit cap.
+	for i := 1; i < len(answered); i++ {
+		for j := i; j > 0 && answered[j].AnsweredAt.Before(answered[j-1].AnsweredAt); j-- {
+			answered[j], answered[j-1] = answered[j-1], answered[j]
+		}
+	}
+	for len(kept)+len(answered) > maxQuestions && len(answered) > 0 {
+		answered = answered[1:] // drop oldest answered
+	}
+	kept = append(kept, answered...)
+	m.store.Questions = kept
 }
 
 // PendingQuestions returns questions still awaiting an answer.
@@ -459,13 +539,21 @@ func (m *Memory) ResumableWorkflow() (Workflow, bool) {
 	var best Workflow
 	found := false
 	for _, w := range m.store.Workflows {
-		if w.State != WFAwaitingApproval {
-			continue
+		// Eligible for resume if EITHER:
+		//  - awaiting approval AND the question now has an answer
+		//  - re-plan path: state=WFTriaging with a recorded
+		//    replan_feedback approval (set when the user rejected
+		//    the previous plan with feedback). The daemon should
+		//    re-enter triage on the next tick instead of waiting
+		//    for an answered question.
+		eligible := false
+		switch {
+		case w.State == WFAwaitingApproval && w.PendingQuestionID != "" && answered[w.PendingQuestionID]:
+			eligible = true
+		case w.State == WFTriaging && w.Approvals != nil && w.Approvals["replan_feedback"] != "":
+			eligible = true
 		}
-		if w.PendingQuestionID == "" {
-			continue
-		}
-		if !answered[w.PendingQuestionID] {
+		if !eligible {
 			continue
 		}
 		if !found || w.UpdatedAt.After(best.UpdatedAt) {
@@ -810,6 +898,104 @@ func (m *Memory) GetStatus() DaemonStatus {
 	return m.store.Status
 }
 
+// SetPaused flips the daemon's pause flag inside the persisted status
+// block. Used by `goon pause` / `goon resume`, the web UI's pause
+// button, and the Telegram bot's /pause /resume commands. The daemon's
+// poll loop reads this every tick (after Reload) and skips pollAndRun
+// when true. Idempotent — calling SetPaused(true) on a paused daemon
+// is a no-op.
+func (m *Memory) SetPaused(paused bool) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store.Status.Paused = paused
+	m.flush()
+}
+
+// IsPaused reports whether the daemon's pause flag is set.
+func (m *Memory) IsPaused() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.Status.Paused
+}
+
+// --- Repo-choice memory API ------------------------------------------------
+
+// RecordRepoChoice persists project→repo so the next ticket from the
+// same project doesn't re-ask the confirm_repo gate. Called from
+// workflow.phaseConfirmRepo right after the user (or auto-approve)
+// confirms the path. Empty project or repo strings are ignored — we
+// only remember concrete choices.
+func (m *Memory) RecordRepoChoice(project, repo string) {
+	if m == nil {
+		return
+	}
+	if strings.TrimSpace(project) == "" || strings.TrimSpace(repo) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.RepoChoices == nil {
+		m.store.RepoChoices = map[string]string{}
+	}
+	if existing, ok := m.store.RepoChoices[project]; ok && existing == repo {
+		return // no-op write avoids touching disk on every poll
+	}
+	m.store.RepoChoices[project] = repo
+	m.flush()
+}
+
+// LookupRepoChoice returns the previously-confirmed repo path for the
+// project, if one was recorded. Used by the workflow engine to skip
+// the confirm_repo gate when a learned choice already exists for the
+// ticket's project.
+func (m *Memory) LookupRepoChoice(project string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.store.RepoChoices[project]
+	return v, ok
+}
+
+// ForgetRepoChoice drops the learned mapping for project (if any).
+// Useful when a user wants to re-route a project to a new repo —
+// CLI: `goon repo forget ENG`.
+func (m *Memory) ForgetRepoChoice(project string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.store.RepoChoices[project]; !ok {
+		return false
+	}
+	delete(m.store.RepoChoices, project)
+	m.flush()
+	return true
+}
+
+// RepoChoices returns a copy of the current learned mapping. Stable
+// keys/values; callers can mutate the result freely.
+func (m *Memory) RepoChoices() map[string]string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]string, len(m.store.RepoChoices))
+	for k, v := range m.store.RepoChoices {
+		out[k] = v
+	}
+	return out
+}
+
 // flush writes the in-memory store to disk. Before writing, it merges any
 // external changes made by other processes (e.g. `goon train` answering a
 // question while the daemon is running) so we don't clobber them.
@@ -871,11 +1057,19 @@ func (m *Memory) flush() {
 // mergeStores merges two storeFile snapshots into a unified view.
 //
 // Ownership rules:
-//   - Status, History, Counts, Workflows, Tickets — the daemon owns these
-//     (only one daemon at a time), so the in-memory copy wins.
-//   - Questions — both daemon (via ask_user) and CLI (`goon train`) write
-//     these. Merge by id: prefer the version with an answer; if both have
-//     answers, prefer the more recent answered_at.
+//   - Status, History, Counts — the daemon owns these (only one daemon
+//     at a time), so the in-memory copy wins.
+//   - Workflows — primarily daemon-owned, but CLI tools like
+//     `goon train` and `goon repo` are SEPARATE processes that load
+//     Memory at startup with whatever Workflows existed then. Without
+//     a per-id merge, those CLI processes' flush would silently
+//     clobber any newer Workflow updates the daemon wrote since.
+//     Merge by id, preferring the more recent UpdatedAt.
+//   - Tickets — prefer the more recent LastSeen so concurrent writers
+//     don't lose snapshot data.
+//   - Questions — both daemon (via ask_user) and CLI (`goon train`)
+//     write these. Merge by id: prefer the version with an answer;
+//     if both have answers, prefer the more recent answered_at.
 //   - NextQID — take the max so concurrent writers don't collide.
 func mergeStores(disk, mem storeFile) storeFile {
 	out := mem // start from in-memory; we'll overlay disk-side question changes
@@ -911,6 +1105,45 @@ func mergeStores(disk, mem storeFile) storeFile {
 		out.NextQID = disk.NextQID
 	}
 
+	// Workflows: merge by id, prefer newer UpdatedAt. Without this,
+	// a `goon train answer` (separate process) loaded Memory with
+	// stale Workflows then flushed back its in-memory copy,
+	// silently rolling back any daemon-side workflow progress that
+	// happened in the interim.
+	if len(disk.Workflows) > 0 {
+		byID := map[string]Workflow{}
+		order := []string{}
+		for _, w := range disk.Workflows {
+			byID[w.ID] = w
+			order = append(order, w.ID)
+		}
+		for _, w := range out.Workflows {
+			if existing, ok := byID[w.ID]; ok {
+				if w.UpdatedAt.After(existing.UpdatedAt) {
+					byID[w.ID] = w
+				}
+			} else {
+				byID[w.ID] = w
+				order = append(order, w.ID)
+			}
+		}
+		merged := make([]Workflow, 0, len(order))
+		for _, id := range order {
+			merged = append(merged, byID[id])
+		}
+		// Apply the same cap that UpsertWorkflow uses, by-UpdatedAt.
+		if len(merged) > 200 {
+			// Sort newest first, drop tail. Insertion sort — N stays small.
+			for i := 1; i < len(merged); i++ {
+				for j := i; j > 0 && merged[j].UpdatedAt.After(merged[j-1].UpdatedAt); j-- {
+					merged[j], merged[j-1] = merged[j-1], merged[j]
+				}
+			}
+			merged = merged[:200]
+		}
+		out.Workflows = merged
+	}
+
 	// Tickets: prefer the more recent LastSeen so external `goon train`
 	// snapshots aren't clobbered.
 	if len(disk.Tickets) > 0 {
@@ -924,6 +1157,19 @@ func mergeStores(disk, mem storeFile) storeFile {
 			}
 		}
 	}
+
+	// RepoChoices: mem wins absolutely. The previous merge-disk-back
+	// implementation silently undid `goon repo forget` — the CLI
+	// process loaded Memory (had ENG), called ForgetRepoChoice
+	// (removed ENG from mem), then flushed, and the merge re-added
+	// ENG from disk. Result: forget appeared to succeed but the
+	// next read found the entry alive.
+	//
+	// RepoChoices is only ever written by the engine (daemon
+	// in-process) or by `goon repo` CLI; there's no parallel-write
+	// scenario where disk has additions mem doesn't know about.
+	// Last writer wins is the right policy here. `out` already
+	// holds mem's RepoChoices via `out := mem` at the top.
 
 	return out
 }
@@ -954,6 +1200,14 @@ func preferAnswered(a, b Question) Question {
 // Reload pulls the latest store from disk into memory, merging anything we
 // haven't flushed yet. Used by the daemon at the start of each poll cycle so
 // it sees user answers as soon as they're written.
+//
+// RepoChoices is treated specially: disk wins absolutely. The daemon
+// always flushes its own writes immediately (RecordRepoChoice → flush),
+// so by Reload time, any daemon-side additions are already on disk.
+// Anything missing from disk that mem still holds is therefore a stale
+// entry — typically because a separate `goon repo forget` deleted it.
+// Without this snapshot, mergeStores' mem-wins policy would silently
+// resurrect forgotten entries on the daemon's next flush.
 func (m *Memory) Reload() {
 	if m == nil || m.path == "" {
 		return
@@ -974,5 +1228,10 @@ func (m *Memory) Reload() {
 	if disk.Tickets == nil {
 		disk.Tickets = map[string]TicketSnapshot{}
 	}
+	if disk.RepoChoices == nil {
+		disk.RepoChoices = map[string]string{}
+	}
 	m.store = mergeStores(disk, m.store)
+	// Snapshot RepoChoices from disk after the merge — see fn doc.
+	m.store.RepoChoices = disk.RepoChoices
 }

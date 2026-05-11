@@ -236,6 +236,10 @@ func (d *Daemon) stop() {
 	st := d.opts.Memory.GetStatus()
 	st.Running = false
 	st.ActiveWorkflow = ""
+	// Clear Paused on shutdown so a fresh `goon start` doesn't inherit
+	// a stale pause from a previous session. Pause is a runtime control,
+	// not durable config.
+	st.Paused = false
 	d.opts.Memory.SetStatus(st)
 	fmt.Fprintln(d.opts.Stdout, "→ goon daemon stopped")
 }
@@ -250,8 +254,19 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 	}()
 
 	// Pick up any answers / new questions that the CLI or web UI may have
-	// written since the last tick.
+	// written since the last tick. Also picks up the Paused flag from
+	// `goon pause` / web UI / Telegram /pause — the three control
+	// surfaces all flip the same memory.json field, and Reload is how
+	// the daemon learns about it.
 	d.opts.Memory.Reload()
+
+	if d.opts.Memory.IsPaused() {
+		// Don't update LastPoll while paused — operators reading the
+		// status see "stuck" timestamps and worry. Paused is its own
+		// state; LastPoll keeps its last-real value.
+		fmt.Fprintln(d.opts.Stdout, "[poll] paused — run `goon resume` (or use the web UI / Telegram /resume) to pick up new tickets")
+		return
+	}
 
 	now := time.Now()
 	st := d.opts.Memory.GetStatus()
@@ -309,9 +324,16 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 		return
 	}
 	for _, t := range tickets {
+		// Copy every field that chat / web UI / /tickets can render —
+		// dropping Assignee/Labels/Project caused "assigned to me"
+		// queries to fall apart because memory had nothing to filter
+		// on. boards.Ticket already carries these from Jira/GitHub.
 		d.opts.Memory.SeenTicket(memory.TicketSnapshot{
 			ID: t.ID, Source: t.Source, Key: t.Key,
 			Title: t.Title, URL: t.URL, Status: string(t.Status),
+			Assignee:  t.Assignee,
+			Labels:    t.Labels,
+			Project:   t.Project,
 			UpdatedAt: t.UpdatedAt, LastSeen: now,
 		})
 	}
@@ -346,15 +368,12 @@ func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
 	var best *boards.Ticket
 	for i := range tickets {
 		t := &tickets[i]
-		logx.Info("========", t.Title, t.Status)
 		if t.Status != boards.StatusOpen && t.Status != boards.StatusUnknown && t.Status != boards.StatusInProgress {
 			continue
 		}
-		logx.Info("========", t.Title, t.Status, d.opts.Memory.HasOpenWorkflowFor(t.ID))
 		if d.opts.Memory.HasOpenWorkflowFor(t.ID) {
 			continue
 		}
-		logx.Info("========", t.Title, t.Status, d.opts.Memory.HasCompletedWorkflowFor(t.ID))
 		if d.opts.Memory.HasCompletedWorkflowFor(t.ID) {
 			continue
 		}

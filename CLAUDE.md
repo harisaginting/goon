@@ -43,6 +43,9 @@ cmd/                CLI entry points + subcommand handlers
   doctor.go         live-probe every configured provider
   train.go          answer LLM-queued questions
   update.go         self-update from upstream
+  pause.go          `goon pause` / `goon resume` (flips memory.json flag)
+  repo.go           `goon repo list|forget|clear` (manages learned project→repo)
+  version.go        `goon version` (resolves ldflags + debug.BuildInfo)
   status.go, stop.go
 
 internal/agent/     LLM ↔ tool loop; SystemPrompt
@@ -159,6 +162,68 @@ the state machine picks up at `wf.Stage`.
 
 ## Recent decisions worth knowing
 
+- **Pause/resume control surface.** Three drivers, one source of truth.
+  `Memory.Status.Paused bool` is flipped by `goon pause` (cmd/pause.go),
+  the web UI's POST `/api/daemon/pause` (renders the alternate
+  resume button so the htmx swap is non-destructive), and the
+  Telegram bot's `/pause` command. The daemon's `pollAndRun` checks
+  `IsPaused()` after `Reload()` every tick and skips the cycle. The
+  bot itself stays responsive while paused (it lives in the same
+  process as the daemon but on a different goroutine). `daemon.stop()`
+  clears the flag so a fresh `goon start` always starts un-paused.
+- **Per-project repo learning.** When the user confirms a repo at
+  the `confirm_repo` gate, `Memory.RecordRepoChoice(project, repo)`
+  persists it to `Memory.RepoChoices`. The next ticket from the same
+  project skips the gate via `lookupLearnedRepo` (env-explicit
+  `GOON_REPO_MAP` still wins, learned beats wildcard, raw project
+  name is last resort). `goon repo list|forget <project>|clear`
+  manages the cache. `Engine.pickRepoForTicket` is the priority-aware
+  resolver that replaces calls to the legacy `pickRepo()`.
+- **Rejected plans re-plan instead of failing.** Cycle-2/3:
+  `phaseApprovePlan` no longer returns WFFailed on a non-yes answer.
+  Instead it stores `Approvals["replan_feedback"] = ans`, sets
+  `Plan = nil`, `Stage = "triage"`, and returns errPaused. The
+  daemon's `ResumableWorkflow()` was extended to pick up workflows
+  in `WFTriaging` with `replan_feedback` set, so re-plans cycle
+  through the daemon naturally. `triageWithFeedback` weaves the
+  feedback into the next prompt under a `PREVIOUS PLAN WAS REJECTED`
+  block. The approve_plan question text includes
+  `"REVISED plan (attempt N)"` so `FindAnswer` can't auto-replay
+  the previous "no". Capped at `maxRePlans = 3` rejections before
+  the workflow gives up with WFFailed. Tests:
+  `TestEngine_RejectedPlanRePlansWithFeedback`,
+  `TestEngine_RejectedPlanGivesUpAfterMaxRePlans`.
+- **Question history cap.** `maxQuestions = 500` in
+  `internal/memory/memory.go`. `pruneQuestions` evicts oldest
+  answered first, never drops pending. Re-plan loops + months of
+  uptime would otherwise unbound the slice.
+- **`/api/config` fires both triggers.** POST returns
+  `HX-Trigger: configChanged, statusChanged` so the header status
+  pill (which polls `statusChanged`) refreshes alongside the config
+  form's success panel. `fragTabConfig` deliberately does NOT listen
+  to configChanged — it would wipe the user's verify/save output.
+- **Telegram subprocess env scrub.** `runGoonCLI` strips every key
+  whose name ends in `_TOKEN`/`_API_KEY`/`_SECRET`/`_PASSWORD` plus
+  the explicit goon/atlassian secrets, before passing env to a
+  passthrough subprocess. Without this, a misbehaving CLI subcommand
+  could dump credentials to a Telegram chat.
+- **Dry-run lets read-only tools through.** Cycle-2:
+  `internal/executor/executor.go` now only short-circuits dry-run
+  for `isMutating` tools. `read_file`, `list_dir`, `memory_read/list/search`,
+  and friends execute even in dry-run so the LLM has real data to
+  reason about. Without this, a fresh user typing `goon "summarize
+  the .go files"` got hallucinated answers.
+- **`/start` Telegram convention** is special-cased in
+  `internal/telegram/commands.go::handleCommand` — for already-auth'd
+  chats it sends a friendly greeting instead of "✗ command not
+  allowed." Tests: `TestBot_StartIsFriendlyForAuthenticated`,
+  `TestBot_StartStillRequiresAuth`.
+- **Comprehensive `goon workflow init`.** Cycle-3:
+  `internal/workflow/config.go::starterConfig()` writes a
+  self-documenting starter with every hook key + populated educational
+  echo commands. `examples/workflows/` library: minimal,
+  engineering, engineering-stages, unattended, marketing-brief,
+  sales-lead.
 - **`internal/util` shared helpers.** `Truncate`, `EnvOr`, `ConfirmTTY`
   live in `internal/util/util.go` and replace four-or-more in-package
   duplicates each. Rule: util has stdlib-only imports (no `internal/*`

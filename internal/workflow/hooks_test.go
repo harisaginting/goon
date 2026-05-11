@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -11,6 +12,19 @@ import (
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/safety"
 )
+
+// hooksRequirePOSIX skips a test on Windows. Hook commands like `false`,
+// `touch`, `echo "$VAR" > path` rely on POSIX shell behaviour;
+// safety.ShellCommand picks `cmd /C` on Windows where these don't work.
+// Cross-platform alternatives exist but rewriting every hook test for
+// both shells is more churn than the value — the daemon's hook surface
+// is documented as POSIX-only on the user side.
+func hooksRequirePOSIX(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("hooks tests use POSIX shell builtins; Windows path is exercised separately")
+	}
+}
 
 func newHookRunner() (*HookRunner, *bytes.Buffer) {
 	var buf bytes.Buffer
@@ -30,6 +44,7 @@ func sampleCtx() HookCtx {
 }
 
 func TestHookRunner_RunsCommandsInOrder(t *testing.T) {
+	hooksRequirePOSIX(t)
 	dir := t.TempDir()
 	r, buf := newHookRunner()
 	hctx := sampleCtx()
@@ -52,6 +67,7 @@ func TestHookRunner_RunsCommandsInOrder(t *testing.T) {
 }
 
 func TestHookRunner_StopsOnFirstError(t *testing.T) {
+	hooksRequirePOSIX(t)
 	dir := t.TempDir()
 	r, _ := newHookRunner()
 	hctx := sampleCtx()
@@ -80,6 +96,7 @@ func TestHookRunner_BlocksDangerousCommand(t *testing.T) {
 }
 
 func TestHookRunner_ExportsTicketEnv(t *testing.T) {
+	hooksRequirePOSIX(t)
 	dir := t.TempDir()
 	r, buf := newHookRunner()
 	hctx := sampleCtx()

@@ -105,8 +105,14 @@ func (e *Executor) Execute(ctx context.Context, t tools.Tool, call tools.ToolCal
 		return t.Run(ctx, call.Args)
 	}
 
-	// run_command + read_only tools: dry-run prints intent.
-	if e.opts.Mode == ModeDryRun {
+	// Dry-run prints intent for mutating tools but lets read-only ones
+	// execute. Without this, a user typing `goon "list .go files"`
+	// (default = dry-run) gets "[dry-run] not executed" feedback for
+	// list_dir / read_file / memory_read etc., the LLM has no real
+	// data to work with, and the final summary is hallucinated. Reads
+	// are safe by definition; the user's intent (no side effects)
+	// is preserved.
+	if e.opts.Mode == ModeDryRun && isMutating(call.Tool) {
 		fmt.Fprintf(e.opts.Stdout, "[dry-run] %s args=%v\n", call.Tool, call.Args)
 		return tools.Result{ToolName: call.Tool, Stdout: "[dry-run] not executed"}, nil
 	}

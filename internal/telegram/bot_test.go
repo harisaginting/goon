@@ -12,10 +12,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/notes"
 )
 
 // fakeTelegram is a minimal stand-in for api.telegram.org used in tests.
@@ -285,10 +287,124 @@ func TestBot_DisallowedCommandRejected(t *testing.T) {
 	mem.AuthorizeChat(42, "harisa", "Harisa")
 	b.handleUpdate(context.Background(), makeUpdate(42, "/uninstall"))
 	got, _ := ft.lastSent()
-	if !strings.Contains(got.Text, "not allowed") {
+	// Cycle 1 reworded this from "not allowed" to "not available over
+	// Telegram" so the user knows where the limitation lives.
+	if !strings.Contains(got.Text, "not available over Telegram") {
 		t.Errorf("text: %q", got.Text)
 	}
 }
+
+// TestBot_StartIsFriendlyForAuthenticated covers the cycle-1 fix:
+// Telegram's `/start` convention should NOT trip the disallowed-CLI
+// path for already-authenticated users — they tap it as a habit and
+// the response should be a friendly greeting, not a refusal.
+func TestBot_StartIsFriendlyForAuthenticated(t *testing.T) {
+	b, ft, mem, _ := newTestBot(t, "s", nil)
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+	b.handleUpdate(context.Background(), makeUpdate(42, "/start"))
+	got, _ := ft.lastSent()
+	if strings.Contains(got.Text, "✗") || strings.Contains(got.Text, "not available") {
+		t.Errorf("/start should produce a friendly greeting for auth'd users, got: %q", got.Text)
+	}
+	for _, want := range []string{"authenticated", "/help"} {
+		if !strings.Contains(got.Text, want) {
+			t.Errorf("expected %q in /start reply, got: %q", want, got.Text)
+		}
+	}
+}
+
+// TestBot_StartStillRequiresAuth: an UNAUTHENTICATED chat sending
+// /start must hit the auth gate, not the friendly greeting (otherwise
+// /start could be used to probe whether a chat is authorized).
+func TestBot_StartStillRequiresAuth(t *testing.T) {
+	b, ft, _, _ := newTestBot(t, "s", nil)
+	b.handleUpdate(context.Background(), makeUpdate(42, "/start"))
+	got, _ := ft.lastSent()
+	if !strings.Contains(got.Text, "not authorized") {
+		t.Errorf("unauth /start should hit auth gate, got: %q", got.Text)
+	}
+}
+
+// TestPollIntervalLabel covers the GOON_POLL_SECONDS humanizer used by
+// /answer to tell users when to expect daemon resume.
+func TestPollIntervalLabel(t *testing.T) {
+	cases := []struct{ env, want string }{
+		{"", "5m"},
+		{"30", "30s"},
+		{"60", "1m"},
+		{"600", "10m"},
+		{"abc", "5m"}, // bad value
+		{"0", "5m"},   // zero
+	}
+	for _, c := range cases {
+		t.Setenv("GOON_POLL_SECONDS", c.env)
+		got := pollIntervalLabel()
+		if got != c.want {
+			t.Errorf("pollIntervalLabel(env=%q) = %q, want %q", c.env, got, c.want)
+		}
+	}
+}
+
+// TestScrubEnv ensures the runGoonCLI scrub list strips every secret
+// before passing env to a subcommand. Regression-guards token leakage
+// via the bot's CLI passthrough (the cycle-1 security fix).
+func TestScrubEnv(t *testing.T) {
+	in := []string{
+		"PATH=/usr/bin",
+		"TELEGRAM_BOT_TOKEN=should-be-stripped",
+		"GOON_TELEGRAM_SECRET=also-stripped",
+		"HOME=/home/me",
+	}
+	out := scrubEnv(in)
+	for _, e := range out {
+		if strings.HasPrefix(e, "TELEGRAM_BOT_TOKEN=") || strings.HasPrefix(e, "GOON_TELEGRAM_SECRET=") {
+			t.Errorf("scrubEnv leaked: %q", e)
+		}
+	}
+	// Other entries must survive.
+	hasPath := false
+	for _, e := range out {
+		if e == "PATH=/usr/bin" {
+			hasPath = true
+		}
+	}
+	if !hasPath {
+		t.Error("scrubEnv dropped non-secret entries")
+	}
+}
+
+// TestSendChunked_RuneAware guards the UTF-8 split fix: long input
+// containing multi-byte runes (emoji / CJK) must produce chunks that
+// each parse as valid UTF-8. Without rune-aware cutting Telegram
+// returns 400.
+func TestSendChunked_RuneAware(t *testing.T) {
+	// Build a string just over 4000 bytes that's all 4-byte runes
+	// (emoji). Each rune is 4 bytes, so 1100 runes = 4400 bytes.
+	rune4 := "🤖"
+	if len(rune4) != 4 {
+		t.Fatalf("test precondition: expected 4-byte rune, got %d", len(rune4))
+	}
+	var sb strings.Builder
+	for i := 0; i < 1100; i++ {
+		sb.WriteString(rune4)
+	}
+	body := sb.String()
+
+	b, ft, _, _ := newTestBot(t, "s", nil)
+	b.SendChunked(context.Background(), 7, body)
+	all := ft.all()
+	if len(all) < 2 {
+		t.Fatalf("expected ≥2 chunks for 4400-byte input, got %d", len(all))
+	}
+	for i, m := range all {
+		if !utf8Valid(m.Text) {
+			t.Errorf("chunk %d is invalid UTF-8 (length %d)", i, len(m.Text))
+		}
+	}
+}
+
+// utf8Valid wraps utf8.ValidString so the test reads cleanly.
+func utf8Valid(s string) bool { return utf8.ValidString(s) }
 
 func TestBot_HelpListsCommands(t *testing.T) {
 	b, ft, mem, _ := newTestBot(t, "s", nil)
@@ -387,6 +503,49 @@ func TestBot_RegisterCommandsPublishesToTelegram(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("payload missing %s:\n%s", want, got)
 		}
+	}
+}
+
+// TestBot_PauseResumeFlipsMemoryFlag covers /pause and /resume — the
+// bot is one of three control surfaces (CLI, web, telegram) that drive
+// Memory.Status.Paused. All three must agree, so this test asserts the
+// bot really flips the same bit `goon pause` writes.
+func TestBot_PauseResumeFlipsMemoryFlag(t *testing.T) {
+	b, ft, mem, _ := newTestBot(t, "s", nil)
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+
+	b.handleUpdate(context.Background(), makeUpdate(42, "/pause"))
+	if !mem.IsPaused() {
+		t.Fatal("/pause should set Memory.Paused = true")
+	}
+	got, _ := ft.lastSent()
+	if !strings.Contains(got.Text, "paused") {
+		t.Errorf("expected 'paused' in reply, got %q", got.Text)
+	}
+
+	b.handleUpdate(context.Background(), makeUpdate(42, "/resume"))
+	if mem.IsPaused() {
+		t.Fatal("/resume should clear Memory.Paused")
+	}
+	got, _ = ft.lastSent()
+	if !strings.Contains(got.Text, "resumed") {
+		t.Errorf("expected 'resumed' in reply, got %q", got.Text)
+	}
+}
+
+// TestBot_StatusShowsPaused covers the surfacing of the Paused flag in
+// /status output. Without this, a paused daemon looks "running" to a
+// confused user staring at /status wondering why goon isn't picking up
+// new tickets.
+func TestBot_StatusShowsPaused(t *testing.T) {
+	b, ft, mem, _ := newTestBot(t, "s", nil)
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+	mem.SetStatus(memory.DaemonStatus{Running: true, Paused: true, BoardName: "jira"})
+
+	b.handleUpdate(context.Background(), makeUpdate(42, "/status"))
+	got, _ := ft.lastSent()
+	if !strings.Contains(got.Text, "paused:") {
+		t.Errorf("expected 'paused:' line in /status when daemon is paused, got:\n%s", got.Text)
 	}
 }
 
@@ -489,6 +648,118 @@ func TestBot_ListTicketsFilter(t *testing.T) {
 	got, _ := ft.lastSent()
 	if !strings.Contains(got.Text, "ENG-1") || strings.Contains(got.Text, "WEB-1") {
 		t.Errorf("filter should keep ENG-1 only, got:\n%s", got.Text)
+	}
+}
+
+// TestBot_ChatInjectsLiveContext is the cycle-7 regression test: the
+// chat handler must include the current goon state in the LLM prompt
+// so the user asking "list tickets" gets a real answer instead of
+// "I'm just an AI without access to your project." This test seeds
+// memory with a ticket, a workflow, a pending question, and a learned
+// repo, then sends a plain-text chat message and asserts the recorded
+// LLM messages contain each of those facts.
+func TestBot_ChatInjectsLiveContext(t *testing.T) {
+	b, _, mem, mock := newTestBot(t, "s", []string{"sure thing"})
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+	mem.SetStatus(memory.DaemonStatus{Running: true, BoardName: "jira", HostName: "bitbucket"})
+	mem.SeenTicket(memory.TicketSnapshot{
+		ID: "ENG-7", Source: "jira", Key: "ENG-7",
+		Title: "Add login flow", Status: "open",
+	})
+	mem.UpsertWorkflow(memory.Workflow{
+		ID: "wf-x", TicketID: "ENG-7", TicketKey: "ENG-7", Title: "Add login flow",
+		State: memory.WFAwaitingApproval, Stage: "approve_plan",
+		PendingQuestionID: "q-9",
+	})
+	mem.AskQuestion(memory.Question{ID: "q-9", TicketID: "ENG-7", Question: "Approve plan?"})
+	mem.RecordRepoChoice("ENG", "/r/eng")
+
+	b.handleUpdate(context.Background(), makeUpdate(42, "give me list open ticket"))
+
+	// Inspect the LLM's recorded messages. The state block lives in
+	// LastMsgs as a system message; the user's text is the last entry.
+	combined := ""
+	for _, m := range mock.LastMsgs {
+		combined += m.Content + "\n"
+	}
+	for _, want := range []string{
+		"GOON STATE",
+		"ENG-7",
+		"Add login flow",
+		"q-9",
+		"jira",
+		"bitbucket",
+		"/r/eng",
+		"/tickets", // command pointer in the system prompt
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("expected live-context injection to include %q; messages were:\n%s",
+				want, combined)
+		}
+	}
+}
+
+// TestBot_ChatNoMemoryDoesntPanic guards the chat path against a
+// Disabled memory or one with no data — chat should still work, just
+// with an "operating without context" note.
+func TestBot_ChatNoMemoryDoesntPanic(t *testing.T) {
+	b, _, mem, mock := newTestBot(t, "s", []string{"hi there"})
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+	// No state seeded — fresh disabled memory.
+	b.handleUpdate(context.Background(), makeUpdate(42, "hello"))
+	combined := ""
+	for _, m := range mock.LastMsgs {
+		combined += m.Content + "\n"
+	}
+	if !strings.Contains(combined, "GOON STATE") {
+		t.Errorf("expected state block even on empty memory; got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "[tickets: none") {
+		t.Errorf("expected explicit 'no tickets' note in state; got:\n%s", combined)
+	}
+}
+
+// TestBot_ChatInjectsActiveKnowledge covers the cycle-7 follow-up: the
+// chat handler must also surface the ACTIVE markdown notes (PINNED.md
+// and the topic-note index) — that's goon's persistent knowledge
+// layer. Without it the LLM can answer "what tickets exist" but not
+// "what do you know about our auth flow."
+func TestBot_ChatInjectsActiveKnowledge(t *testing.T) {
+	// Isolated notes dir per test so we don't trample real state.
+	memDir := t.TempDir()
+	t.Setenv("GOON_MEMORY_DIR", memDir)
+
+	store, err := notes.New(memDir)
+	if err != nil {
+		t.Fatalf("notes.New: %v", err)
+	}
+	if err := store.Write(notes.PinnedFilename,
+		"# Conventions\n- branch prefix is goon/\n- always run goimports before PR"); err != nil {
+		t.Fatalf("write pinned: %v", err)
+	}
+	if err := store.Write("learnings/oauth-flow.md",
+		"# OAuth flow\nThe service uses PKCE + state cookie."); err != nil {
+		t.Fatalf("write topic: %v", err)
+	}
+
+	b, _, mem, mock := newTestBot(t, "s", []string{"sure"})
+	mem.AuthorizeChat(42, "harisa", "Harisa")
+	b.handleUpdate(context.Background(), makeUpdate(42, "what do you know"))
+
+	combined := ""
+	for _, m := range mock.LastMsgs {
+		combined += m.Content + "\n"
+	}
+	for _, want := range []string{
+		"PINNED.md",
+		"branch prefix is goon/",       // body content from pinned
+		"learnings/oauth-flow.md",      // topic note name
+		"OAuth flow",                   // headline of topic note
+		"/memory read",                 // command pointer
+	} {
+		if !strings.Contains(combined, want) {
+			t.Errorf("knowledge block missing %q; messages:\n%s", want, combined)
+		}
 	}
 }
 

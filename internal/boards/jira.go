@@ -92,10 +92,17 @@ type jiraIssue struct {
 }
 
 // jiraPageSize is the per-page cap. The /rest/api/3/search/jql endpoint
-// allows up to 5000 but we keep it small (10) because the daemon picks
-// only one ticket per poll tick — fetching more would just waste API
-// quota and risk surprising the user with a stale rolled-back result.
-const jiraPageSize = 10
+// allows up to 5000. We pick 50 because:
+//   - The daemon picks one ticket per poll TICK, but every ticket in
+//     the page is recorded via memory.SeenTicket — that's what the
+//     user-facing inventory (/tickets, web Tickets tab, chat context)
+//     surfaces. With pageSize=10, a user with 30 open tickets only
+//     ever sees the first 10, and the chat answer to "list my open
+//     tickets" was truncated. 50 covers most real teams in one page.
+//   - We deliberately do NOT auto-paginate further. If a user has
+//     >50 matches, they should tighten JIRA_JQL — fetching every page
+//     on every 5-minute tick would burn API quota.
+const jiraPageSize = 50
 
 // List runs the configured JQL and returns matching tickets. Caps at
 // jiraPageSize results per page; logs a warning to stderr if the result was

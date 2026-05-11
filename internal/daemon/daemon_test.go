@@ -209,6 +209,35 @@ func TestDaemon_ResumesPausedWorkflow(t *testing.T) {
 	}
 }
 
+// TestDaemon_PausedSkipsPoll covers the pause/resume semantics. When
+// Memory.Status.Paused is set, pollAndRun must short-circuit BEFORE
+// touching the board — the test seeds an open ticket, pauses, ticks
+// the daemon, and asserts no workflow record was created.
+func TestDaemon_PausedSkipsPoll(t *testing.T) {
+	mem := memory.Disabled()
+	mem.SetPaused(true)
+	board := boards.NewMock([]boards.Ticket{
+		{ID: "ENG-1", Key: "ENG-1", Title: "x", Status: boards.StatusOpen, UpdatedAt: time.Now()},
+	})
+	mock := llm.NewMock(nil)
+	var out bytes.Buffer
+	d := New(Options{
+		LLM: mock, Tools: tools.DefaultRegistry(),
+		Executor: executor.New(executor.Options{Mode: executor.ModeAuto, Validator: safety.Default(), Stdout: &out, Stderr: &out, Stdin: strings.NewReader("")}),
+		Memory:   mem, Board: board, Host: githost.NewMock(),
+		Stdout: &out, Stderr: &out, PollInterval: 30 * time.Millisecond,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	_ = d.Run(ctx)
+	if !strings.Contains(out.String(), "[poll] paused") {
+		t.Fatalf("expected paused log line:\n%s", out.String())
+	}
+	if len(mem.ListWorkflows(10)) != 0 {
+		t.Errorf("paused daemon should not have started any workflow")
+	}
+}
+
 // Confirm the poll loop ticks at least twice with a 50ms interval.
 func TestDaemon_PollsRepeatedly(t *testing.T) {
 	mem := memory.Disabled()

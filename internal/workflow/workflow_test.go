@@ -341,6 +341,89 @@ func TestPickRepo(t *testing.T) {
 	}
 }
 
+// TestPickRepoForTicket_PriorityLadder covers the repo-resolution
+// priority documented on the Engine method:
+//   1. GOON_REPO_MAP exact (operator-explicit)
+//   2. Memory.RepoChoices learned (user-confirmed once)
+//   3. GOON_REPO_MAP wildcard "*"
+//   4. ticket.Project literal (last resort)
+//
+// A regression here is silent (goon still finds *some* path) but
+// disastrous in practice — env settings stop being authoritative or
+// learned choices stop carrying forward. The four sub-cases cover the
+// four rungs.
+func TestPickRepoForTicket_PriorityLadder(t *testing.T) {
+	t.Run("env exact wins over learned", func(t *testing.T) {
+		t.Setenv("GOON_REPO_MAP", "ENG=/r/env-eng")
+		mem := memory.Disabled()
+		mem.RecordRepoChoice("ENG", "/r/learned")
+		e := &Engine{Memory: mem}
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/env-eng" {
+			t.Errorf("env should win over learned; got %q", got)
+		}
+	})
+	t.Run("learned wins over wildcard", func(t *testing.T) {
+		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
+		mem := memory.Disabled()
+		mem.RecordRepoChoice("ENG", "/r/learned")
+		e := &Engine{Memory: mem}
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/learned" {
+			t.Errorf("learned should win over wildcard; got %q", got)
+		}
+	})
+	t.Run("wildcard used when no exact match and no learning", func(t *testing.T) {
+		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
+		mem := memory.Disabled()
+		e := &Engine{Memory: mem}
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "OTHER"}); got != "/r/wildcard" {
+			t.Errorf("wildcard fallback failed; got %q", got)
+		}
+	})
+	t.Run("project literal as last resort", func(t *testing.T) {
+		t.Setenv("GOON_REPO_MAP", "")
+		mem := memory.Disabled()
+		e := &Engine{Memory: mem}
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "owner/repo"}); got != "owner/repo" {
+			t.Errorf("project-literal fallback failed; got %q", got)
+		}
+	})
+}
+
+// TestEngine_PhaseConfirmRepoLearns ensures the gate's success path
+// records the project→repo mapping so the next ticket from the same
+// project skips the gate entirely. This is the user-facing promise of
+// "I confirmed this once, don't ask me again."
+func TestEngine_PhaseConfirmRepoLearns(t *testing.T) {
+	e, _, _, _, mem := gatedEngine(t, []string{
+		`{"steps":[{"title":"x"}],"repo":"/r/eng"}`,
+	})
+	ticket := boards.Ticket{
+		ID: "ENG-1", Source: "jira", Key: "ENG-1",
+		Title: "Add login", Project: "ENG",
+	}
+	// Run 1 — pauses at confirm_repo.
+	if _, err := e.Run(context.Background(), ticket); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	pending := mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending question, got %d", len(pending))
+	}
+	mem.AnswerQuestion(pending[0].ID, "yes")
+
+	// Run 2 — confirm_repo passes; project→repo should be persisted.
+	if _, err := e.Run(context.Background(), ticket); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	got, ok := mem.LookupRepoChoice("ENG")
+	if !ok {
+		t.Fatal("expected memory to have learned a repo for ENG")
+	}
+	if got != "/r/eng" {
+		t.Errorf("learned repo = %q, want /r/eng", got)
+	}
+}
+
 // gatedEngine is like newEngine but with AutoApprove=false so the gate
 // pause/resume behaviour can be exercised end-to-end.
 func gatedEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githost.Mock, *boards.Mock, *memory.Memory) {
@@ -468,9 +551,20 @@ func TestEngine_ResumesAfterApproval(t *testing.T) {
 	}
 }
 
-func TestEngine_RejectedPlanFailsWorkflow(t *testing.T) {
+// TestEngine_RejectedPlanRePlansWithFeedback covers the cycle-2 product
+// change: a non-yes answer at approve_plan no longer kills the
+// workflow. Instead the rejection text becomes feedback for a fresh
+// triage. The previous behaviour (immediate WFFailed) was broken UX —
+// users typing "no, refactor X first" got a permanently-dead ticket
+// with no recovery surface.
+//
+// Verifies the first round trip: reject → re-triage → ask again with
+// the revised plan. Full exhaustion (3 rejections → giveup) is covered
+// by TestEngine_RejectedPlanGivesUpAfterMaxRePlans below.
+func TestEngine_RejectedPlanRePlansWithFeedback(t *testing.T) {
 	replies := []string{
-		`{"steps":[{"title":"x"}],"repo":"o/r"}`,
+		`{"steps":[{"title":"original step"}],"repo":"o/r"}`, // run1 triage
+		`{"steps":[{"title":"revised step"}],"repo":"o/r"}`,  // run3 re-triage
 	}
 	e, out, host, _, mem := gatedEngine(t, replies)
 	ticket := boards.Ticket{
@@ -478,7 +572,7 @@ func TestEngine_RejectedPlanFailsWorkflow(t *testing.T) {
 		Title: "Bad idea", Project: "ENG",
 	}
 
-	// Run 1: triage runs, pauses at confirm_repo.
+	// Run 1: triage + pauses at confirm_repo.
 	if _, err := e.Run(context.Background(), ticket); err != nil {
 		t.Fatalf("run1: %v\n%s", err, out.String())
 	}
@@ -486,9 +580,9 @@ func TestEngine_RejectedPlanFailsWorkflow(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("pending after run1: %d", len(pending))
 	}
-	mem.AnswerQuestion(pending[0].ID, "yes") // confirm repo
+	mem.AnswerQuestion(pending[0].ID, "yes")
 
-	// Run 2: pauses at approve_plan; user rejects.
+	// Run 2: pauses at approve_plan with the original plan.
 	if _, err := e.Run(context.Background(), ticket); err != nil {
 		t.Fatalf("run2: %v\n%s", err, out.String())
 	}
@@ -496,21 +590,123 @@ func TestEngine_RejectedPlanFailsWorkflow(t *testing.T) {
 	if len(pending) != 1 {
 		t.Fatalf("pending after run2: %d", len(pending))
 	}
-	mem.AnswerQuestion(pending[0].ID, "no")
+	// Reject with feedback that should be woven into the next triage.
+	mem.AnswerQuestion(pending[0].ID, "no — refactor the auth helper first")
 
-	// Run 3: should fail at approve_plan.
+	// Run 3: re-triage with the rejection feedback. Pauses again at
+	// approve_plan with a NEW question (different text, replan_count=1).
 	wf, err := e.Run(context.Background(), ticket)
-	if err == nil {
-		t.Fatalf("expected rejection error, got none\n%s", out.String())
+	if err != nil {
+		t.Fatalf("run3 should not fail (re-plan path), got: %v\n%s", err, out.String())
 	}
-	if wf.State != memory.WFFailed {
-		t.Fatalf("state = %q want failed", wf.State)
+	if wf.State != memory.WFAwaitingApproval {
+		t.Errorf("expected WFAwaitingApproval after re-plan, got %q (err=%q)", wf.State, wf.Error)
 	}
-	if !strings.Contains(wf.Error, "approve_plan") {
-		t.Errorf("error = %q should mention approve_plan", wf.Error)
+	if got := wf.Approvals["replan_count"]; got != "1" {
+		t.Errorf("replan_count = %q, want 1", got)
+	}
+	// PendingQuestionID must be set to a NEW question (the second one).
+	if wf.PendingQuestionID == "" {
+		t.Error("PendingQuestionID should point at the new approve_plan question")
+	}
+	// The new pending question text must signal it's a revised plan
+	// (different from the original) so FindAnswer can't auto-reuse
+	// the previous "no" answer.
+	pending = mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("expected exactly 1 pending question, got %d", len(pending))
+	}
+	if !strings.Contains(pending[0].Question, "REVISED") {
+		t.Errorf("re-plan question should advertise REVISED, got: %q", pending[0].Question)
 	}
 	if len(host.Opened) != 0 {
-		t.Errorf("PR should not be opened on rejection, got %d", len(host.Opened))
+		t.Errorf("PR should not be opened during re-plan, got %d", len(host.Opened))
+	}
+	// The user's rejection text MUST be woven into the re-triage
+	// prompt — otherwise triageWithFeedback's whole point is lost
+	// and the LLM regenerates the same plan blindly. The mock LLM
+	// records every Generate() message; the second triage call's
+	// most recent user-message must contain the rejection text.
+	mockLLM, ok := e.LLM.(*llm.Mock)
+	if !ok {
+		t.Fatal("expected *llm.Mock for prompt inspection")
+	}
+	if mockLLM.Calls < 2 {
+		t.Fatalf("expected at least 2 LLM calls (initial triage + re-triage), got %d", mockLLM.Calls)
+	}
+	combined := ""
+	for _, m := range mockLLM.LastMsgs {
+		combined += m.Content + "\n"
+	}
+	if !strings.Contains(combined, "refactor the auth helper first") {
+		t.Errorf("re-triage prompt should weave in the rejection feedback; got messages:\n%s", combined)
+	}
+	if !strings.Contains(combined, "PREVIOUS PLAN WAS REJECTED") {
+		t.Errorf("re-triage prompt should signal it's a re-plan; got messages:\n%s", combined)
+	}
+}
+
+// TestEngine_RejectedPlanGivesUpAfterMaxRePlans covers the second half
+// of the rejection contract: after maxRePlans (=3) re-plans plus a
+// fourth rejection, the workflow fails with an explicit "giving up"
+// error — preventing an infinite re-plan loop.
+//
+// Counting: each non-yes answer increments replan_count BEFORE the
+// `count > maxRePlans` check. The first three increments (1, 2, 3)
+// each trigger a fresh re-plan. The fourth (count=4 > 3) gives up.
+// With Engine's in-call rewind via errReplan, every rejection except
+// the last is processed by the SAME Run() call as the next ask, so
+// the test scaffolding answers four "no"s — the fifth Run is the
+// one that fails.
+func TestEngine_RejectedPlanGivesUpAfterMaxRePlans(t *testing.T) {
+	replies := []string{
+		`{"steps":[{"title":"v1"}],"repo":"o/r"}`, // initial triage
+		`{"steps":[{"title":"v2"}],"repo":"o/r"}`, // re-plan 1
+		`{"steps":[{"title":"v3"}],"repo":"o/r"}`, // re-plan 2
+		`{"steps":[{"title":"v4"}],"repo":"o/r"}`, // re-plan 3
+	}
+	e, out, _, _, mem := gatedEngine(t, replies)
+	ticket := boards.Ticket{
+		ID: "ENG-3", Source: "jira", Key: "ENG-3",
+		Title: "Stubborn", Project: "ENG",
+	}
+
+	// Run #1 — initial triage → confirm_repo gate.
+	if _, err := e.Run(context.Background(), ticket); err != nil {
+		t.Fatalf("triage run: %v\n%s", err, out.String())
+	}
+	confirmQ := mem.PendingQuestions()[0].ID
+	mem.AnswerQuestion(confirmQ, "yes")
+
+	// Four [Run + reject] cycles. After cycle N, replan_count==N.
+	// Run #2 produces the first approve_plan question. Run #3 onward
+	// processes the previous "no" and (when count<=maxRePlans)
+	// re-triages + asks the next one in the same call.
+	for i := 0; i < 4; i++ {
+		if _, err := e.Run(context.Background(), ticket); err != nil {
+			t.Fatalf("rejection iter %d: %v\n%s", i, err, out.String())
+		}
+		pending := mem.PendingQuestions()
+		if len(pending) != 1 {
+			t.Fatalf("iter %d expected 1 pending, got %d", i, len(pending))
+		}
+		mem.AnswerQuestion(pending[0].ID, "no")
+	}
+
+	// Final Run — 4th rejection processed; count=4 > maxRePlans(=3)
+	// → giveup. Error message must report "4 times" exactly.
+	wf, err := e.Run(context.Background(), ticket)
+	if err == nil {
+		t.Fatal("expected give-up error after maxRePlans")
+	}
+	if wf.State != memory.WFFailed {
+		t.Errorf("state = %q, want failed", wf.State)
+	}
+	if !strings.Contains(wf.Error, "giving up") {
+		t.Errorf("error should mention giving up, got: %q", wf.Error)
+	}
+	if !strings.Contains(wf.Error, "4 times") {
+		t.Errorf("error should report rejection count = 4, got: %q", wf.Error)
 	}
 }
 

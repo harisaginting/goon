@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,6 +40,10 @@ var menuCommands = []struct {
 	{"comment", "Comment on a PR: /comment <repo> <num> <body>"},
 	{"tickets", "List tickets goon has seen + status"},
 	{"ticket", "Show a ticket: /ticket <id-or-key>"},
+	{"knowledge", "What goon knows — PINNED.md + topic-note index"},
+	{"refresh", "Pull a fresh ticket snapshot from the board NOW"},
+	{"pause", "Pause the daemon's poll loop"},
+	{"resume", "Resume the daemon's poll loop"},
 	{"run", "Run a one-shot agent task: /run <task>"},
 	{"whoami", "Show your chat record"},
 	{"logout", "Revoke auth and forget this chat"},
@@ -86,6 +91,11 @@ func (b *Bot) registerCommands(ctx context.Context) error {
 // message and reads well on a phone screen.
 const helpText = `goon bot — commands
 
+auth:
+  /auth <secret>   one-time login with the shared GOON_TELEGRAM_SECRET
+  /logout          revoke this chat's access
+  /whoami          show your auth record
+
 monitoring:
   /status          daemon status snapshot
   /logs [n]        last n log lines (default 30)
@@ -99,6 +109,10 @@ monitoring:
 questions / approvals:
   /queue           pending questions waiting for input
   /answer <id> <a> answer a pending question
+
+daemon control:
+  /pause           stop polling for new tickets (running workflows finish)
+  /resume          pick up where we left off
 
 PR review (if a git host is configured):
   /prs [repo]      list open PRs
@@ -139,6 +153,8 @@ var builtins = map[string]bool{
 	"workflows": true,
 	"tickets":   true,
 	"ticket":    true,
+	"knowledge": true,
+	"refresh":   true,
 	"memory":    true,
 	"queue":     true,
 	"answer":    true,
@@ -147,6 +163,8 @@ var builtins = map[string]bool{
 	"approve":   true,
 	"decline":   true,
 	"comment":   true,
+	"pause":     true,
+	"resume":    true,
 	"run":       true,
 	"whoami":    true,
 	"logout":    true,
@@ -160,8 +178,19 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 	cmd = strings.ToLower(cmd)
 	args := parts[1:]
 
+	// /start is a Telegram convention — every bot menu entry-point uses
+	// it as "begin chat." Already-authenticated users tap it as a habit,
+	// and a "✗ not allowed" reply makes the bot look broken. Treat it
+	// as a friendly hello instead, regardless of disallowedCLI.
+	if cmd == "start" {
+		_ = b.Send(ctx, chatID,
+			"👋 you're authenticated. Try /status to see daemon state, /help for the full command list, or send any plain text to chat with the model.")
+		return
+	}
 	if disallowedCLI[cmd] {
-		_ = b.Send(ctx, chatID, "✗ command `"+cmd+"` is not allowed via Telegram")
+		_ = b.Send(ctx, chatID,
+			"✗ /"+cmd+" is not available over Telegram (the daemon controls its own lifecycle).\n"+
+				"Use the CLI for /stop, /update, /uninstall. /pause and /resume work here.")
 		return
 	}
 
@@ -178,6 +207,10 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 		b.cmdListTickets(ctx, chatID, args)
 	case "ticket":
 		b.cmdTicketDetail(ctx, chatID, args)
+	case "knowledge":
+		b.cmdKnowledge(ctx, chatID)
+	case "refresh":
+		b.cmdRefresh(ctx, chatID)
 	case "memory":
 		b.cmdMemory(ctx, chatID, args)
 	case "queue":
@@ -194,6 +227,10 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 		b.cmdDeclinePR(ctx, chatID, args)
 	case "comment":
 		b.cmdCommentPR(ctx, chatID, args)
+	case "pause":
+		b.cmdPauseDaemon(ctx, chatID)
+	case "resume":
+		b.cmdResumeDaemon(ctx, chatID)
 	case "run":
 		b.cmdRun(ctx, chatID, args)
 	case "whoami":
@@ -212,6 +249,14 @@ func (b *Bot) cmdStatus(ctx context.Context, chatID int64) {
 	st := b.opts.Memory.GetStatus()
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "running:        %v\n", st.Running)
+	// Always show paused state, even when false. Otherwise users
+	// running /status to *check* whether they paused have to infer
+	// from absence — a footgun the cycle-1 audit flagged.
+	if st.Paused {
+		sb.WriteString("paused:         yes — /resume to pick up new tickets\n")
+	} else {
+		sb.WriteString("paused:         no\n")
+	}
 	if st.PID > 0 {
 		fmt.Fprintf(&sb, "pid:            %d\n", st.PID)
 	}
@@ -329,7 +374,25 @@ func (b *Bot) cmdAnswer(ctx context.Context, chatID int64, args []string) {
 		return
 	}
 	logx.Info("telegram_bot.answer", "chat", chatID, "qid", qid)
-	_ = b.Send(ctx, chatID, "✓ answered "+qid)
+	_ = b.Send(ctx, chatID,
+		"✓ answered "+qid+"\nthe daemon resumes on its next poll tick (≤ "+pollIntervalLabel()+"). Use /status to check.")
+}
+
+// pollIntervalLabel returns a human-readable poll interval ("5m", "30s")
+// from the env. Surfaced in /answer so users know how long until the
+// daemon picks up their reply.
+func pollIntervalLabel() string {
+	v := strings.TrimSpace(os.Getenv("GOON_POLL_SECONDS"))
+	if v == "" {
+		return "5m"
+	}
+	if n, err := strconv.Atoi(v); err == nil && n > 0 {
+		if n < 60 {
+			return fmt.Sprintf("%ds", n)
+		}
+		return fmt.Sprintf("%dm", n/60)
+	}
+	return "5m"
 }
 
 func (b *Bot) cmdMemory(ctx context.Context, chatID int64, args []string) {
@@ -388,6 +451,35 @@ func (b *Bot) cmdWhoami(ctx context.Context, chatID int64, from User) {
 	_ = b.Send(ctx, chatID, fmt.Sprintf("you are %s @%s (chat=%d)", from.DisplayName(), from.Username, chatID))
 }
 
+// cmdPauseDaemon flips the daemon's Paused flag in shared memory.
+// Same control surface as `goon pause` and the web UI's Pause button —
+// all three drive the single Memory.Status.Paused field.
+//
+// Note: this does NOT stop the bot itself (the bot lives inside the
+// daemon process). The bot keeps responding to commands while paused;
+// only the ticket-polling loop is suspended. /resume picks it back up.
+func (b *Bot) cmdPauseDaemon(ctx context.Context, chatID int64) {
+	if b.opts.Memory.IsPaused() {
+		_ = b.Send(ctx, chatID, "daemon is already paused. /resume to pick up new tickets.")
+		return
+	}
+	b.opts.Memory.SetPaused(true)
+	logx.Info("telegram_bot.pause", "chat", chatID)
+	_ = b.Send(ctx, chatID,
+		"⏸ daemon paused.\nRunning workflows finish; no new tickets are picked up.\n/resume to continue.")
+}
+
+// cmdResumeDaemon clears the Paused flag.
+func (b *Bot) cmdResumeDaemon(ctx context.Context, chatID int64) {
+	if !b.opts.Memory.IsPaused() {
+		_ = b.Send(ctx, chatID, "daemon is not paused.")
+		return
+	}
+	b.opts.Memory.SetPaused(false)
+	logx.Info("telegram_bot.resume", "chat", chatID)
+	_ = b.Send(ctx, chatID, "▶ daemon resumed. Next poll picks up new tickets.")
+}
+
 func (b *Bot) cmdLogout(ctx context.Context, chatID int64) {
 	if b.opts.Memory.RevokeChat(chatID) {
 		// Drop chat history too.
@@ -434,7 +526,13 @@ func (b *Bot) cmdRun(ctx context.Context, chatID int64, args []string) {
 	if body == "" {
 		body = "(agent produced no output)"
 	}
-	b.SendChunked(ctx, chatID, body)
+	// Use a detached context for the final flush. If the caller's ctx
+	// was already cancelled (typically `goon stop` mid-/run), the
+	// Telegram POST would fail and the user would see nothing of what
+	// the agent actually did. A 10s timeout bounds the flush itself.
+	flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer flushCancel()
+	b.SendChunked(flushCtx, chatID, body)
 }
 
 // --- full CLI passthrough --------------------------------------------------
@@ -467,15 +565,74 @@ func (b *Bot) cmdPassthrough(ctx context.Context, chatID int64, cmd string, args
 // runGoonCLI shells out to the goon binary and returns the combined stdout
 // + stderr. Stdin is /dev/null so commands that prompt fail fast instead of
 // hanging the long-poll goroutine.
+//
+// Env scrubbing: the daemon's env contains TELEGRAM_BOT_TOKEN and
+// GOON_TELEGRAM_SECRET. Any subcommand that prints env (like a misbehaving
+// `goon config show --reveal`) would leak those to the chat. We strip
+// auth-bearing env vars from the subprocess. The CLI re-reads them from
+// ~/.config/goon/.env if it actually needs them.
+//
+// Timeout is 5 minutes — long enough for `goon doctor` to do live
+// network probes, short enough to bound a misbehaving subcommand.
 func (b *Bot) runGoonCLI(ctx context.Context, args ...string) (string, error) {
 	if b.opts.GoonExe == "" {
 		return "", fmt.Errorf("goon executable not located")
 	}
-	runCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	c := exec.CommandContext(runCtx, b.opts.GoonExe, args...)
-	c.Env = os.Environ()
+	c.Env = scrubEnv(os.Environ())
 	c.Stdin = bytes.NewReader(nil)
 	out, err := c.CombinedOutput()
 	return string(out), err
+}
+
+// scrubEnv removes sensitive env vars from the subprocess environment so
+// a misbehaving CLI subcommand can't dump them to the chat. Covers every
+// secret-bearing key goon currently accepts: bot tokens, API keys, API
+// tokens, app passwords, and generic *_SECRET / *_PASSWORD names.
+//
+// Returns a fresh slice — never mutates the caller's backing array.
+func scrubEnv(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		eq := strings.IndexByte(e, '=')
+		if eq <= 0 {
+			out = append(out, e)
+			continue
+		}
+		if isSecretEnvKey(e[:eq]) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// isSecretEnvKey returns true when the given env key likely holds a
+// credential. Conservative — false positives just mean a few extra
+// env entries are dropped from the subprocess; false negatives could
+// leak a secret.
+func isSecretEnvKey(name string) bool {
+	switch name {
+	case "TELEGRAM_BOT_TOKEN",
+		"GOON_TELEGRAM_SECRET",
+		"OPENAI_API_KEY",
+		"ANTHROPIC_API_KEY",
+		"GITHUB_TOKEN",
+		"GITLAB_TOKEN",
+		"BITBUCKET_TOKEN",
+		"BITBUCKET_APP_PASSWORD",
+		"JIRA_API_TOKEN",
+		"CONFLUENCE_API_TOKEN",
+		"ATLASSIAN_API_TOKEN":
+		return true
+	}
+	// Catch-all heuristics — any var ending in _TOKEN / _KEY / _SECRET /
+	// _PASSWORD / _PASSWD is treated as sensitive.
+	return strings.HasSuffix(name, "_TOKEN") ||
+		strings.HasSuffix(name, "_API_KEY") ||
+		strings.HasSuffix(name, "_SECRET") ||
+		strings.HasSuffix(name, "_PASSWORD") ||
+		strings.HasSuffix(name, "_PASSWD")
 }

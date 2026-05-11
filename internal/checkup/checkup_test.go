@@ -51,7 +51,7 @@ func TestProbeOpenAI_OK(t *testing.T) {
 	t.Setenv("GOON_LLM_PROVIDER", "openai")
 	t.Setenv("OPENAI_API_KEY", "KEY")
 	t.Setenv("OPENAI_BASE_URL", ts.URL)
-	r := probeOpenAI(context.Background())
+	r := probeOpenAI(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -69,7 +69,7 @@ func TestProbeOpenAI_BadAuth(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("OPENAI_API_KEY", "BAD")
 	t.Setenv("OPENAI_BASE_URL", ts.URL)
-	r := probeOpenAI(context.Background())
+	r := probeOpenAI(context.Background(), os.Getenv)
 	if r.OK {
 		t.Fatalf("expected fail, got %+v", r)
 	}
@@ -80,7 +80,7 @@ func TestProbeOpenAI_BadAuth(t *testing.T) {
 
 func TestProbeOpenAI_NoKey(t *testing.T) {
 	clearLLMEnv(t)
-	r := probeOpenAI(context.Background())
+	r := probeOpenAI(context.Background(), os.Getenv)
 	if r.OK {
 		t.Fatalf("expected fail when key missing")
 	}
@@ -103,7 +103,7 @@ func TestProbeAnthropic_OK(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("ANTHROPIC_API_KEY", "KEY")
 	t.Setenv("ANTHROPIC_BASE_URL", ts.URL)
-	r := probeAnthropic(context.Background())
+	r := probeAnthropic(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -117,7 +117,7 @@ func TestProbeOllama_ServerReachable(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("OLLAMA_BASE_URL", ts.URL)
 	t.Setenv("OLLAMA_MODEL", "llama3")
-	r := probeOllama(context.Background())
+	r := probeOllama(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -134,7 +134,7 @@ func TestProbeOllama_ModelNotPulled(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("OLLAMA_BASE_URL", ts.URL)
 	t.Setenv("OLLAMA_MODEL", "qwen2.5-coder")
-	r := probeOllama(context.Background())
+	r := probeOllama(context.Background(), os.Getenv)
 	// Server reachable but the configured model isn't pulled — the agent
 	// loop will fail at first generate(), so doctor flags it red so the
 	// user sees the misconfig before launching `goon start`.
@@ -152,7 +152,7 @@ func TestProbeOllama_ModelNotPulled(t *testing.T) {
 func TestProbeOllama_Unreachable(t *testing.T) {
 	clearLLMEnv(t)
 	t.Setenv("OLLAMA_BASE_URL", "http://127.0.0.1:1") // refused
-	r := probeOllama(context.Background())
+	r := probeOllama(context.Background(), os.Getenv)
 	if r.OK {
 		t.Fatalf("expected fail, got %+v", r)
 	}
@@ -173,7 +173,7 @@ func TestProbeJira_OK(t *testing.T) {
 	t.Setenv("JIRA_BASE_URL", ts.URL)
 	t.Setenv("JIRA_EMAIL", "h@x")
 	t.Setenv("JIRA_API_TOKEN", "tok")
-	r := probeJira(context.Background())
+	r := probeJira(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -185,7 +185,7 @@ func TestProbeJira_OK(t *testing.T) {
 func TestProbeGitHubBoard_NeedsRepos(t *testing.T) {
 	clearLLMEnv(t)
 	t.Setenv("GITHUB_TOKEN", "x")
-	r := probeGitHubBoard(context.Background())
+	r := probeGitHubBoard(context.Background(), os.Getenv)
 	if r.OK {
 		t.Fatalf("expected fail without GITHUB_REPOS")
 	}
@@ -200,7 +200,7 @@ func TestProbeGitHubBoard_OK(t *testing.T) {
 	t.Setenv("GITHUB_TOKEN", "tok")
 	t.Setenv("GITHUB_REPOS", "harisaginting/goon,me/other")
 	t.Setenv("GITHUB_API_URL", ts.URL)
-	r := probeGitHubBoard(context.Background())
+	r := probeGitHubBoard(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -220,7 +220,7 @@ func TestProbeGitLab_OK(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("GITLAB_TOKEN", "T")
 	t.Setenv("GITLAB_API_URL", ts.URL)
-	r := probeGitLab(context.Background())
+	r := probeGitLab(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -236,7 +236,7 @@ func TestProbeBitbucket_TokenAuth(t *testing.T) {
 	defer ts.Close()
 	t.Setenv("BITBUCKET_TOKEN", "TOK")
 	t.Setenv("BITBUCKET_API_URL", ts.URL)
-	r := probeBitbucket(context.Background())
+	r := probeBitbucket(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -256,7 +256,7 @@ func TestProbeBitbucket_BasicAuth(t *testing.T) {
 	t.Setenv("BITBUCKET_USERNAME", "u@x")
 	t.Setenv("BITBUCKET_APP_PASSWORD", "appkey")
 	t.Setenv("BITBUCKET_API_URL", ts.URL)
-	r := probeBitbucket(context.Background())
+	r := probeBitbucket(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK, got %+v", r)
 	}
@@ -274,7 +274,7 @@ func TestCheckTelegram_OK(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "TOK")
 	t.Setenv("TELEGRAM_API_BASE_URL", ts.URL)
 	t.Setenv("TELEGRAM_CHAT_ID", "12345")
-	r := checkTelegram(context.Background())
+	r := checkTelegram(context.Background(), os.Getenv)
 	if !r.OK {
 		t.Fatalf("expected OK: %+v", r)
 	}
@@ -285,7 +285,7 @@ func TestCheckTelegram_OK(t *testing.T) {
 
 func TestCheckTelegram_NoToken_Skipped(t *testing.T) {
 	clearLLMEnv(t)
-	r := checkTelegram(context.Background())
+	r := checkTelegram(context.Background(), os.Getenv)
 	if r.Component != "" {
 		t.Fatalf("expected empty result when no token, got %+v", r)
 	}

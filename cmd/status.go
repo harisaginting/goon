@@ -30,6 +30,9 @@ func runStatus(_ context.Context, _ []string, stdout, stderr io.Writer) error {
 
 	fmt.Fprintf(stdout, "goon daemon\n")
 	fmt.Fprintf(stdout, "  status:        %s\n", runningStr(st.Running && pidLive))
+	if st.Paused {
+		fmt.Fprintf(stdout, "  paused:        yes — `goon resume` to pick up new tickets\n")
+	}
 	if pid != 0 {
 		fmt.Fprintf(stdout, "  pid:           %d (alive=%v)\n", pid, pidLive)
 	}

@@ -1,170 +1,429 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="h-full">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>goon — autonomous engineer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goon — dashboard</title>
+
+<!-- Tailwind via Play CDN. Single-binary "zero deps" applies to the Go
+     build; the in-browser stylesheet is cached aggressively and the
+     page degrades gracefully (functional, unstyled) when offline. -->
+<script src="https://cdn.tailwindcss.com?plugins=forms,typography"></script>
+<script>
+  tailwind.config = {
+    darkMode: 'media',
+    theme: {
+      extend: {
+        colors: {
+          accent: {
+            DEFAULT: '#58a6ff',
+            soft:    '#1f6feb22',
+            ring:    '#58a6ff66',
+          },
+          surface: {
+            DEFAULT: '#0d1117',
+            raised:  '#161b22',
+            sunken:  '#0a0d12',
+            border:  '#21262d',
+          },
+        },
+        fontFamily: {
+          sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
+          mono: ['ui-monospace', 'SF Mono', 'JetBrains Mono', 'Menlo', 'Consolas', 'monospace'],
+        },
+        boxShadow: {
+          'card': '0 1px 2px 0 rgb(0 0 0 / 0.04), 0 1px 3px 0 rgb(0 0 0 / 0.04)',
+          'lift': '0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.04)',
+          'glow': '0 0 0 4px rgb(88 166 255 / 0.15)',
+        },
+        animation: {
+          'fade-in':    'fadeIn 200ms ease-out both',
+          'slide-up':   'slideUp 240ms cubic-bezier(0.16, 1, 0.3, 1) both',
+          'pulse-dot':  'pulseDot 2s ease-in-out infinite',
+          'spin-slow':  'spin 1.4s linear infinite',
+          'shimmer':    'shimmer 1.6s linear infinite',
+        },
+        keyframes: {
+          fadeIn:   { '0%': { opacity: 0 },                    '100%': { opacity: 1 } },
+          slideUp:  { '0%': { opacity: 0, transform: 'translateY(6px)' }, '100%': { opacity: 1, transform: 'translateY(0)' } },
+          pulseDot: { '0%, 100%': { opacity: 1 },              '50%': { opacity: 0.4 } },
+          shimmer:  { '0%': { backgroundPosition: '-200% 0' }, '100%': { backgroundPosition: '200% 0' } },
+        },
+      },
+    },
+  };
+</script>
+
+<!-- Preconnect to the Inter font CDN; falls back to system if blocked. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+
 <script src="/htmx.min.js"></script>
 <style>
-:root {
-  --bg: #0e1116; --fg: #d8dee4; --muted: #888; --accent: #6cf;
-  --card: #161b22; --border: #2a313a;
-  --running: #5cdb85; --stopped: #ff6868;
-  --done: #5cdb85; --failed: #ff6868; --running-state: #ffaa44; --planning: #6cf;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; padding: 0;
-  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-  background: var(--bg); color: var(--fg);
-}
-header {
-  background: var(--card); border-bottom: 1px solid var(--border);
-  padding: 14px 24px; display: flex; align-items: center; justify-content: space-between;
-}
-h1 { margin: 0; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
-h1 .robot { color: var(--accent); }
-.subtitle { color: var(--muted); font-size: 13px; }
-.docs-link {
-  margin-left: auto;
-  color: var(--muted); text-decoration: none; font-size: 13px;
-  padding: 4px 10px; border-radius: 4px; border: 1px solid var(--border);
-}
-.docs-link:hover { color: var(--accent); border-color: var(--accent); }
-main { padding: 20px 24px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-@media (max-width: 900px) { main { grid-template-columns: 1fr; } }
-section.card {
-  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-  padding: 14px 16px; min-height: 80px;
-}
-section.card h2 { margin: 0 0 10px 0; font-size: 13px; font-weight: 600; letter-spacing: 0.6px; color: var(--accent); text-transform: uppercase; }
-.kv { display: flex; justify-content: space-between; padding: 4px 0; border-bottom: 1px dashed var(--border); }
-.kv:last-child { border-bottom: 0; }
-.kv .k { color: var(--muted); }
-.kv .v { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
-.kv .v.running { color: var(--running); }
-.kv .v.stopped { color: var(--stopped); }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-table th { text-align: left; color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--border); padding: 6px 8px; }
-table td { padding: 6px 8px; border-bottom: 1px solid var(--border); font-family: ui-monospace, monospace; }
-table a { color: var(--accent); text-decoration: none; }
-table a:hover { text-decoration: underline; }
-.empty { color: var(--muted); font-style: italic; padding: 4px 0; }
-.ok { color: var(--running); }
-.qrow {
-  display: grid; gap: 6px 10px;
-  grid-template-columns: 1fr auto auto; grid-template-rows: auto auto;
-  border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px;
-  background: rgba(255,255,255,0.02);
-}
-.qrow .q { grid-column: 1 / -1; font-weight: 500; }
-.qrow .ticket { color: var(--muted); font-size: 12px; grid-column: 1 / -1; }
-.qrow input[type=text] { background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; }
-.qrow button {
-  background: var(--accent); color: var(--bg); border: 0; border-radius: 4px;
-  padding: 6px 14px; cursor: pointer; font-weight: 600;
-}
-.qrow button:hover { filter: brightness(1.15); }
-.state { padding: 2px 8px; border-radius: 3px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-.state-done { background: rgba(92,219,133,0.18); color: var(--done); }
-.state-failed { background: rgba(255,104,104,0.18); color: var(--failed); }
-.state-executing, .state-testing, .state-verifying, .state-opening_pr, .state-notifying { background: rgba(255,170,68,0.18); color: var(--running-state); }
-.state-triaging, .state-planning { background: rgba(102,204,255,0.18); color: var(--planning); }
-.state-blocked { background: rgba(255,104,104,0.10); color: var(--failed); }
+  :root { color-scheme: light dark; }
+  body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 
-/* setup banner */
-.setup-banner {
-  background: linear-gradient(90deg, rgba(102,204,255,0.18), rgba(102,204,255,0.06));
-  border: 1px solid rgba(102,204,255,0.4); border-radius: 8px;
-  padding: 14px 18px; margin: 0 24px 0 24px; color: var(--fg);
-}
-.setup-banner strong { color: var(--accent); }
+  /* Subtle gradient on page background — light enough to feel modern,
+     not so loud it competes with content. */
+  html.dark, html:not(.dark) body { background-attachment: fixed; }
+  html.dark body { background-image: radial-gradient(ellipse at top, #161b2240 0%, transparent 70%); }
 
-/* config form */
-form.cfg fieldset {
-  border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px;
-  margin-bottom: 12px;
-}
-form.cfg legend {
-  color: var(--accent); font-size: 11px; text-transform: uppercase;
-  letter-spacing: 0.6px; padding: 0 6px;
-}
-form.cfg label {
-  display: grid; grid-template-columns: 220px 1fr; align-items: center;
-  gap: 10px; padding: 4px 0;
-}
-form.cfg .lbl {
-  color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px;
-}
-form.cfg input {
-  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-  border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, monospace;
-}
-form.cfg input:focus { border-color: var(--accent); outline: none; }
-form.cfg .hint {
-  grid-column: 2 / 3; font-size: 11px; color: var(--muted); margin-top: -2px;
-}
-form.cfg .cfg-actions {
-  display: flex; gap: 10px; align-items: center; margin-top: 12px;
-}
-form.cfg button {
-  background: var(--accent); color: var(--bg); border: 0; border-radius: 4px;
-  padding: 8px 18px; cursor: pointer; font-weight: 600;
-}
-form.cfg button:hover { filter: brightness(1.15); }
-form.cfg button.btn-verify {
-  background: transparent; color: var(--accent);
-  border: 1px solid var(--accent);
-}
-form.cfg button.btn-verify:hover { background: rgba(102,204,255,0.10); }
-.htmx-indicator { display: none; color: var(--muted); font-size: 12px; }
-.htmx-request .htmx-indicator,
-.htmx-request.htmx-indicator { display: inline; }
-ul.notes { margin: 8px 0 0 0; padding: 0; list-style: none; font-size: 12px; }
-ul.notes li { padding: 2px 0; font-family: ui-monospace, monospace; }
-ul.notes .note-ok { color: var(--running); }
-ul.notes .note-err { color: var(--failed); }
-ul.notes .note-skip { color: var(--muted); }
-.err { color: var(--failed); font-weight: 600; }
+  /* Custom scrollbars. */
+  .scrollbar-thin::-webkit-scrollbar { width: 10px; height: 10px; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(120,128,148,0.18); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(120,128,148,0.32); background-clip: padding-box; border: 2px solid transparent; }
+  .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
 
-footer { text-align: center; color: var(--muted); padding: 18px; font-size: 12px; }
+  /* htmx loading indicator. */
+  .htmx-indicator { opacity: 0; transition: opacity 200ms; }
+  .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
+
+  /* Tab active state via aria-current. */
+  [aria-current="page"] {
+    color: #58a6ff !important;
+    border-bottom-color: #58a6ff !important;
+  }
+  @media (prefers-color-scheme: dark) {
+    [aria-current="page"] { color: #79c0ff !important; border-bottom-color: #79c0ff !important; }
+  }
+
+  /* Status dot pulse for "running". */
+  .pulse-dot { animation: pulseDot 2s ease-in-out infinite; }
+  @keyframes pulseDot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.55; transform: scale(1.15); } }
+
+  /* Loading skeleton — neutral shimmering bar. */
+  .skel {
+    background: linear-gradient(90deg,
+      rgba(120,128,148,0.10) 25%,
+      rgba(120,128,148,0.18) 37%,
+      rgba(120,128,148,0.10) 63%);
+    background-size: 400% 100%;
+    animation: shimmer 1.6s linear infinite;
+    border-radius: 4px;
+  }
+  @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
+
+  /* Toast entry/exit. */
+  @keyframes toast-in  { from { opacity: 0; transform: translateX(8px); } to { opacity: 1; transform: translateX(0); } }
+  @keyframes toast-out { from { opacity: 1; transform: translateX(0); }   to { opacity: 0; transform: translateX(8px); } }
+  .toast       { animation: toast-in  200ms ease-out both; }
+  .toast.gone  { animation: toast-out 220ms ease-in  both; }
+
+  /* Command palette. */
+  .cmdk-overlay { animation: fadeIn 120ms ease-out both; }
+  .cmdk-panel   { animation: slideUp 200ms cubic-bezier(0.16, 1, 0.3, 1) both; }
+
+  /* Kbd visual. */
+  kbd {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 1.5em; height: 1.5em; padding: 0 0.35em;
+    border: 1px solid rgba(120, 128, 148, 0.3);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    font: 0.72rem ui-monospace, "SF Mono", Menlo, monospace;
+    background: rgba(255, 255, 255, 0.04);
+    color: inherit;
+  }
+
+  /* Smooth swap of tab content. */
+  #tab-content > * { animation: fadeIn 180ms ease-out both; }
+
+  /* Hide htmx outerHTML target during request to prevent flash. */
+  details > summary::-webkit-details-marker { display: none; }
 </style>
 </head>
-<body>
-<header>
-  <h1><span class="robot">🤖</span> goon</h1>
-  <span class="subtitle">autonomous AI engineer</span>
-  <a href="/docs" class="docs-link" target="_blank" rel="noopener" title="Open the embedded documentation">📖 docs</a>
+
+<body class="h-full bg-white text-gray-900 dark:bg-surface dark:text-gray-100 font-sans selection:bg-accent/30 selection:text-gray-900 dark:selection:text-white">
+
+<!-- ===== Top header ====================================================== -->
+<header class="sticky top-0 z-30 border-b border-gray-200 dark:border-surface-border bg-white/85 dark:bg-surface-raised/85 backdrop-blur-md">
+  <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 flex items-center gap-3 h-14">
+    <!-- Brand -->
+    <a href="/" class="flex items-center gap-2 font-semibold tracking-tight group">
+      <span class="grid place-items-center h-7 w-7 rounded-md bg-gradient-to-br from-accent/30 to-accent/10 text-base group-hover:from-accent/40 transition">🤖</span>
+      <span class="text-[15px]">goon</span>
+      <span class="hidden md:inline text-xs font-normal text-gray-500">autonomous engineer</span>
+    </a>
+
+    <!-- Daemon status pill: live-updated header chip -->
+    <div hx-get="/fragments/status-pill" hx-trigger="load, every 3s, statusChanged from:body" class="ml-2"></div>
+
+    <!-- Spacer -->
+    <div class="flex-1"></div>
+
+    <!-- Command palette trigger (kbd hint) -->
+    <button id="cmdk-open" class="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-surface-border bg-white dark:bg-surface hover:border-accent/40 hover:text-accent transition" aria-label="Open command palette">
+      <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
+      <span>Search</span>
+      <span class="flex items-center gap-0.5 ml-2">
+        <kbd>⌘</kbd><kbd>K</kbd>
+      </span>
+    </button>
+
+    <!-- Docs link -->
+    <a href="/docs" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 hover:text-accent hover:bg-accent-soft transition" title="Open docs in new tab">
+      <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+      <span class="hidden sm:inline">docs</span>
+    </a>
+  </div>
 </header>
 
-<div hx-get="/fragments/setup" hx-trigger="load, every 5s, configChanged from:body" hx-swap="innerHTML"></div>
+<!-- ===== Setup banner ==================================================== -->
+<div hx-get="/fragments/setup" hx-trigger="load, every 10s, configChanged from:body" hx-swap="innerHTML" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"></div>
 
-<main>
-  <section class="card">
-    <h2>Daemon status</h2>
-    <div hx-get="/fragments/status" hx-trigger="load, every 3s, configChanged from:body">loading…</div>
-  </section>
-  <section class="card">
-    <h2>Pending questions</h2>
-    <div hx-get="/fragments/questions" hx-trigger="load, every 5s, questionsChanged from:body">loading…</div>
-  </section>
-  <section class="card" style="grid-column: 1 / -1;">
-    <h2>Workflows</h2>
-    <div hx-get="/fragments/workflows" hx-trigger="load, every 4s">loading…</div>
-  </section>
-  <section class="card" style="grid-column: 1 / -1;">
-    <h2>Recent tickets</h2>
-    <div hx-get="/fragments/tickets" hx-trigger="load, every 6s">loading…</div>
-  </section>
-  <section class="card" style="grid-column: 1 / -1;">
-    <h2>Configuration</h2>
-    <p style="color: var(--muted); font-size: 12px; margin: 0 0 12px 0;">
-      All values are persisted to <code>~/.config/goon/.env</code>. Hitting "save" hot-reloads the daemon.
-      Sensitive fields display as masked placeholders when set; leave them blank to keep, or type a new value to replace.
-    </p>
-    <div hx-get="/fragments/config" hx-trigger="load, configChanged from:body">loading config…</div>
-  </section>
+<!-- ===== Pending-questions banner ======================================== -->
+<div hx-get="/fragments/questions-banner" hx-trigger="load, every 5s, questionsChanged from:body" hx-swap="innerHTML" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"></div>
+
+<!-- ===== Tabs ============================================================ -->
+<nav class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 mt-4 border-b border-gray-200 dark:border-surface-border overflow-x-auto scrollbar-thin" role="tablist" aria-label="Sections">
+  <div class="flex gap-1 min-w-max">
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" aria-current="page" data-tab="overview" data-shortcut="1"
+            hx-get="/fragments/tab-overview" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Overview <kbd class="hidden sm:inline-flex">1</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" data-tab="tickets" data-shortcut="2"
+            hx-get="/fragments/tab-tickets" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Tickets <kbd class="hidden sm:inline-flex">2</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" data-tab="workflows" data-shortcut="3"
+            hx-get="/fragments/tab-workflows" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Workflows <kbd class="hidden sm:inline-flex">3</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" data-tab="questions" data-shortcut="4"
+            hx-get="/fragments/tab-questions" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Questions <kbd class="hidden sm:inline-flex">4</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" data-tab="chat" data-shortcut="5"
+            hx-get="/fragments/tab-chat" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Chat <kbd class="hidden sm:inline-flex">5</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
+            role="tab" data-tab="knowledge" data-shortcut="6"
+            hx-get="/fragments/tab-knowledge" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">Knowledge <kbd class="hidden sm:inline-flex">6</kbd></span>
+    </button>
+    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap ml-auto"
+            role="tab" data-tab="config" data-shortcut="7"
+            hx-get="/fragments/tab-config" hx-target="#tab-content" hx-swap="innerHTML"
+            onclick="setActiveTab(this)">
+      <span class="inline-flex items-center gap-1.5">
+        <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        Config <kbd class="hidden sm:inline-flex">7</kbd>
+      </span>
+    </button>
+  </div>
+</nav>
+
+<!-- ===== Tab content ===================================================== -->
+<main id="tab-content" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6"
+      hx-get="/fragments/tab-overview" hx-trigger="load" hx-swap="innerHTML">
+  <!-- Initial skeleton -->
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+    <div class="lg:col-span-1 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3">
+      <div class="skel h-3 w-24"></div>
+      <div class="skel h-6 w-32"></div>
+      <div class="skel h-3 w-full"></div>
+      <div class="skel h-3 w-3/4"></div>
+    </div>
+    <div class="lg:col-span-2 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3">
+      <div class="skel h-3 w-32"></div>
+      <div class="skel h-4 w-full"></div>
+      <div class="skel h-4 w-5/6"></div>
+      <div class="skel h-4 w-4/6"></div>
+    </div>
+  </div>
 </main>
-<footer>goon · same memory as the CLI · all data lives at <code>./storage/memory.json</code></footer>
+
+<!-- ===== Footer ========================================================== -->
+<footer class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 mt-12 text-xs text-gray-500 border-t border-gray-200 dark:border-surface-border">
+  <div class="flex flex-wrap items-center gap-4 justify-between">
+    <div>
+      same memory file backs the CLI · state at
+      <code class="font-mono">./storage/memory.json</code>
+    </div>
+    <div class="flex items-center gap-4">
+      <a href="/docs" class="hover:text-accent transition">documentation</a>
+      <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener" class="hover:text-accent transition">source</a>
+      <span class="text-gray-400 dark:text-gray-600">·</span>
+      <span class="font-mono text-[10px]">⌘K to search</span>
+    </div>
+  </div>
+</footer>
+
+<!-- ===== Toast container ================================================= -->
+<div id="toast-stack" class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none max-w-sm" aria-live="polite" aria-atomic="false"></div>
+
+<!-- ===== Command palette ================================================= -->
+<div id="cmdk" class="hidden fixed inset-0 z-50">
+  <div class="cmdk-overlay absolute inset-0 bg-gray-900/40 dark:bg-black/60 backdrop-blur-sm" onclick="closeCmdk()"></div>
+  <div class="cmdk-panel absolute top-24 left-1/2 -translate-x-1/2 w-full max-w-xl rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-2xl overflow-hidden">
+    <div class="flex items-center gap-2 px-4 py-3 border-b border-gray-200 dark:border-surface-border">
+      <svg class="h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
+      <input id="cmdk-input" type="text" placeholder="Search commands, tabs, tickets…"
+             autocomplete="off" autocorrect="off" spellcheck="false"
+             class="flex-1 bg-transparent text-sm focus:outline-none placeholder:text-gray-400">
+      <kbd>esc</kbd>
+    </div>
+    <ul id="cmdk-results" class="max-h-80 overflow-y-auto scrollbar-thin py-2" role="listbox"></ul>
+    <div class="px-4 py-2 border-t border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface-sunken text-xs text-gray-500 flex items-center gap-3">
+      <span class="flex items-center gap-1"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span class="flex items-center gap-1"><kbd>↵</kbd> open</span>
+      <span class="flex items-center gap-1"><kbd>esc</kbd> close</span>
+    </div>
+  </div>
+</div>
+
+<script>
+  // -------- Tab activation ------------------------------------------------
+  function setActiveTab(btn) {
+    document.querySelectorAll('button.tab').forEach(b => b.removeAttribute('aria-current'));
+    btn.setAttribute('aria-current', 'page');
+  }
+
+  // -------- Keyboard shortcuts -------------------------------------------
+  // 1-7: switch tabs. /: focus search (cmdk). ?: open docs in new tab.
+  document.addEventListener('keydown', (e) => {
+    // Skip when typing in inputs/textareas (so users can type "1" into a search).
+    const inField = e.target instanceof HTMLElement &&
+      (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable);
+    // Cmd-K / Ctrl-K opens palette regardless.
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      e.preventDefault(); openCmdk(); return;
+    }
+    if (inField) return;
+    if (e.key >= '1' && e.key <= '7') {
+      const btn = document.querySelector(`button.tab[data-shortcut="${e.key}"]`);
+      if (btn) { btn.click(); e.preventDefault(); }
+    } else if (e.key === '/') {
+      e.preventDefault(); openCmdk();
+    } else if (e.key === '?') {
+      e.preventDefault(); window.open('/docs', '_blank');
+    } else if (e.key === 'Escape') {
+      closeCmdk();
+    }
+  });
+
+  // -------- Command palette ----------------------------------------------
+  const cmdkActions = [
+    { label: 'Overview',      hint: 'Tab 1',     run: () => clickTab('overview') },
+    { label: 'Tickets',       hint: 'Tab 2',     run: () => clickTab('tickets') },
+    { label: 'Workflows',     hint: 'Tab 3',     run: () => clickTab('workflows') },
+    { label: 'Questions',     hint: 'Tab 4',     run: () => clickTab('questions') },
+    { label: 'Chat',          hint: 'Tab 5',     run: () => clickTab('chat') },
+    { label: 'Knowledge',     hint: 'Tab 6',     run: () => clickTab('knowledge') },
+    { label: 'Configuration', hint: 'Tab 7',     run: () => clickTab('config') },
+    { label: 'Refresh tickets from board', hint: 'POST /api/refresh', run: doRefresh },
+    { label: 'Pause daemon',  hint: 'POST /api/daemon/pause',   run: () => doDaemon('pause') },
+    { label: 'Resume daemon', hint: 'POST /api/daemon/resume',  run: () => doDaemon('resume') },
+    { label: 'Open documentation', hint: 'docs', run: () => window.open('/docs', '_blank') },
+  ];
+
+  function clickTab(name) {
+    const btn = document.querySelector(`button.tab[data-tab="${name}"]`);
+    if (btn) btn.click();
+    closeCmdk();
+  }
+  async function doRefresh() {
+    closeCmdk();
+    const r = await fetch('/api/refresh', { method: 'POST' });
+    if (r.ok) toast('refreshed tickets from board', 'ok');
+    else toast('refresh failed', 'err');
+  }
+  async function doDaemon(action) {
+    closeCmdk();
+    const r = await fetch('/api/daemon/' + action, { method: 'POST' });
+    if (r.ok) toast('daemon ' + action + (action.endsWith('e') ? 'd' : 'ed'), 'ok');
+    else toast(action + ' failed', 'err');
+  }
+
+  function openCmdk() {
+    document.getElementById('cmdk').classList.remove('hidden');
+    document.getElementById('cmdk-input').value = '';
+    document.getElementById('cmdk-input').focus();
+    renderCmdk('');
+  }
+  function closeCmdk() { document.getElementById('cmdk').classList.add('hidden'); }
+  document.getElementById('cmdk-open').addEventListener('click', openCmdk);
+
+  let cmdkIdx = 0;
+  function renderCmdk(query) {
+    const q = query.toLowerCase();
+    const results = cmdkActions.filter(a => !q || a.label.toLowerCase().includes(q) || a.hint.toLowerCase().includes(q));
+    cmdkIdx = 0;
+    const ul = document.getElementById('cmdk-results');
+    if (results.length === 0) {
+      ul.innerHTML = '<li class="px-4 py-3 text-sm text-gray-500">no matches</li>';
+      return;
+    }
+    ul.innerHTML = results.map((a, i) => `
+      <li role="option" data-i="${i}" class="cmdk-item flex items-center justify-between px-4 py-2 cursor-pointer ${i === 0 ? 'bg-accent-soft text-accent' : 'hover:bg-gray-100 dark:hover:bg-gray-800/50'}">
+        <span class="text-sm">${escapeHtml(a.label)}</span>
+        <span class="text-xs text-gray-400 font-mono">${escapeHtml(a.hint)}</span>
+      </li>`).join('');
+    ul.querySelectorAll('.cmdk-item').forEach((el) => {
+      el.addEventListener('click', () => results[+el.dataset.i].run());
+      el.addEventListener('mouseenter', () => moveCmdk(+el.dataset.i, results));
+    });
+  }
+  function moveCmdk(i, results) {
+    cmdkIdx = i;
+    document.querySelectorAll('.cmdk-item').forEach((el, idx) => {
+      if (idx === i) el.classList.add('bg-accent-soft','text-accent');
+      else el.classList.remove('bg-accent-soft','text-accent');
+    });
+  }
+  document.getElementById('cmdk-input').addEventListener('input', (e) => renderCmdk(e.target.value));
+  document.getElementById('cmdk-input').addEventListener('keydown', (e) => {
+    const items = document.querySelectorAll('.cmdk-item');
+    if (e.key === 'ArrowDown') { e.preventDefault(); if (cmdkIdx < items.length - 1) moveCmdk(cmdkIdx + 1, cmdkActionsFiltered()); }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); if (cmdkIdx > 0)                 moveCmdk(cmdkIdx - 1, cmdkActionsFiltered()); }
+    if (e.key === 'Enter')     { e.preventDefault(); const r = cmdkActionsFiltered(); if (r[cmdkIdx]) r[cmdkIdx].run(); }
+    if (e.key === 'Escape')    { closeCmdk(); }
+  });
+  function cmdkActionsFiltered() {
+    const q = document.getElementById('cmdk-input').value.toLowerCase();
+    return cmdkActions.filter(a => !q || a.label.toLowerCase().includes(q) || a.hint.toLowerCase().includes(q));
+  }
+  function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+  // -------- Toast notifications ------------------------------------------
+  function toast(message, kind) {
+    const tone = {
+      ok:    'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
+      err:   'bg-rose-500/10    text-rose-700    dark:text-rose-300    border-rose-500/30',
+      warn:  'bg-amber-500/10   text-amber-700   dark:text-amber-300   border-amber-500/30',
+      info:  'bg-sky-500/10     text-sky-700     dark:text-sky-300     border-sky-500/30',
+    }[kind || 'info'];
+    const icon = { ok: '✓', err: '✗', warn: '⚠', info: 'ⓘ' }[kind || 'info'];
+    const el = document.createElement('div');
+    el.className = `toast pointer-events-auto rounded-lg border px-3.5 py-2.5 text-sm shadow-lift backdrop-blur flex items-center gap-2.5 ${tone}`;
+    el.innerHTML = `<span class="text-base leading-none">${icon}</span><span class="flex-1">${escapeHtml(message)}</span>`;
+    document.getElementById('toast-stack').appendChild(el);
+    setTimeout(() => {
+      el.classList.add('gone');
+      setTimeout(() => el.remove(), 280);
+    }, 3200);
+  }
+
+  // -------- HX-Trigger event → toast mapping -----------------------------
+  document.body.addEventListener('statusChanged',     () => toast('daemon state changed',  'info'));
+  document.body.addEventListener('questionsChanged',  () => toast('answer recorded',       'ok'));
+  document.body.addEventListener('configChanged',     () => toast('config saved',          'ok'));
+  document.body.addEventListener('ticketsChanged',    () => toast('ticket snapshot refreshed', 'ok'));
+  document.body.addEventListener('configError',  (e) => toast(e.detail?.message || 'config error', 'err'));
+</script>
+
 </body>
 </html>

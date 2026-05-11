@@ -50,11 +50,6 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		return fmt.Errorf("goon already running (pid %d). Use 'goon stop' first", pid)
 	}
 
-	// Announce which workflow is in use BEFORE anything else, so the very
-	// first line of the daemon's output identifies the active pipeline.
-	// The same info is mirrored to the log file via logx.
-	workflow.Announce("", stdout)
-
 	// Memory is the only thing genuinely required — the web UI and the CLI
 	// both read+write here, and the daemon parks its status here.
 	mem, err := memory.New(os.Getenv("GOON_MEMORY_PATH"))
@@ -89,8 +84,16 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 	// so we always pass it the daemon — POST /api/config calls Reconfigure().
 	var srv *web.Server
 	if *webAddr != "" {
+		// Pass the daemon's snapshotted providers so the web chat
+		// panel has an LLM to talk to, AND the board so /api/refresh
+		// can pull fresh tickets on demand. Reconfigure can swap
+		// them later; web handlers read via s.opts.LLM / s.opts.Board
+		// at request time.
+		llmProv, snapBoard, _ := d.Snapshot()
 		srv = web.NewServer(web.Options{
 			Addr: *webAddr, Memory: mem,
+			LLM:    llmProv,
+			Board:  snapBoard,
 			Daemon: d, Stdout: stdout, Stderr: stderr,
 		})
 		go func() {
@@ -110,6 +113,12 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		fmt.Fprintf(stdout, "→ web UI at http://%s — open it to configure goon\n",
 			strings.TrimPrefix(*webAddr, ":"))
 	}
+
+	// Now announce the active workflow. Doing this AFTER the web URL
+	// keeps the most-actionable line at the top of stdout so a user
+	// running `goon start --web=:8080` doesn't have to scroll past
+	// startup banners to find the URL to click.
+	workflow.Announce("", stdout)
 
 	// Optional Telegram bot. Auto-starts when both the bot token and the
 	// shared secret are present in the env. Snapshot the daemon's current
@@ -161,7 +170,7 @@ func startTelegramBot(parent context.Context, d *daemon.Daemon,
 		}
 		return nil
 	}
-	llmProv, _, host := d.Snapshot()
+	llmProv, botBoard, host := d.Snapshot()
 	bot, err := telegram.New(telegram.Options{
 		Token:    token,
 		Secret:   secret,
@@ -170,6 +179,7 @@ func startTelegramBot(parent context.Context, d *daemon.Daemon,
 		Tools:    reg,
 		Executor: exec,
 		Host:     host,
+		Board:    botBoard,
 		Stdout:   stdout,
 		Stderr:   stderr,
 		Debug:    debug,

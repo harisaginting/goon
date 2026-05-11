@@ -261,6 +261,9 @@ GOON_REVIEW_REPOS=owner/a,owner/b    # default repos for /prs</code></pre>
     <tr><td><code>goon config show|get|set|unset|path|edit</code></td><td>Manage <code>~/.config/goon/.env</code>.</td></tr>
     <tr><td><code>goon update [&lt;ref&gt;]</code></td><td>Rebuild from upstream. Requires <code>git</code> and <code>go</code> on PATH.</td></tr>
     <tr><td><code>goon uninstall [--yes] [--purge]</code></td><td>Remove the binary; <code>--purge</code> wipes state too.</td></tr>
+    <tr><td><code>goon pause | resume</code></td><td>Toggle the daemon's poll loop without killing the process. Same flag readable by web UI + Telegram <code>/pause</code> /<code>/resume</code>.</td></tr>
+    <tr><td><code>goon repo list|forget &lt;project&gt;|clear</code></td><td>Manage learned project→repo mappings (the cache populated by the confirm_repo gate).</td></tr>
+    <tr><td><code>goon version</code></td><td>Print version + commit + build date + Go runtime info.</td></tr>
   </table>
 
   <h3>Modes (for one-shot agent runs)</h3>
@@ -304,10 +307,16 @@ GOON_REVIEW_REPOS=owner/a,owner/b    # default repos for /prs</code></pre>
     <li><strong>CLI</strong> — <code>goon train</code> walks you through pending questions, or <code>goon train answer &lt;id&gt; &lt;text&gt;</code> for non-interactive use.</li>
     <li><strong>Telegram</strong> — <code>/queue</code> to see what's pending, <code>/answer &lt;id&gt; yes</code> to approve.</li>
   </ul>
+  <h3>Reply formats</h3>
+  <ul>
+    <li><strong>confirm_repo:</strong> <code>yes</code>, <code>change=/path/to/repo</code>, or <code>no</code> (aborts).</li>
+    <li><strong>approve_plan:</strong> <code>yes</code> to proceed, <code>no</code> or any feedback (e.g. <code>"refactor the auth helper first"</code>) to <strong>re-plan</strong>. The feedback is woven into the next triage prompt so the model knows what to change. Capped at 3 rejections before the workflow gives up — prevents infinite re-plan loops.</li>
+  </ul>
   <blockquote class="warn">
-    Anything other than <code>yes</code> at <code>approve_plan</code> aborts the
-    workflow. The ticket is marked failed in <code>memory.json</code>; the
-    board comment + transition do not happen.
+    A <code>no</code> at <code>confirm_repo</code> permanently fails the workflow
+    (the ticket is marked failed in <code>memory.json</code>; no PR opened, no
+    board transition). At <code>approve_plan</code>, only the 4th rejection
+    fails — the first three trigger a re-plan.
   </blockquote>
 </section>
 
@@ -366,6 +375,7 @@ GOON_REVIEW_REPOS=owner/a,owner/b   # optional</code></pre>
   <table>
     <tr><th>Group</th><th>Commands</th></tr>
     <tr><td>monitor</td><td><code>/status</code> · <code>/logs [n]</code> · <code>/workflows [n]</code> · <code>/tickets [filter]</code> · <code>/ticket &lt;id&gt;</code> · <code>/memory list|read|search</code></td></tr>
+    <tr><td>daemon control</td><td><code>/pause</code> · <code>/resume</code> (toggles the same flag <code>goon pause</code> writes; bot itself stays responsive)</td></tr>
     <tr><td>queue</td><td><code>/queue</code> · <code>/answer &lt;id&gt; &lt;text&gt;</code></td></tr>
     <tr><td>PR review</td><td><code>/prs [repo]</code> · <code>/review &lt;repo&gt; &lt;num&gt;</code> · <code>/approve</code> · <code>/decline</code> · <code>/comment</code></td></tr>
     <tr><td>agent</td><td><code>/run &lt;task&gt;</code> · plain text → LLM chat (6-turn history)</td></tr>

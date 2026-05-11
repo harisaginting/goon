@@ -30,7 +30,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/harisaginting/goon/internal/atlassian"
@@ -39,6 +38,22 @@ import (
 	"github.com/harisaginting/goon/internal/storage"
 	"github.com/harisaginting/goon/internal/util"
 )
+
+// Env is a key-lookup function that lets probes pull config without
+// mutating process-global os.Environ. Default implementation is
+// os.Getenv; RunWithEnvOverride supplies a wrapper that overlays
+// user-provided values on top.
+type Env func(key string) string
+
+// envOrDefault returns the trimmed value of env(key), or def when empty.
+// Mirrors util.EnvOr but uses an injected lookup so probes can be tested
+// and overridden without touching os.Environ.
+func envOrDefault(env Env, key, def string) string {
+	if v := strings.TrimSpace(env(key)); v != "" {
+		return v
+	}
+	return def
+}
 
 // Result is the outcome of one component's probe.
 type Result struct {
@@ -65,55 +80,45 @@ func (r Result) Pretty() string {
 	return fmt.Sprintf("%s %-22s %s", mark, id, r.Detail)
 }
 
-// Run probes every component using the current environment.
+// Run probes every component using the current process environment.
 func Run(ctx context.Context) []Result {
+	return RunWithEnv(ctx, os.Getenv)
+}
+
+// RunWithEnv probes every component, looking up configuration via the
+// supplied Env function. Useful for tests and for callers that want to
+// supply overlay values without mutating os.Environ.
+func RunWithEnv(ctx context.Context, env Env) []Result {
+	if env == nil {
+		env = os.Getenv
+	}
 	out := []Result{}
-	out = append(out, checkMemory())
-	out = append(out, checkLLM(ctx))
-	out = append(out, checkBoard(ctx))
-	out = append(out, checkGitHost(ctx))
-	if t := checkTelegram(ctx); t.Component != "" {
+	out = append(out, checkMemory(env))
+	out = append(out, checkLLM(ctx, env))
+	out = append(out, checkBoard(ctx, env))
+	out = append(out, checkGitHost(ctx, env))
+	if t := checkTelegram(ctx, env); t.Component != "" {
 		out = append(out, t)
 	}
 	return out
 }
 
-// envMu serializes RunWithEnvOverride callers so concurrent verify requests
-// don't trample each other's temporary env changes.
-var envMu sync.Mutex
-
-// RunWithEnvOverride applies the given key/value pairs to os.Environ for the
-// duration of the probe, then restores the previous values. Empty values
-// unset the key. Callers serialise via envMu so this is safe to call from
-// multiple HTTP requests.
+// RunWithEnvOverride probes every component as if the supplied key/value
+// pairs were present in the environment, falling back to os.Getenv for
+// keys not in the override map. The process-global env is never mutated,
+// so this is safe to call concurrently with other goroutines that read
+// env (e.g. the daemon's Reconfigure()).
+//
+// TODO: internal/atlassian.Jira()/Confluence() still consult os.Getenv
+// directly; that path is unaffected by override values for now.
 func RunWithEnvOverride(ctx context.Context, override map[string]string) []Result {
-	envMu.Lock()
-	defer envMu.Unlock()
-
-	type prev struct {
-		val string
-		set bool
-	}
-	saved := map[string]prev{}
-	for k, v := range override {
-		old, ok := os.LookupEnv(k)
-		saved[k] = prev{old, ok}
-		if v == "" {
-			_ = os.Unsetenv(k)
-		} else {
-			_ = os.Setenv(k, v)
+	env := func(k string) string {
+		if v, ok := override[k]; ok {
+			return v
 		}
+		return os.Getenv(k)
 	}
-	defer func() {
-		for k, p := range saved {
-			if p.set {
-				_ = os.Setenv(k, p.val)
-			} else {
-				_ = os.Unsetenv(k)
-			}
-		}
-	}()
-	return Run(ctx)
+	return RunWithEnv(ctx, env)
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -143,8 +148,8 @@ func newReq(ctx context.Context, method, url string, body io.Reader) (*http.Requ
 
 // --- memory ---------------------------------------------------------------
 
-func checkMemory() Result {
-	path := os.Getenv("GOON_MEMORY_PATH")
+func checkMemory(env Env) Result {
+	path := env("GOON_MEMORY_PATH")
 	if path == "" {
 		// Mirror internal/memory.New's default so `goon doctor` reports the
 		// same path the agent will actually use.
@@ -165,18 +170,18 @@ func checkMemory() Result {
 
 // --- LLM ------------------------------------------------------------------
 
-func checkLLM(ctx context.Context) Result {
-	name := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_LLM_PROVIDER")))
+func checkLLM(ctx context.Context, env Env) Result {
+	name := strings.ToLower(strings.TrimSpace(env("GOON_LLM_PROVIDER")))
 	if name == "" {
 		name = "openai"
 	}
 	switch name {
 	case "openai":
-		return probeOpenAI(ctx)
+		return probeOpenAI(ctx, env)
 	case "anthropic":
-		return probeAnthropic(ctx)
+		return probeAnthropic(ctx, env)
 	case "ollama":
-		return probeOllama(ctx)
+		return probeOllama(ctx, env)
 	case "mock":
 		return Result{Component: "llm", Name: "mock", OK: true, Detail: "mock provider — always succeeds"}
 	default:
@@ -185,14 +190,14 @@ func checkLLM(ctx context.Context) Result {
 	}
 }
 
-func probeOpenAI(ctx context.Context) Result {
+func probeOpenAI(ctx context.Context, env Env) Result {
 	r := Result{Component: "llm", Name: "openai"}
-	key := os.Getenv("OPENAI_API_KEY")
+	key := env("OPENAI_API_KEY")
 	if key == "" {
 		r.Detail = "OPENAI_API_KEY is not set"
 		return r
 	}
-	base := util.EnvOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
+	base := envOrDefault(env, "OPENAI_BASE_URL", "https://api.openai.com/v1")
 	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/models", nil)
 	if err != nil {
 		r.Detail = err.Error()
@@ -211,19 +216,19 @@ func probeOpenAI(ctx context.Context) Result {
 		return r
 	}
 	r.OK = true
-	r.Detail = fmt.Sprintf("auth OK · model=%s", util.EnvOr("OPENAI_MODEL", "gpt-4o-mini"))
+	r.Detail = fmt.Sprintf("auth OK · model=%s", envOrDefault(env, "OPENAI_MODEL", "gpt-4o-mini"))
 	return r
 }
 
-func probeAnthropic(ctx context.Context) Result {
+func probeAnthropic(ctx context.Context, env Env) Result {
 	r := Result{Component: "llm", Name: "anthropic"}
-	key := os.Getenv("ANTHROPIC_API_KEY")
+	key := env("ANTHROPIC_API_KEY")
 	if key == "" {
 		r.Detail = "ANTHROPIC_API_KEY is not set"
 		return r
 	}
-	base := util.EnvOr("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
-	body := []byte(`{"model":"` + util.EnvOr("ANTHROPIC_MODEL", "claude-sonnet-4-5") +
+	base := envOrDefault(env, "ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+	body := []byte(`{"model":"` + envOrDefault(env, "ANTHROPIC_MODEL", "claude-sonnet-4-5") +
 		`","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`)
 	req, err := newReq(ctx, http.MethodPost,
 		strings.TrimRight(base, "/")+"/messages", strings.NewReader(string(body)))
@@ -246,14 +251,14 @@ func probeAnthropic(ctx context.Context) Result {
 		return r
 	}
 	r.OK = true
-	r.Detail = fmt.Sprintf("auth OK · model=%s", util.EnvOr("ANTHROPIC_MODEL", "claude-sonnet-4-5"))
+	r.Detail = fmt.Sprintf("auth OK · model=%s", envOrDefault(env, "ANTHROPIC_MODEL", "claude-sonnet-4-5"))
 	return r
 }
 
-func probeOllama(ctx context.Context) Result {
+func probeOllama(ctx context.Context, env Env) Result {
 	r := Result{Component: "llm", Name: "ollama"}
-	base := util.EnvOr("OLLAMA_BASE_URL", "http://localhost:11434")
-	model := util.EnvOr("OLLAMA_MODEL", "llama3")
+	base := envOrDefault(env, "OLLAMA_BASE_URL", "http://localhost:11434")
+	model := envOrDefault(env, "OLLAMA_MODEL", "llama3")
 	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/api/tags", nil)
 	if err != nil {
 		r.Detail = err.Error()
@@ -302,16 +307,16 @@ func probeOllama(ctx context.Context) Result {
 
 // --- board ----------------------------------------------------------------
 
-func checkBoard(ctx context.Context) Result {
-	name := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_BOARD")))
+func checkBoard(ctx context.Context, env Env) Result {
+	name := strings.ToLower(strings.TrimSpace(env("GOON_BOARD")))
 	if name == "" {
 		return Result{Component: "board", OK: false, Skipped: true, Detail: "GOON_BOARD is not set"}
 	}
 	switch name {
 	case "jira":
-		return probeJira(ctx)
+		return probeJira(ctx, env)
 	case "github":
-		return probeGitHubBoard(ctx)
+		return probeGitHubBoard(ctx, env)
 	case "mock":
 		return Result{Component: "board", Name: "mock", OK: true, Detail: "mock board — always succeeds"}
 	default:
@@ -320,8 +325,12 @@ func checkBoard(ctx context.Context) Result {
 	}
 }
 
-func probeJira(ctx context.Context) Result {
+func probeJira(ctx context.Context, env Env) Result {
 	r := Result{Component: "board", Name: "jira"}
+	// TODO: atlassian.Jira() reads os.Getenv directly; an override map
+	// supplied via RunWithEnvOverride won't reach the JIRA_*/ATLASSIAN_*
+	// keys until atlassian.Jira gains an Env-aware variant.
+	_ = env // currently unused; kept for signature consistency.
 	c := atlassian.Jira()
 	if !c.Filled() {
 		r.Detail = "set JIRA_BASE_URL/JIRA_EMAIL/JIRA_API_TOKEN (or shared ATLASSIAN_* equivalents)"
@@ -356,19 +365,19 @@ func probeJira(ctx context.Context) Result {
 	return r
 }
 
-func probeGitHubBoard(ctx context.Context) Result {
+func probeGitHubBoard(ctx context.Context, env Env) Result {
 	r := Result{Component: "board", Name: "github"}
-	tok := os.Getenv("GITHUB_TOKEN")
+	tok := env("GITHUB_TOKEN")
 	if tok == "" {
 		r.Detail = "GITHUB_TOKEN is not set"
 		return r
 	}
-	repos := strings.TrimSpace(os.Getenv("GITHUB_REPOS"))
+	repos := strings.TrimSpace(env("GITHUB_REPOS"))
 	if repos == "" {
 		r.Detail = "GITHUB_REPOS is not set (need owner/repo[,...])"
 		return r
 	}
-	api := util.EnvOr("GITHUB_API_URL", "https://api.github.com")
+	api := envOrDefault(env, "GITHUB_API_URL", "https://api.github.com")
 	r2 := pingGitHub(ctx, api, tok)
 	if !r2.OK {
 		r.Detail = r2.Detail
@@ -382,14 +391,14 @@ func probeGitHubBoard(ctx context.Context) Result {
 
 // --- git host -------------------------------------------------------------
 
-func checkGitHost(ctx context.Context) Result {
-	name := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_GIT_HOST")))
+func checkGitHost(ctx context.Context, env Env) Result {
+	name := strings.ToLower(strings.TrimSpace(env("GOON_GIT_HOST")))
 	if name == "" {
 		// If a board is configured but no git host is, that's a config gap
 		// — the daemon will run the workflow happily but skip the PR step,
 		// which usually surprises users. Surface it as a yellow ⚠ skip
 		// (OK + Skipped + an actionable Detail) instead of a silent ✓.
-		board := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_BOARD")))
+		board := strings.ToLower(strings.TrimSpace(env("GOON_BOARD")))
 		if board != "" && board != "mock" {
 			return Result{
 				Component: "git_host", OK: true, Skipped: true,
@@ -400,8 +409,8 @@ func checkGitHost(ctx context.Context) Result {
 	}
 	switch name {
 	case "github":
-		api := util.EnvOr("GITHUB_API_URL", "https://api.github.com")
-		tok := os.Getenv("GITHUB_TOKEN")
+		api := envOrDefault(env, "GITHUB_API_URL", "https://api.github.com")
+		tok := env("GITHUB_TOKEN")
 		if tok == "" {
 			return Result{Component: "git_host", Name: "github", Detail: "GITHUB_TOKEN is not set"}
 		}
@@ -410,9 +419,9 @@ func checkGitHost(ctx context.Context) Result {
 		out.Name = "github"
 		return out
 	case "gitlab":
-		return probeGitLab(ctx)
+		return probeGitLab(ctx, env)
 	case "bitbucket":
-		return probeBitbucket(ctx)
+		return probeBitbucket(ctx, env)
 	case "mock":
 		return Result{Component: "git_host", Name: "mock", OK: true, Detail: "mock host — always succeeds"}
 	default:
@@ -451,14 +460,14 @@ func pingGitHub(ctx context.Context, api, tok string) Result {
 	return r
 }
 
-func probeGitLab(ctx context.Context) Result {
+func probeGitLab(ctx context.Context, env Env) Result {
 	r := Result{Component: "git_host", Name: "gitlab"}
-	tok := os.Getenv("GITLAB_TOKEN")
+	tok := env("GITLAB_TOKEN")
 	if tok == "" {
 		r.Detail = "GITLAB_TOKEN is not set"
 		return r
 	}
-	api := util.EnvOr("GITLAB_API_URL", "https://gitlab.com/api/v4")
+	api := envOrDefault(env, "GITLAB_API_URL", "https://gitlab.com/api/v4")
 	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
 	if err != nil {
 		r.Detail = err.Error()
@@ -485,16 +494,16 @@ func probeGitLab(ctx context.Context) Result {
 	return r
 }
 
-func probeBitbucket(ctx context.Context) Result {
+func probeBitbucket(ctx context.Context, env Env) Result {
 	r := Result{Component: "git_host", Name: "bitbucket"}
-	tok := os.Getenv("BITBUCKET_TOKEN")
-	user := os.Getenv("BITBUCKET_USERNAME")
-	pw := os.Getenv("BITBUCKET_APP_PASSWORD")
+	tok := env("BITBUCKET_TOKEN")
+	user := env("BITBUCKET_USERNAME")
+	pw := env("BITBUCKET_APP_PASSWORD")
 	if tok == "" && (user == "" || pw == "") {
 		r.Detail = "set BITBUCKET_TOKEN or BITBUCKET_USERNAME + BITBUCKET_APP_PASSWORD"
 		return r
 	}
-	api := util.EnvOr("BITBUCKET_API_URL", "https://api.bitbucket.org/2.0")
+	api := envOrDefault(env, "BITBUCKET_API_URL", "https://api.bitbucket.org/2.0")
 	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
 	if err != nil {
 		r.Detail = err.Error()
@@ -534,13 +543,13 @@ func probeBitbucket(ctx context.Context) Result {
 
 // --- telegram (optional) --------------------------------------------------
 
-func checkTelegram(ctx context.Context) Result {
-	tok := os.Getenv("TELEGRAM_BOT_TOKEN")
+func checkTelegram(ctx context.Context, env Env) Result {
+	tok := env("TELEGRAM_BOT_TOKEN")
 	if tok == "" {
 		return Result{} // skip entirely
 	}
 	r := Result{Component: "telegram", Name: "bot"}
-	api := util.EnvOr("TELEGRAM_API_BASE_URL", "https://api.telegram.org")
+	api := envOrDefault(env, "TELEGRAM_API_BASE_URL", "https://api.telegram.org")
 	req, err := newReq(ctx, http.MethodGet, fmt.Sprintf("%s/bot%s/getMe", api, tok), nil)
 	if err != nil {
 		r.Detail = err.Error()
@@ -569,7 +578,7 @@ func checkTelegram(ctx context.Context) Result {
 		}
 		return r
 	}
-	chat := os.Getenv("TELEGRAM_CHAT_ID")
+	chat := env("TELEGRAM_CHAT_ID")
 	if chat == "" {
 		r.OK = true
 		r.Detail = fmt.Sprintf("auth OK as @%s · NOTE: TELEGRAM_CHAT_ID is empty", parsed.Result.Username)

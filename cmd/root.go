@@ -87,6 +87,12 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runLogs(ctx, sargs, stdout, stderr)
 		case "memory":
 			return runMemory(ctx, sargs, stdout, stderr, stdin)
+		case "repo":
+			return runRepo(ctx, sargs, stdout, stderr)
+		case "pause":
+			return runPause(ctx, sargs, stdout, stderr)
+		case "resume":
+			return runResume(ctx, sargs, stdout, stderr)
 		case "help":
 			printUsage(stdout)
 			return nil
@@ -202,11 +208,13 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, `  goon "<natural-language task>" [flags]              one-shot agent run`)
 	fmt.Fprintln(w, "  goon start [--web=:8080] [--once] [--no-pr]         autonomous daemon")
 	fmt.Fprintln(w, "  goon stop                                           stop the running daemon")
+	fmt.Fprintln(w, "  goon pause | resume                                 toggle the daemon's poll loop")
 	fmt.Fprintln(w, "  goon status                                         daemon + queue snapshot")
 	fmt.Fprintln(w, "  goon doctor [--json] [--quiet]                      live-probe every provider")
 	fmt.Fprintln(w, "  goon train [--list|--all|answer <id> <a>]           answer questions queued by the agent")
 	fmt.Fprintln(w, "  goon workflow <show|path|init|edit|hooks>           customize the per-ticket workflow")
 	fmt.Fprintln(w, "  goon memory <list|read|write|append|search|edit|delete|path|init>  manage markdown notes")
+	fmt.Fprintln(w, "  goon repo <list|forget <project>|clear>             manage learned project→repo mappings")
 	fmt.Fprintln(w, "  goon logs [--tail=N|--follow|--clear|--path]        browse the structured log file")
 	fmt.Fprintln(w, "  goon config <show|get|set|unset|path|edit>          ~/.config/goon/.env")
 	fmt.Fprintln(w, "  goon update [<ref>]                                 rebuild from upstream (needs git + go)")
@@ -243,7 +251,7 @@ func splitSubcommand(argv []string) (string, []string) {
 		return "", nil
 	}
 	switch first {
-	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory":
+	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory", "repo", "pause", "resume":
 		return first, argv[1:]
 	}
 	return "", nil

@@ -105,6 +105,15 @@ type Engine struct {
 // in WFAwaitingApproval state without firing the on_failure hook.
 var errPaused = errors.New("workflow paused: awaiting user answer")
 
+// errReplan is the sentinel phaseApprovePlan returns after the user
+// rejected a plan with feedback. Run() catches it and rewinds to
+// phaseTriage in the SAME Run() call so the new plan is generated and
+// the next approve_plan question is asked atomically — without a
+// second daemon tick. Without this, a rejected plan would set
+// Stage=triage on disk and the test/single-call user surface would
+// see no new pending question until the daemon polled again.
+var errReplan = errors.New("workflow replan: re-entering triage with feedback")
+
 // phase is one entry in the built-in pipeline.
 type phase struct {
 	name string
@@ -206,6 +215,12 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 		start = 0
 	}
 
+	// Cap re-plan iterations defensively at the loop level too, even
+	// though phaseApprovePlan tracks its own counter. A misbehaving
+	// LLM that always produces the same plan + a user always
+	// rejecting + the in-call rewind would otherwise spin forever.
+	const loopReplanCap = 16
+	loopReplans := 0
 	for i := start; i < len(phases); i++ {
 		select {
 		case <-ctx.Done():
@@ -221,6 +236,18 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 		if errors.Is(err, errPaused) {
 			// Gate paused us; state already saved by the gate.
 			return wf, nil
+		}
+		if errors.Is(err, errReplan) {
+			// User rejected the plan with feedback. Rewind to
+			// triage in this same Run call so the new plan is
+			// generated and the next approve_plan question is
+			// asked atomically.
+			loopReplans++
+			if loopReplans > loopReplanCap {
+				return e.fail(wf, phases[i].name, fmt.Errorf("re-plan loop did not stabilize after %d iterations", loopReplanCap))
+			}
+			i = indexOfPhase(phases, "triage") - 1 // -1 because the for-loop's i++ runs next
+			continue
 		}
 		hctx := FromTicket(t, wf.Repo, branch, wf.Plan)
 		e.runFailureHook(ctx, hr, cfg, hctx, err)
@@ -351,28 +378,61 @@ func (e *Engine) phaseTriage(ctx context.Context, wf *memory.Workflow, t boards.
 	}
 	wf.State = memory.WFTriaging
 	e.save(*wf)
-	plan, repo, err := e.triage(ctx, t)
+	// Carry rejection feedback forward — when the user rejected the
+	// previous plan with text, that text becomes context for the next
+	// triage so the model knows what to change.
+	feedback := ""
+	if wf.Approvals != nil {
+		feedback = wf.Approvals["replan_feedback"]
+	}
+	plan, repo, err := e.triageWithFeedback(ctx, t, feedback)
 	if err != nil {
 		return err
 	}
 	wf.Plan = plan
 	wf.Repo = repo
 	wf.State = memory.WFPlanning
+	// Clear feedback so the gate's "approval already recorded" check
+	// for approve_plan doesn't get poisoned. We keep replan_count.
+	if wf.Approvals != nil {
+		delete(wf.Approvals, "replan_feedback")
+		// Approval value for approve_plan must be cleared too —
+		// otherwise approvalAnswer() short-circuits the gate on
+		// the next call.
+		delete(wf.Approvals, "approve_plan")
+	}
 	e.save(*wf)
 	return nil
 }
 
 func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	// Auto-approve still records the resolved repo so the choice
+	// persists into Memory.RepoChoices for future tickets.
 	if p.autoApprove {
 		ensureApproval(wf, "confirm_repo", "auto:approved")
+		e.rememberRepo(t.Project, wf.Repo)
 		return nil
 	}
 	if existing := approvalAnswer(wf, "confirm_repo"); existing != "" {
 		return nil
 	}
+	// If we already learned a repo for this project, skip the gate
+	// entirely. Gives the user the satisfaction of "I confirmed this
+	// once, don't ask me again." They can break the cache via
+	// `goon repo forget <project>` (see cmd/repo.go).
+	if learned, ok := e.lookupLearnedRepo(t.Project); ok {
+		wf.Repo = learned
+		ensureApproval(wf, "confirm_repo", "auto:remembered")
+		wf.State = memory.WFPlanning
+		e.save(*wf)
+		if e.Stdout != nil {
+			fmt.Fprintf(e.Stdout, "[workflow] using remembered repo %q for project %q\n", learned, t.Project)
+		}
+		return nil
+	}
 	suggested := wf.Repo
 	if suggested == "" {
-		suggested = pickRepo(t)
+		suggested = e.pickRepoForTicket(t)
 		wf.Repo = suggested
 	}
 	q := fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
@@ -390,9 +450,63 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 		return fmt.Errorf("user rejected repo: %s", ans)
 	}
 	ensureApproval(wf, "confirm_repo", ans)
+	e.rememberRepo(t.Project, wf.Repo)
 	wf.State = memory.WFPlanning
 	e.save(*wf)
 	return nil
+}
+
+// pickRepoForTicket resolves a repo path for the ticket using the
+// priority ladder:
+//
+//  1. GOON_REPO_MAP exact match on project key (operator-explicit)
+//  2. Memory.RepoChoices learned mapping (user-confirmed once before)
+//  3. GOON_REPO_MAP "*" wildcard fallback
+//  4. ticket.Project as a literal (last resort — usually not a real path)
+//
+// Operator-explicit env wins over learned because admins set env for
+// security; learned wins over the wildcard so a single confirmation
+// overrides a vague catch-all.
+func (e *Engine) pickRepoForTicket(t boards.Ticket) string {
+	rm := RepoMap()
+	if v, ok := rm[t.Project]; ok && v != "" {
+		return v
+	}
+	if e.Memory != nil {
+		if v, ok := e.Memory.LookupRepoChoice(t.Project); ok && v != "" {
+			return v
+		}
+	}
+	if v, ok := rm["*"]; ok && v != "" {
+		return v
+	}
+	return t.Project
+}
+
+// lookupLearnedRepo returns the persisted choice without consulting
+// env. Used by phaseConfirmRepo to short-circuit the gate when we've
+// already had this conversation. Separate from pickRepoForTicket so
+// the env-override path stays explicit.
+func (e *Engine) lookupLearnedRepo(project string) (string, bool) {
+	if e.Memory == nil {
+		return "", false
+	}
+	// Env-explicit mapping always wins, even over memory — admins
+	// expect their env to be authoritative.
+	if v, ok := RepoMap()[project]; ok && v != "" {
+		return v, true
+	}
+	return e.Memory.LookupRepoChoice(project)
+}
+
+// rememberRepo persists project→repo to Memory.RepoChoices when both
+// values are concrete. Best-effort: silently no-ops on missing memory
+// or empty inputs.
+func (e *Engine) rememberRepo(project, repo string) {
+	if e.Memory == nil {
+		return
+	}
+	e.Memory.RecordRepoChoice(project, repo)
 }
 
 func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
@@ -403,9 +517,22 @@ func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t bo
 	if existing := approvalAnswer(wf, "approve_plan"); existing != "" {
 		return nil
 	}
-	q := "Approve work + test plan for " + t.Key + "?\n" +
+	// Include the replan_count in the question text. Without this,
+	// FindAnswer (which matches by ticket+question text) would return
+	// the previous "no" and auto-reject every regenerated plan
+	// without ever asking the user — burning the maxRePlans budget
+	// in a single tick.
+	replanCount := 0
+	if wf.Approvals != nil {
+		fmt.Sscanf(wf.Approvals["replan_count"], "%d", &replanCount)
+	}
+	header := "Approve work + test plan for " + t.Key + "?"
+	if replanCount > 0 {
+		header = fmt.Sprintf("Approve REVISED plan (attempt %d) for %s?", replanCount+1, t.Key)
+	}
+	q := header + "\n" +
 		formatPlanForApproval(wf.Plan) +
-		"Reply: yes / no"
+		"Reply: yes / no / <feedback to re-plan with>"
 	ans, ready, err := e.gate(ctx, wf, t, "approve_plan", q)
 	if err != nil {
 		return err
@@ -414,7 +541,50 @@ func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t bo
 		return errPaused
 	}
 	if !isYes(ans) {
-		return fmt.Errorf("user rejected plan: %s", ans)
+		// Treat any non-yes answer as "re-plan with this feedback"
+		// instead of WFFailed. The old behaviour killed the workflow,
+		// daemon picked the same ticket up again, and the user faced
+		// the same plan with no way to influence it. Now we discard
+		// the plan, store the feedback for the next triage, and
+		// re-enter the pipeline at triage. Capped to avoid an
+		// infinite re-plan loop.
+		const maxRePlans = 3
+		if wf.Approvals == nil {
+			wf.Approvals = map[string]string{}
+		}
+		count := 0
+		fmt.Sscanf(wf.Approvals["replan_count"], "%d", &count)
+		count++
+		if count > maxRePlans {
+			// Persist the final count + last feedback before failing
+			// so the on-disk record matches the error message and
+			// post-mortem readers see the actual rejection that
+			// blew the budget.
+			wf.Approvals["replan_count"] = fmt.Sprintf("%d", count)
+			wf.Approvals["replan_feedback"] = ans
+			e.save(*wf)
+			return fmt.Errorf("plan rejected %d times — giving up: %s", count, ans)
+		}
+		wf.Approvals["replan_count"] = fmt.Sprintf("%d", count)
+		wf.Approvals["replan_feedback"] = ans
+		wf.Plan = nil
+		wf.Stage = "triage"
+		wf.State = memory.WFTriaging
+		// Clear the stale PendingQuestionID — the previous question is
+		// now answered, and leaving it set causes the web UI's
+		// workflow card to render "⏸ awaiting q-X" for a workflow
+		// that's actually mid-triage.
+		wf.PendingQuestionID = ""
+		e.save(*wf)
+		if e.Stdout != nil {
+			fmt.Fprintf(e.Stdout, "[workflow] plan rejected (%d/%d) — re-planning with feedback: %q\n", count, maxRePlans, ans)
+		}
+		// Return errReplan so Run() rewinds to phaseTriage in this
+		// same call, generates the new plan, and asks the next
+		// approve_plan question — all atomically, no daemon round-
+		// trip needed. The user (or test) sees a new pending
+		// question after one Run, not two.
+		return errReplan
 	}
 	ensureApproval(wf, "approve_plan", ans)
 	// Clear the "awaiting" state on resume — the next phase (execute) sets
@@ -706,15 +876,34 @@ func (e *Engine) verifyN(cfg WorkflowConfig) int {
 	return VerifyRuns
 }
 
-// triage asks the LLM to produce a structured plan. The prompt is strict-JSON
-// like the agent's, but with a different schema: an ordered list of steps.
+// triage is the legacy zero-feedback entry point — kept so older callers
+// keep compiling. New code should call triageWithFeedback so the user's
+// previous-rejection feedback (if any) is woven into the prompt.
 func (e *Engine) triage(ctx context.Context, t boards.Ticket) ([]memory.PlanStep, string, error) {
+	return e.triageWithFeedback(ctx, t, "")
+}
+
+// triageWithFeedback asks the LLM to produce a structured plan. When
+// feedback is non-empty it's woven into the prompt under a REJECTED:
+// section so the model knows what the previous plan got wrong and can
+// produce a different one.
+func (e *Engine) triageWithFeedback(ctx context.Context, t boards.Ticket, feedback string) ([]memory.PlanStep, string, error) {
 	if e.LLM == nil {
 		return nil, "", errors.New("triage: no LLM provider configured")
 	}
-	repo := pickRepo(t)
+	// Use the memory-aware picker so the LLM sees a sensible default
+	// in the prompt (env > learned > wildcard > project literal).
+	repo := e.pickRepoForTicket(t)
+	feedbackBlock := ""
+	if strings.TrimSpace(feedback) != "" {
+		feedbackBlock = fmt.Sprintf(`
+PREVIOUS PLAN WAS REJECTED. The user said:
+  %q
+Produce a different plan that addresses the feedback.
+`, feedback)
+	}
 	prompt := fmt.Sprintf(`You are GOON's planner. The user wants you to break this ticket into 3-7 ordered, atomic engineering steps that an autonomous agent can execute one-by-one. Each step MUST be small enough to finish in <= 5 tool calls.
-
+%s
 Reply with EXACTLY ONE JSON object: {"steps":[{"title":"..."}, ...], "repo":"%s"}.
 No prose, no fences, no comments.
 
@@ -722,7 +911,7 @@ TICKET:
 key: %s
 title: %s
 description: %s
-`, repo, t.Key, t.Title, snippet(t.Description, 1500))
+`, feedbackBlock, repo, t.Key, t.Title, snippet(t.Description, 1500))
 
 	out, err := e.LLM.Generate(ctx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
@@ -873,7 +1062,8 @@ func snippet(s string, max int) string {
 // is named "pr" — or always at the end when cfg.PRTitleTemplate is set —
 // and the notify step runs at the very end if a notify channel is wired.
 func (e *Engine) runStages(ctx context.Context, wf memory.Workflow, t boards.Ticket, cfg WorkflowConfig, hr *HookRunner, branch string) (memory.Workflow, error) {
-	repo := pickRepo(t)
+	// Declarative stages also benefit from the learned repo cache.
+	repo := e.pickRepoForTicket(t)
 	wf.Repo = repo
 	wf.State = memory.WFExecuting
 	e.save(wf)

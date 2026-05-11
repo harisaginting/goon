@@ -21,11 +21,14 @@ the terminal, the web UI, or Telegram.
                  └─────────┬──────────────────┬───────┘
                        CLI │ web UI           │ Telegram bot
                            ▼                  ▼
-   board ──► triage ──► confirm_repo ──► approve_plan ──► execute ──►
-   (Jira/GH)  (LLM)        (gate)            (gate)        (agent)
-                                                             │
-            ◄── notify ◄── PR ◄── update_memory ◄── verify ◄──┘
-                (Telegram)  (GitHub/GitLab/Bitbucket)  (LLM × N)
+   board ──► triage ──► confirm_repo ──► approve_plan ──► execute ──► test ──►
+   (Jira/GH)  (LLM)        (gate)            (gate)        (agent)   (make/go)
+                                                                       │
+              ◄── notify ◄── PR ◄── update_memory ◄── verify × N ◄─────┘
+                  (Telegram)  (GitHub/GitLab/Bitbucket)  (LLM)
+
+  Reject the plan with feedback ─► daemon re-triages with your feedback (capped
+  at 3 rejections) so you don't have to start over.
 ```
 
 ---
@@ -404,6 +407,9 @@ goon train                               # answer questions queued by the agent
 goon train answer <id> <answer>          # non-interactive
 goon workflow init|show|path|edit|hooks  # customize the pipeline
 goon memory init|list|read|write|append|search|edit|delete|path  # active markdown notes
+goon repo list|forget <project>|clear    # learned project→repo mappings
+goon pause | resume                      # toggle the daemon's poll loop
+goon version                             # build info (commit, date, go version)
 goon logs [--tail|--follow|--clear]      # browse the structured log
 goon config show|get|set|unset|path|edit # ~/.config/goon/.env
 goon update [<ref>]                      # rebuild from upstream
