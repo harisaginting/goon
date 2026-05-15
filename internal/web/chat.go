@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"github.com/harisaginting/goon/internal/agentctx"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/notes"
+	"github.com/harisaginting/goon/internal/personal"
 )
 
 // chatSystemPrompt mirrors the Telegram bot's chat persona. Both
@@ -19,48 +21,46 @@ import (
 // agentctx.Build; only the wrapper "channel" differs.
 const chatSystemPrompt = `You are GOON, an autonomous engineering co-pilot reachable from the web dashboard.
 
-# STRICT GROUNDING RULES — FOLLOW EXACTLY
+# HOW TO ANSWER
 
-1. The "GOON STATE" message that follows this one is the ONLY source
-   of truth about tickets, workflows, pending questions, daemon
-   status, and stored knowledge notes. You have NO other access to
-   Jira, GitHub, the user's repos, or the network.
+You have THREE kinds of moves available each turn:
 
-2. When the user asks for tickets / workflows / status:
-   - List ONLY entries that appear in GOON STATE. Never invent.
-   - Filter by exactly what the user specified. If they say
-     "status != closed", include only tickets whose [status] is NOT
-     done/closed/resolved/merged. If they say "assigned to me",
-     filter on the assignee= field.
-   - If nothing matches, say so plainly. Suggest the user click the
-     "refresh tickets" button on the Tickets tab to pull fresh data,
-     or widen the filter.
-   - Quote keys / IDs / URLs verbatim. NEVER paraphrase IDs.
+1. Answer in prose — use the GOON STATE block when it already
+   answers the question (daemon status, recently-cached tickets,
+   workflows in flight, pending approvals, knowledge notes).
 
-3. The GOON STATE block may say "tickets: 30 total, 30 most-recent
-   shown" or "…N more not shown". If the user asks for "all tickets"
-   and the state says some are not shown, answer with what you have
-   AND warn them that some are not in your view — point them at the
-   Tickets tab.
+2. Call a READ tool — jira_search, when the user asks about tickets
+   and the cached state is insufficient. Don't make the user click
+   "refresh"; just query.
 
-4. The durable knowledge block contains PINNED.md and a topic-note
-   index. When the user asks about engineering specifics, look there
-   first, name the relevant note, and tell them which one to open.
+3. Call a WRITE tool — jira_comment, jira_transition, jira_update —
+   when the user explicitly asks you to act on a ticket:
+     - "comment on ENG-123 that the build is green" → jira_comment
+     - "move ENG-123 to in progress" → jira_transition
+     - "change ENG-123 title to ..." or "update description to ..." →
+       jira_update
 
-# OUT OF SCOPE — DO NOT
+When you call ANY tool, your ENTIRE response that turn is the single
+JSON line specified in the TOOLS block. The server runs the action
+and re-prompts you with the result; you confirm in prose on the
+next turn.
 
-- Do not pretend to query Jira / GitHub / the repo. You see only the
-  cached snapshot.
-- Do not emit JSON tool calls.
-- Do not give "I'm just an AI" non-answers — the state above is real.
-- Do not include closed/done tickets when the user asked otherwise.
+# RULES
 
-# STYLE
-
-- Plain prose, tight. When listing more than 3 tickets, one per line:
-  "KEY — title [status] assignee=NAME".
-- When the user wants to ACT (edit code, ship work), tell them to use
-  the CLI's ` + "`" + `goon "<task>"` + "`" + ` for the agent runtime.`
+- Quote ticket KEYs, URLs, and IDs verbatim. Never invent.
+- When listing more than 3 tickets, one per line:
+  "KEY — title [status] assignee=NAME"
+- If a search returns nothing, say so plainly and suggest the user
+  widen their filter; don't pretend.
+- Only call WRITE tools when the user is explicit. "what does ENG-1
+  say" → read; "comment on ENG-1 that ..." → write.
+- After a successful action, confirm with a short prose line like
+  "✓ commented on ENG-123 — '<first words of the comment>'".
+- Do NOT tell the user to click "refresh"; you have the tools now.
+- For project facts / how-it-works questions, check the knowledge
+  notes in GOON STATE first and name the relevant note.
+- When the user wants to ACT on CODE (edit, ship), tell them to use
+  the CLI's ` + "`" + `goon "<task>"` + "`" + ` for the agent runtime — that's outside chat scope.`
 
 const maxWebChatHistory = 6 // turn pairs
 
@@ -89,53 +89,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Append user turn, build history snapshot.
+	// Snapshot existing history (without the new user turn) so the
+	// agent-loop helper can append both turns atomically at the end.
 	s.chatMu.Lock()
-	s.chatHistory = append(s.chatHistory, llm.Message{Role: llm.RoleUser, Content: msg})
-	s.chatHistory = trimChatHistory(s.chatHistory)
 	historySnapshot := append([]llm.Message(nil), s.chatHistory...)
 	s.chatMu.Unlock()
 
-	// Auto-refresh stale tickets before answering — same UX as the
-	// Telegram chat. Silent if the network is down or no board is
-	// configured.
-	if s.opts.Board != nil {
-		refreshCtx, refreshCancel := context.WithTimeout(r.Context(), 10*time.Second)
-		_, _, _ = agentctx.MaybeRefreshStale(refreshCtx, s.opts.Memory, s.opts.Board, 2*time.Minute)
-		refreshCancel()
-	}
-
-	// Build prompt with shared context block.
-	stateBlock := agentctx.Build(s.opts.Memory, "")
-	msgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: chatSystemPrompt},
-		{Role: llm.RoleSystem, Content: stateBlock},
-	}
-	msgs = append(msgs, historySnapshot...)
-
+	// Run the LLM↔tool loop. The agent decides whether to query the
+	// board live (search_jira tool) or answer from the GOON STATE
+	// block alone. No more pre-fetch refresh — the agent pulls only
+	// what it needs.
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
-	out, err := s.opts.LLM.Generate(ctx, msgs, llm.Options{
-		Temperature: 0.4,
-		MaxTokens:   800,
+	result, err := agentctx.ChatTurn(ctx, agentctx.ChatTurnOptions{
+		LLM:          s.opts.LLM,
+		Memory:       s.opts.Memory,
+		Board:        s.opts.Board,
+		SystemPrompt: chatSystemPrompt,
+		History:      historySnapshot,
+		UserMessage:  msg,
 	})
 	if err != nil {
-		// Drop the user turn we just optimistically appended so
-		// retry doesn't leak orphaned context.
-		s.chatMu.Lock()
-		if n := len(s.chatHistory); n > 0 && s.chatHistory[n-1].Role == llm.RoleUser {
-			s.chatHistory = s.chatHistory[:n-1]
-		}
-		s.chatMu.Unlock()
 		writeChatBubble(w, "error", "llm error: "+err.Error())
 		return
 	}
-	reply := strings.TrimSpace(out)
-	if reply == "" {
+	reply := result.Reply
+	if strings.TrimSpace(reply) == "" {
 		reply = "(no response from model)"
 	}
+	// Commit both turns to history together so retries don't orphan
+	// the user turn (which the previous implementation could do).
 	s.chatMu.Lock()
-	s.chatHistory = append(s.chatHistory, llm.Message{Role: llm.RoleAssistant, Content: reply})
+	s.chatHistory = append(s.chatHistory, result.NewTurns...)
 	s.chatHistory = trimChatHistory(s.chatHistory)
 	s.chatMu.Unlock()
 
@@ -265,11 +250,9 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `<section>
 		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
 			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Chat with goon</h2>
+				<h2 class="text-xl font-semibold tracking-tight">Chat</h2>
 				<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-					Grounded on live tickets, workflows, pending questions, and your knowledge notes in
-					<code class="font-mono text-xs">./storage/memory/</code>. Conversational only —
-					for actions use the CLI or the Tickets/Workflows tabs.
+					Ask about tickets, workflows, and your knowledge notes. Goon can also comment, transition, and update Jira tickets when you ask it to.
 				</p>
 			</div>
 			<button type="button" hx-post="/api/chat/reset" hx-target="#chat-transcript" hx-swap="outerHTML"
@@ -351,22 +334,137 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 	</section>`)
 }
 
-// fragTabKnowledge renders the active markdown notes — PINNED.md body
-// styled as a card on top, then a clickable list of topic notes. Each
-// topic-note row expands inline via htmx when clicked.
-func (s *Server) fragTabKnowledge(w http.ResponseWriter, _ *http.Request) {
+// fragTabMemory is the consolidated tab merging Knowledge + Skills +
+// Personal. Three segmented buttons toggle between three pre-rendered
+// bodies WITHOUT a network round-trip — same pattern as the previous
+// two-segment version, just one more option.
+//
+// Personal sits last because it's the rarest-edited of the three,
+// but it ships with default content out of the box so the user has
+// something to read+tweak on day one.
+func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<section>
-		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Knowledge</h2>
-				<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-					What goon remembers. <code class="font-mono text-xs">PINNED.md</code> is auto-loaded into every agent run and chat turn.
-					Topic notes are written by the <code class="font-mono text-xs">update_memory</code> phase and read on demand.
-					Edit locally with <code class="font-mono text-xs">goon memory edit &lt;name&gt;</code>.
-				</p>
+	fmt.Fprint(w, `<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
+		<div>
+			<h2 class="text-xl font-semibold tracking-tight">Memory</h2>
+			<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
+				What goon remembers. <strong>Personal</strong> shapes its voice. <strong>Knowledge</strong> is auto-loaded facts (PINNED.md + topic notes). <strong>Skills</strong> are specialist procedures activated on demand.
+			</p>
+		</div>
+		<div class="inline-flex rounded-lg border border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface-sunken p-0.5 text-xs font-medium" role="tablist">
+			<button type="button" data-store-switch="knowledge" onclick="goonSwitchStore('knowledge')"
+				class="px-3 py-1.5 rounded-md transition bg-white dark:bg-surface-raised text-accent shadow-sm" aria-current="page">
+				Knowledge
+			</button>
+			<button type="button" data-store-switch="skills" onclick="goonSwitchStore('skills')"
+				class="px-3 py-1.5 rounded-md transition text-gray-600 dark:text-gray-400 hover:text-accent">
+				Skills
+			</button>
+			<button type="button" data-store-switch="personal" onclick="goonSwitchStore('personal')"
+				class="px-3 py-1.5 rounded-md transition text-gray-600 dark:text-gray-400 hover:text-accent">
+				Personal
+			</button>
+		</div>
+	</div>
+
+	<div data-store="knowledge">`)
+	s.renderKnowledgeBody(w)
+	fmt.Fprint(w, `</div>
+	<div data-store="skills" class="hidden">`)
+	s.renderSkillsBody(w)
+	fmt.Fprint(w, `</div>
+	<div data-store="personal" class="hidden">`)
+	s.renderPersonalBody(w)
+	fmt.Fprint(w, `</div>
+
+	<script>
+	(function() {
+		// Defined once; subsequent loads just rebind handlers via inline onclick.
+		if (window.goonSwitchStore) return;
+		window.goonSwitchStore = function(target) {
+			document.querySelectorAll('[data-store]').forEach(function(el) {
+				el.classList.toggle('hidden', el.dataset.store !== target);
+			});
+			document.querySelectorAll('[data-store-switch]').forEach(function(btn) {
+				var active = btn.dataset.storeSwitch === target;
+				btn.classList.toggle('bg-white', active);
+				btn.classList.toggle('dark:bg-surface-raised', active);
+				btn.classList.toggle('text-accent', active);
+				btn.classList.toggle('shadow-sm', active);
+				btn.classList.toggle('text-gray-600', !active);
+				btn.classList.toggle('dark:text-gray-400', !active);
+				if (active) btn.setAttribute('aria-current', 'page');
+				else btn.removeAttribute('aria-current');
+			});
+		};
+	})();
+	</script>`)
+}
+
+// renderPersonalBody renders the personality editor — single
+// textarea with the current personal.md contents, plus save and
+// reset-to-default buttons. No list; this is one file by intent.
+func (s *Server) renderPersonalBody(w http.ResponseWriter) {
+	body := personal.Read()
+	if body == "" {
+		body = personal.Default
+	}
+	fmt.Fprintf(w, `<p class="mb-4 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
+		goon's <strong>character</strong> file — the voice and decision style
+		auto-injected into every agent run and chat turn. Stored at
+		<code class="font-mono text-xs">%s</code>. Keep it short and
+		opinionated; the agent reads this on every call.
+	</p>
+
+	<form hx-post="/api/personal/save" hx-target="#personal-save-result" hx-swap="innerHTML" class="space-y-3">
+		<textarea name="body" rows="22" required
+			class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">%s</textarea>
+		<div class="flex items-center justify-between gap-2 flex-wrap">
+			<button type="button"
+				onclick="if(confirm('Reset to the default character? Your current personal.md will be replaced.')){this.closest('form').querySelector('textarea').value=%s;}"
+				class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1.5 text-gray-600 dark:text-gray-400 hover:border-accent hover:text-accent transition">reset to default</button>
+			<div class="flex items-center gap-2">
+				<div id="personal-save-result" class="text-xs"></div>
+				<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1.5 font-semibold hover:brightness-110 transition">save personal.md</button>
 			</div>
-		</div>`)
+		</div>
+	</form>`,
+		html.EscapeString(personal.Path()),
+		html.EscapeString(body),
+		jsonStringLiteral(personal.Default),
+	)
+}
+
+// jsonStringLiteral turns a Go string into a JSON-encoded literal
+// safe to drop into an inline JavaScript expression. Used by the
+// "reset to default" button so the default content is embedded
+// once at render time, no extra fetch needed.
+func jsonStringLiteral(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+// renderKnowledgeBody renders the original Knowledge UI inside the
+// shared Memory tab shell. PINNED.md card + topic notes index.
+// Caller (fragTabMemory) has already emitted the section opener and
+// segmented header.
+func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
+	fmt.Fprint(w, `<details class="mb-4 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised">
+			<summary class="px-4 py-3 cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center gap-2">
+				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+				create or replace a note
+			</summary>
+			<form hx-post="/api/memory/write" hx-target="#memory-save-result" hx-swap="innerHTML" hx-on::after-request="if (event.detail.successful) this.reset()" class="px-4 pb-4 space-y-3">
+				<input type="text" name="name" required placeholder="PINNED.md, kebab-case-name.md, …"
+					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
+				<textarea name="body" rows="6" required placeholder="# Project context&#10;- API base URL is …&#10;- always run `+"make verify"+` before pushing"
+					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"></textarea>
+				<div class="flex items-center justify-between">
+					<div id="memory-save-result"></div>
+					<button type="submit" class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 transition">save note</button>
+				</div>
+			</form>
+		</details>`)
 
 	pinned := agentctx.Pinned("")
 	if strings.TrimSpace(pinned) == "" {
@@ -406,7 +504,7 @@ func (s *Server) fragTabKnowledge(w http.ResponseWriter, _ *http.Request) {
 				Workflows write here as they learn. You can also create them manually with
 				<code class="font-mono text-xs">goon memory write &lt;name&gt; &lt;body&gt;</code>.
 			</div>
-		</div></section>`)
+		</div>`)
 		return
 	}
 	fmt.Fprintf(w, `<div class="flex items-baseline justify-between mb-3">
@@ -422,6 +520,8 @@ func (s *Server) fragTabKnowledge(w http.ResponseWriter, _ *http.Request) {
 		if headline == "" {
 			headline = "<span class='text-gray-400 italic'>(no headline)</span>"
 		}
+		nameEsc := html.EscapeString(e.Name)
+		nameQ := urlQueryEscape(e.Name)
 		fmt.Fprintf(w, `<details class="group rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-accent/40 transition open:border-accent/50 open:shadow-card">
 			<summary class="flex items-center gap-3 px-4 py-3 cursor-pointer list-none">
 				<svg class="h-4 w-4 text-gray-400 group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
@@ -429,16 +529,19 @@ func (s *Server) fragTabKnowledge(w http.ResponseWriter, _ *http.Request) {
 					<div class="font-mono text-sm text-gray-800 dark:text-gray-200 group-open:text-accent group-open:font-semibold truncate">%s</div>
 					<div class="text-xs text-gray-500 truncate">%s</div>
 				</div>
-				<span class="hidden group-open:inline text-[10px] font-mono uppercase tracking-wider text-accent">open</span>
+				<form hx-post="/api/memory/delete" hx-confirm="Delete %s?" hx-target="#memory-list-result" hx-swap="innerHTML" class="m-0">
+					<input type="hidden" name="name" value="%s">
+					<button type="submit" class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1 transition" title="delete">✕</button>
+				</form>
 			</summary>
 			<div hx-get="/api/knowledge/note?name=%s" hx-trigger="toggle from:closest details once" hx-swap="innerHTML"
 				class="px-4 pb-4 -mt-1 text-sm">
 				<div class="space-y-2"><div class="skel h-3 w-1/3"></div><div class="skel h-3 w-full"></div><div class="skel h-3 w-5/6"></div></div>
 			</div>
 		</details>`,
-			html.EscapeString(e.Name), headline, urlQueryEscape(e.Name))
+			nameEsc, headline, nameEsc, nameEsc, nameQ)
 	}
-	fmt.Fprint(w, `</div></section>`)
+	fmt.Fprint(w, `</div><div id="memory-list-result" class="mt-3"></div>`)
 }
 
 // urlQueryEscape is a tiny wrapper so we don't import net/url at the
@@ -500,9 +603,227 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("HX-Trigger", "ticketsChanged, statusChanged")
+	s.events.Publish("ticketsChanged")
+	s.events.Publish("statusChanged")
 	fmt.Fprintf(w, `<div class="rounded-md bg-emerald-500/10 border border-emerald-500/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">✓ pulled %d ticket(s) from the board</div>`, n)
 }
 
 // Keep notes import alive for tests/future references even if every
 // caller goes through agentctx today.
 var _ = notes.PinnedFilename
+
+// --- Memory + Skills CRUD --------------------------------------------------
+//
+// Two parallel stores, two parallel handlers. We keep them in this
+// file (chat.go already owns the Knowledge tab) instead of a new
+// file because the surface is small.
+
+// handleMemoryWrite creates or replaces a memory note. Body comes
+// from a form (`name`, `body`). Returns a small confirmation +
+// fires HX-Trigger so the Knowledge tab refreshes its list.
+func (s *Server) handleMemoryWrite(w http.ResponseWriter, r *http.Request) {
+	s.handleStoreWrite(w, r, "memory", agentctx.WriteNote)
+}
+
+// handleMemoryDelete removes a memory note. Triggered by per-note
+// delete buttons in the Knowledge tab.
+func (s *Server) handleMemoryDelete(w http.ResponseWriter, r *http.Request) {
+	s.handleStoreDelete(w, r, "memory", agentctx.DeleteNote)
+}
+
+// handleSkillWrite — same as memory but for the skills store.
+func (s *Server) handleSkillWrite(w http.ResponseWriter, r *http.Request) {
+	s.handleStoreWrite(w, r, "skills", agentctx.WriteSkill)
+}
+
+// handleSkillDelete — same as memory but for the skills store.
+func (s *Server) handleSkillDelete(w http.ResponseWriter, r *http.Request) {
+	s.handleStoreDelete(w, r, "skills", agentctx.DeleteSkill)
+}
+
+// handlePersonalSave persists the character file. Single field (body)
+// — personal.md is one file, not a collection. Empty body resets to
+// the seeded default rather than wiping the personality entirely.
+func (s *Server) handlePersonalSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	body := strings.TrimSpace(r.FormValue("body"))
+	if body == "" {
+		body = personal.Default
+	}
+	if err := personal.Write(body); err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<span class="text-rose-700 dark:text-rose-400">✗ save failed: %s</span>`, html.EscapeString(err.Error()))
+		return
+	}
+	w.Header().Set("HX-Trigger", "personalChanged")
+	s.events.Publish("personalChanged")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<span class="text-emerald-700 dark:text-emerald-400">✓ saved</span>`)
+}
+
+// handleSkillNote returns one skill's body — analogue of
+// handleKnowledgeNote for the skills store.
+func (s *Server) handleSkillNote(w http.ResponseWriter, r *http.Request) {
+	name := r.URL.Query().Get("name")
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	body, err := agentctx.ReadSkill("", name)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err != nil {
+		fmt.Fprintf(w, `<div class="text-xs text-rose-500">%s</div>`, html.EscapeString(err.Error()))
+		return
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		fmt.Fprint(w, `<div class="text-xs text-gray-500">(empty)</div>`)
+		return
+	}
+	fmt.Fprint(w, `<pre class="whitespace-pre-wrap text-sm font-mono text-gray-800 dark:text-gray-200 bg-gray-50 dark:bg-surface-sunken rounded-md p-3 border border-gray-200 dark:border-gray-800 overflow-x-auto">`)
+	fmt.Fprint(w, html.EscapeString(body))
+	fmt.Fprint(w, `</pre>`)
+}
+
+// handleStoreWrite is the shared implementation for the memory and
+// skill write endpoints. kind controls the HX-Trigger event and the
+// confirmation label; writeFn delegates the actual save to whichever
+// agentctx helper matches.
+func (s *Server) handleStoreWrite(w http.ResponseWriter, r *http.Request, kind string, writeFn func(string, string, string) (string, error)) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	body := r.FormValue("body")
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	if _, err := writeFn("", name, body); err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<div class="rounded-md bg-rose-500/10 border border-rose-500/30 px-3 py-2 text-sm text-rose-700 dark:text-rose-400">%s save failed: %s</div>`,
+			html.EscapeString(kind), html.EscapeString(err.Error()))
+		return
+	}
+	w.Header().Set("HX-Trigger", kind+"Changed")
+	s.events.Publish(kind + "Changed")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<div class="rounded-md bg-emerald-500/10 border border-emerald-500/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">✓ saved %s · <span class="font-mono">%s</span></div>`,
+		html.EscapeString(kind), html.EscapeString(name))
+}
+
+// handleStoreDelete is the shared implementation for the memory and
+// skill delete endpoints.
+func (s *Server) handleStoreDelete(w http.ResponseWriter, r *http.Request, kind string, deleteFn func(string, string) error) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	name := strings.TrimSpace(r.FormValue("name"))
+	if name == "" {
+		http.Error(w, "name required", http.StatusBadRequest)
+		return
+	}
+	if err := deleteFn("", name); err != nil {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<div class="rounded-md bg-rose-500/10 border border-rose-500/30 px-3 py-2 text-sm text-rose-700 dark:text-rose-400">delete failed: %s</div>`,
+			html.EscapeString(err.Error()))
+		return
+	}
+	w.Header().Set("HX-Trigger", kind+"Changed")
+	s.events.Publish(kind + "Changed")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprintf(w, `<div class="rounded-md bg-gray-500/10 border border-gray-500/30 px-3 py-2 text-sm text-gray-700 dark:text-gray-400">✓ deleted %s · <span class="font-mono">%s</span></div>`,
+		html.EscapeString(kind), html.EscapeString(name))
+}
+
+// renderSkillsBody renders the Skills index inside the shared Memory
+// tab shell. Caller (fragTabMemory) has already emitted the section
+// opener and segmented header.
+func (s *Server) renderSkillsBody(w http.ResponseWriter) {
+	fmt.Fprint(w, `<p class="mb-4 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
+		Specialist procedures the agent can apply on demand — role definitions, how-tos, review checklists. Activated when you ask, not auto-loaded.
+	</p>
+
+	<details class="mb-4 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised">
+		<summary class="px-4 py-3 cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center gap-2">
+			<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+			create new skill
+		</summary>
+		<form hx-post="/api/skills/write" hx-target="#skill-save-result" hx-swap="innerHTML" hx-on::after-request="if (event.detail.successful) this.reset()" class="px-4 pb-4 space-y-3">
+			<input type="text" name="name" required placeholder="kebab-case-name.md (e.g. code-reviewer.md)"
+				class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
+			<textarea name="body" rows="6" required placeholder="# Code reviewer&#10;&#10;When asked to review code, focus on: ..."
+				class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"></textarea>
+			<div class="flex items-center justify-between">
+				<div id="skill-save-result"></div>
+				<button type="submit" class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 transition">save skill</button>
+			</div>
+		</form>
+	</details>
+
+	<div hx-get="/fragments/skills-list" hx-trigger="load, skillsChanged from:body" hx-swap="innerHTML">
+		<div class="text-sm text-gray-500">Loading skills…</div>
+	</div>`)
+}
+
+// fragSkillsList renders the skill index as a list with read /
+// download / delete controls. Auto-refreshed when skillsChanged
+// fires from anywhere (create, edit, delete).
+func (s *Server) fragSkillsList(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	idx := agentctx.SkillsIndex("")
+	if len(idx) == 0 {
+		_, _ = io.WriteString(w, emptyState("No skills yet",
+			"Create one with the form above, or via /skill write <name> <body> on Telegram."))
+		return
+	}
+	fmt.Fprintf(w, `<div class="flex items-baseline justify-between mb-3">
+		<h3 class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-500">
+			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+			Skills <span class="rounded-full bg-gray-100 dark:bg-surface-sunken text-gray-600 dark:text-gray-300 px-2 py-0.5 text-[10px] font-mono normal-case tracking-normal">%d</span>
+		</h3>
+	</div>
+	<div class="space-y-2">`, len(idx))
+	for _, e := range idx {
+		headline := html.EscapeString(e.Headline)
+		if headline == "" {
+			headline = `<span class="text-gray-400 italic">(no headline)</span>`
+		}
+		nameEsc := html.EscapeString(e.Name)
+		nameQ := urlQueryEscape(e.Name)
+		fmt.Fprintf(w, `<details class="group rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-accent/40 open:border-accent/50 open:shadow-card transition">
+			<summary class="flex items-center gap-3 px-4 py-3 cursor-pointer list-none">
+				<svg class="h-4 w-4 text-gray-400 group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
+				<div class="flex-1 min-w-0">
+					<div class="font-mono text-sm text-gray-800 dark:text-gray-200 group-open:text-accent group-open:font-semibold truncate">%s</div>
+					<div class="text-xs text-gray-500 truncate">%s</div>
+				</div>
+				<form hx-post="/api/skills/delete" hx-confirm="Delete %s?" hx-target="#skill-list-result" hx-swap="innerHTML" class="m-0">
+					<input type="hidden" name="name" value="%s">
+					<button type="submit" class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1 transition" title="delete">✕</button>
+				</form>
+			</summary>
+			<div hx-get="/api/skills/note?name=%s" hx-trigger="toggle from:closest details once" hx-swap="innerHTML" class="px-4 pb-4 -mt-1 text-sm">
+				<div class="space-y-2"><div class="skel h-3 w-1/3"></div><div class="skel h-3 w-full"></div></div>
+			</div>
+		</details>`, nameEsc, headline, nameEsc, nameEsc, nameQ)
+	}
+	fmt.Fprint(w, `</div><div id="skill-list-result" class="mt-3"></div>`)
+}

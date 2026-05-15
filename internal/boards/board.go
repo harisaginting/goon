@@ -54,6 +54,50 @@ type Board interface {
 	Transition(ctx context.Context, id string, s Status) error
 }
 
+// Searcher is an optional companion interface for boards that support
+// ad-hoc queries (Jira's JQL, GitHub's `is:issue` syntax). The chat
+// agent uses this to fetch live data mid-conversation instead of
+// answering from a cached snapshot. Boards that don't implement it
+// degrade gracefully — the chat falls back to filtering memory.
+//
+// query is intentionally board-native (e.g. JQL for Jira) — the LLM
+// emits it directly. limit caps results; pass 0 for the board's
+// default. Returning ErrSearchUnsupported lets callers detect "this
+// board can't search" cleanly.
+type Searcher interface {
+	Search(ctx context.Context, query string, limit int) ([]Ticket, error)
+}
+
+// ErrSearchUnsupported is returned by boards that don't implement
+// Searcher when callers reach them through the optional path. Lets the
+// chat agent fall back to memory-only answers without a type assertion.
+var ErrSearchUnsupported = errors.New("board does not support ad-hoc search")
+
+// TicketPatch is the diff used by Updater.Update. Each pointer
+// field encodes "leave this alone (nil) vs set this value (non-nil
+// pointer to new value)". Pointer-to-empty-string is a deliberate
+// clear. Labels uses a slice rather than a pointer because Go
+// already has a "nil slice = leave alone" idiom; pass an empty
+// non-nil slice (`[]string{}`) to clear labels.
+type TicketPatch struct {
+	Title       *string
+	Description *string
+	Labels      []string
+}
+
+// Updater is an optional companion interface for boards that allow
+// editing ticket fields (summary, description, labels). Jira
+// implements it; GitHub and the mock board implement it too. Boards
+// that don't can ignore — the chat agent surfaces "not supported"
+// to the user.
+type Updater interface {
+	Update(ctx context.Context, id string, patch TicketPatch) error
+}
+
+// ErrUpdateUnsupported is the analogue of ErrSearchUnsupported for
+// the Updater path.
+var ErrUpdateUnsupported = errors.New("board does not support ticket update")
+
 // NewFromEnv selects and constructs the board adapter from environment
 // variables. Returns ErrNoBoard when no board is configured, so the daemon
 // can degrade gracefully.
@@ -111,7 +155,16 @@ type Mock struct {
 	Tickets  []Ticket
 	Comments []string
 	Transit  []string
+	// Searches records every query passed to Search (newest at the end)
+	// — handy in tests to verify the chat agent actually queried the
+	// board rather than hallucinating an answer from cached state.
+	Searches []string
+	// Updates records every patch passed to Update so tests can assert
+	// the chat agent edited tickets correctly. Stored as
+	// "<key>: title=<title?> desc=<desc?> labels=<labels?>".
+	Updates  []string
 	OnList   func() ([]Ticket, error)
+	OnSearch func(query string, limit int) ([]Ticket, error)
 }
 
 // NewMock constructs a mock board prefilled with the given tickets.
@@ -143,6 +196,54 @@ func (m *Mock) Transition(_ context.Context, id string, s Status) error {
 	for i := range m.Tickets {
 		if m.Tickets[i].ID == id {
 			m.Tickets[i].Status = s
+		}
+	}
+	return nil
+}
+
+// Search implements Searcher for the mock board. It records every
+// query in m.Searches (so tests can assert what the chat agent asked
+// for) and returns a configurable result via OnSearch — falling back
+// to all tickets when no override is set.
+func (m *Mock) Search(_ context.Context, query string, limit int) ([]Ticket, error) {
+	m.Searches = append(m.Searches, query)
+	if m.OnSearch != nil {
+		return m.OnSearch(query, limit)
+	}
+	out := make([]Ticket, len(m.Tickets))
+	copy(out, m.Tickets)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, nil
+}
+
+// Update implements Updater for the mock board. Applies the patch
+// to the in-memory ticket slice in addition to logging it, so a
+// subsequent Get/List call sees the change.
+func (m *Mock) Update(_ context.Context, id string, patch TicketPatch) error {
+	parts := []string{}
+	if patch.Title != nil {
+		parts = append(parts, "title="+*patch.Title)
+	}
+	if patch.Description != nil {
+		parts = append(parts, "desc="+*patch.Description)
+	}
+	if patch.Labels != nil {
+		parts = append(parts, "labels="+strings.Join(patch.Labels, ","))
+	}
+	m.Updates = append(m.Updates, id+": "+strings.Join(parts, " "))
+	for i := range m.Tickets {
+		if m.Tickets[i].ID == id {
+			if patch.Title != nil {
+				m.Tickets[i].Title = *patch.Title
+			}
+			if patch.Description != nil {
+				m.Tickets[i].Description = *patch.Description
+			}
+			if patch.Labels != nil {
+				m.Tickets[i].Labels = patch.Labels
+			}
 		}
 	}
 	return nil

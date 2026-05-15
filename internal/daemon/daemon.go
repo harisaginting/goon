@@ -73,6 +73,10 @@ type Daemon struct {
 	llm   llm.Provider
 	board boards.Board
 	host  githost.Host
+	// wakeCh nudges Run() to call pollAndRun immediately instead of
+	// waiting for the next ticker. Buffer=1 with select-default in
+	// Wake() means we coalesce bursts without blocking the sender.
+	wakeCh chan struct{}
 }
 
 // New wires a Daemon. LLM / Board / Host may be nil — Reconfigure can fill
@@ -82,10 +86,27 @@ func New(opts Options) *Daemon {
 		opts.PollInterval = PollInterval()
 	}
 	return &Daemon{
-		opts:  opts,
-		llm:   opts.LLM,
-		board: opts.Board,
-		host:  opts.Host,
+		opts:   opts,
+		llm:    opts.LLM,
+		board:  opts.Board,
+		host:   opts.Host,
+		wakeCh: make(chan struct{}, 1),
+	}
+}
+
+// Wake nudges the daemon to run pollAndRun on the next loop iteration
+// instead of waiting for the poll interval ticker. Used by the web /
+// Telegram answer handlers so a workflow paused at an approval gate
+// resumes within a second of the user replying, not within minutes.
+// Safe to call from any goroutine; bursts coalesce into one wake.
+func (d *Daemon) Wake() {
+	if d == nil || d.wakeCh == nil {
+		return
+	}
+	select {
+	case d.wakeCh <- struct{}{}:
+	default:
+		// already a pending wake — fine, the next tick handles it
 	}
 }
 
@@ -196,6 +217,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
+			d.pollAndRun(ctx)
+		case <-d.wakeCh:
+			// User just answered a gate question, or some other
+			// nudge — run immediately instead of waiting up to
+			// d.opts.PollInterval for the next scheduled tick.
 			d.pollAndRun(ctx)
 		}
 	}

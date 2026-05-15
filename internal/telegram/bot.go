@@ -40,6 +40,13 @@ import (
 	"github.com/harisaginting/goon/internal/tools"
 )
 
+// Waker is satisfied by *daemon.Daemon's Wake() method. We accept it
+// as an interface here instead of importing daemon directly so the
+// telegram package doesn't pull in workflow + tools + executor.
+type Waker interface {
+	Wake()
+}
+
 // Options configures a Bot. Memory and Token are required; everything else
 // is optional and turns specific commands on or off.
 type Options struct {
@@ -53,6 +60,13 @@ type Options struct {
 	Executor *executor.Executor // optional: enables /run
 	Host     githost.Host       // optional: enables /prs /review /approve /decline /comment
 	Board    boards.Board       // optional: enables /refresh + chat auto-refresh of ticket cache
+
+	// Daemon, when non-nil and implementing Wake(), is signalled by
+	// /answer so a paused workflow resumes within a second of the
+	// reply instead of waiting up to PollInterval for the next tick.
+	// Declared as an interface (not *daemon.Daemon) to avoid an
+	// import cycle: daemon imports telegram already.
+	Daemon Waker
 
 	// GoonExe is the absolute path to the goon binary used for full CLI
 	// parity (`/<subcmd>` shells out to `goon <subcmd>`). Defaults to
@@ -173,18 +187,30 @@ type apiResponse struct {
 
 // Update mirrors the slice of fields we consume from the Bot API.
 type Update struct {
-	UpdateID int64    `json:"update_id"`
-	Message  *Message `json:"message"`
+	UpdateID      int64          `json:"update_id"`
+	Message       *Message       `json:"message"`
+	CallbackQuery *CallbackQuery `json:"callback_query,omitempty"`
 	// EditedMessage etc intentionally ignored: we only handle fresh sends.
+}
+
+// CallbackQuery fires when the user taps an inline-keyboard button.
+// We use them as the "select a ticket → see actions" affordance so
+// users don't have to type ticket keys.
+type CallbackQuery struct {
+	ID      string   `json:"id"`
+	From    User     `json:"from"`
+	Message *Message `json:"message,omitempty"`
+	Data    string   `json:"data,omitempty"`
 }
 
 // Message is the inbound text message we dispatch on.
 type Message struct {
-	MessageID int64  `json:"message_id"`
-	Text      string `json:"text"`
-	Chat      Chat   `json:"chat"`
-	From      User   `json:"from"`
-	Date      int64  `json:"date"`
+	MessageID      int64    `json:"message_id"`
+	Text           string   `json:"text"`
+	Chat           Chat     `json:"chat"`
+	From           User     `json:"from"`
+	Date           int64    `json:"date"`
+	ReplyToMessage *Message `json:"reply_to_message,omitempty"`
 }
 
 // Chat identifies the conversation.
@@ -253,7 +279,7 @@ func (b *Bot) getUpdates(ctx context.Context, offset int64) ([]Update, error) {
 		v.Set("offset", fmt.Sprintf("%d", offset))
 	}
 	v.Set("timeout", fmt.Sprintf("%d", b.opts.PollTimeout))
-	v.Set("allowed_updates", `["message"]`)
+	v.Set("allowed_updates", `["message","callback_query"]`)
 	endpoint := b.endpoint("getUpdates") + "?" + v.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -289,10 +315,74 @@ func (b *Bot) getUpdates(ctx context.Context, offset int64) ([]Update, error) {
 // Send delivers text to chatID as a single Telegram message. Long content
 // should use SendChunked which splits at line boundaries.
 func (b *Bot) Send(ctx context.Context, chatID int64, text string) error {
+	return b.send(ctx, chatID, text, "")
+}
+
+// SendWithButtons posts a message with an attached inline keyboard.
+// The keyboard is a list of rows; each row is a list of buttons. Each
+// button is {text, callbackData} — callbackData is what Telegram
+// echoes back when the user taps. Use SendForceReply for the
+// "user-types-text-as-the-answer" pattern.
+//
+// Telegram caps callback_data at 64 bytes; callers should keep
+// payloads short (e.g. "v:KEY", "m:KEY:in_progress").
+type InlineButton struct {
+	Text         string
+	CallbackData string
+	URL          string // mutually exclusive with CallbackData
+}
+
+func (b *Bot) SendWithButtons(ctx context.Context, chatID int64, text string, rows [][]InlineButton) error {
+	if len(rows) == 0 {
+		return b.send(ctx, chatID, text, "")
+	}
+	// Build the reply_markup JSON manually so we don't import a
+	// telegram SDK. Shape: {"inline_keyboard":[[{...},{...}], ...]}
+	type btnWire struct {
+		Text         string `json:"text"`
+		CallbackData string `json:"callback_data,omitempty"`
+		URL          string `json:"url,omitempty"`
+	}
+	type kbWire struct {
+		InlineKeyboard [][]btnWire `json:"inline_keyboard"`
+	}
+	wire := kbWire{InlineKeyboard: make([][]btnWire, 0, len(rows))}
+	for _, row := range rows {
+		wRow := make([]btnWire, 0, len(row))
+		for _, bt := range row {
+			wRow = append(wRow, btnWire{Text: bt.Text, CallbackData: bt.CallbackData, URL: bt.URL})
+		}
+		wire.InlineKeyboard = append(wire.InlineKeyboard, wRow)
+	}
+	buf, err := json.Marshal(wire)
+	if err != nil {
+		return err
+	}
+	return b.send(ctx, chatID, text, string(buf))
+}
+
+// SendForceReply posts a message and asks Telegram to surface the
+// system "reply" UI on the user's keyboard, with the original
+// message quoted. This is how we collect multi-line input (comment
+// bodies, descriptions) without needing per-chat state machines —
+// the inbound reply carries ReplyToMessage pointing at our prompt,
+// which has the ticket key embedded in plain text for us to parse.
+func (b *Bot) SendForceReply(ctx context.Context, chatID int64, text string) error {
+	markup := `{"force_reply":true,"input_field_placeholder":"type your reply here…"}`
+	return b.send(ctx, chatID, text, markup)
+}
+
+// send is the shared sendMessage implementation. replyMarkup is the
+// JSON-encoded reply_markup value (inline keyboard, force reply,
+// etc.) — empty string means "no markup".
+func (b *Bot) send(ctx context.Context, chatID int64, text, replyMarkup string) error {
 	form := url.Values{}
 	form.Set("chat_id", fmt.Sprintf("%d", chatID))
 	form.Set("text", text)
 	form.Set("disable_web_page_preview", "true")
+	if replyMarkup != "" {
+		form.Set("reply_markup", replyMarkup)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		b.endpoint("sendMessage"), bytes.NewBufferString(form.Encode()))
 	if err != nil {
@@ -316,6 +406,30 @@ func (b *Bot) Send(ctx context.Context, chatID int64, text string) error {
 		return fmt.Errorf("telegram send: %s", r.Description)
 	}
 	return nil
+}
+
+// AnswerCallback dismisses the loading spinner on a tapped inline
+// button. Toast text is shown briefly above the chat. Best-effort —
+// errors here are logged but not surfaced.
+func (b *Bot) AnswerCallback(ctx context.Context, callbackID, toast string) {
+	form := url.Values{}
+	form.Set("callback_query_id", callbackID)
+	if toast != "" {
+		form.Set("text", toast)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		b.endpoint("answerCallbackQuery"), bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		logx.Warn("telegram_bot.answer_callback_build", "error", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := b.http.Do(req)
+	if err != nil {
+		logx.Warn("telegram_bot.answer_callback_send", "error", err.Error())
+		return
+	}
+	resp.Body.Close()
 }
 
 // SendChunked splits a long body into messages under Telegram's 4096-char
@@ -361,6 +475,13 @@ func (b *Bot) SendChunked(ctx context.Context, chatID int64, text string) {
 // All errors are surfaced back to the user as Telegram messages so they're
 // never lost.
 func (b *Bot) handleUpdate(ctx context.Context, u Update) {
+	// Callback queries come from inline-keyboard button taps. They
+	// have no Message of their own (well, they reference the original
+	// message but the text is empty), so handle them first.
+	if u.CallbackQuery != nil {
+		b.handleCallback(ctx, u.CallbackQuery)
+		return
+	}
 	msg := u.Message
 	if msg == nil || strings.TrimSpace(msg.Text) == "" {
 		return
@@ -382,6 +503,14 @@ func (b *Bot) handleUpdate(ctx context.Context, u Update) {
 		return
 	}
 	b.opts.Memory.TouchChat(chatID)
+
+	// "Reply to this message" flows: when the inbound message has a
+	// ReplyToMessage that we previously sent as a force-reply prompt
+	// (with an embedded ticket key tag), route into the action handler
+	// instead of the generic command/chat path.
+	if msg.ReplyToMessage != nil && b.tryHandleReplyAction(ctx, chatID, msg) {
+		return
+	}
 
 	if strings.HasPrefix(text, "/") {
 		b.handleCommand(ctx, chatID, msg.From, text)

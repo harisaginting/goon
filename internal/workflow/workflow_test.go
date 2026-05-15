@@ -309,7 +309,7 @@ func TestEngine_PRTitleAndBodyTemplates(t *testing.T) {
 	if got.Title != "FIX(ENG-1): Add login" {
 		t.Errorf("title: %q", got.Title)
 	}
-	if !strings.Contains(got.Body, "Branch: goon/eng-1") || !strings.Contains(got.Body, "Project: ENG") {
+	if !strings.Contains(got.Body, "Branch: goon/ENG-1") || !strings.Contains(got.Body, "Project: ENG") {
 		t.Errorf("body: %q", got.Body)
 	}
 	hasLabel := false

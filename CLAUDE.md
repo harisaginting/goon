@@ -52,13 +52,24 @@ internal/agent/     LLM ↔ tool loop; SystemPrompt
 internal/atlassian/ shared env-var helper for Jira + Confluence
 internal/boards/    ticket-source adapters: jira, github
 internal/checkup/   `goon doctor` provider probes
+internal/codeindex/ regex symbol extractor + ripgrep/stdlib content
+                    search; backs the search_code tool
 internal/daemon/    poll loop, hot-reload via Reconfigure()
 internal/executor/  runs tool calls in {dry-run|run|auto|explain} modes
 internal/githost/   PR adapters: github, gitlab, bitbucket
-internal/llm/       provider adapters: openai, anthropic, ollama, mock
+internal/llm/       provider adapters: openai, anthropic, gemini, ollama, mock
 internal/logx/      slog wrapper, log rotation, HTTP LoggingTransport
 internal/memory/    PASSIVE runtime store (JSON file: tickets, workflows, questions)
 internal/notes/     ACTIVE markdown notes store (./storage/memory/*.md)
+internal/skills/    Specialist markdown store (./storage/skills/*.md)
+                    Same Store type as notes; instantiated against a
+                    different default root. Sibling of memory, NOT
+                    auto-injected like PINNED.md.
+internal/personal/  Single-file character store (./storage/personal.md).
+                    Auto-injected into every agent run + chat turn
+                    (alongside PINNED.md). The "soul" of goon —
+                    voice, tone, default behaviors. SeedDefault()
+                    writes a starter file on first boot.
 internal/safety/    command validator (blocks rm -rf / etc)
 internal/storage/   single source of truth for the per-project state root
 internal/telegram/  inbound bot — auth, /commands, chat, PR review (cmd/start spawns)
@@ -162,6 +173,104 @@ the state machine picks up at `wf.Stage`.
 
 ## Recent decisions worth knowing
 
+- **Codebase index (`internal/codeindex` + `internal/tools/search_code.go`).**
+  First call to `search_code` builds a per-process index of the
+  current repo: regex symbol extraction (Go/Python/JS/TS/Java/Rust/
+  Ruby/PHP/Elixir/Shell) + a content searcher that prefers ripgrep
+  when on PATH and falls back to stdlib bufio. Query shape picks the
+  mode: bare word → symbol lookup + content fallback; `/pat/` →
+  regex; anything else → substring. Single shared `SearchCode` is
+  registered in `DefaultRegistry` so the index isn't rebuilt per
+  call. Files >2 MB and ignored dirs (.git, node_modules, vendor,
+  target, build, dist, .venv …) are skipped. No Tree-sitter because
+  CGo would break the "single binary, zero deps" rule — regex was
+  good enough and matches 9 langs with ~50 lines per lang.
+- **Browser tools (`internal/tools/fetch.go`).** `fetch_url`
+  retrieves a URL (HTTPS-only by default, `GOON_FETCH_ALLOW_HTTP=1`
+  unlocks plain http), 256 KB cap, strips HTML tags via a hand-
+  written stripper so the agent gets readable docs without an x/net
+  dep. `web_search` prefers Google CSE when `GOOGLE_API_KEY` +
+  `GOOGLE_CSE_ID` are set; falls back to `html.duckduckgo.com`
+  scraping (substring-based, no html.Parser). Both clients are
+  `logx.InstrumentClient("fetch", ...)` so every outbound request
+  shows up in `./storage/logs/goon.log`. Use case: the agent can
+  read error messages, library docs, and Stack Overflow answers
+  autonomously instead of guessing.
+- **Web UI file browser (`internal/web/files.go`).** New "Files"
+  sidebar entry under a "Workspace" section. Endpoints:
+  `/api/files/tree` (directory listing — JSON or HTML fragment),
+  `/api/files/read` (returns the editor pane with a textarea),
+  `/api/files/write` (atomic tmp+rename, fires
+  `HX-Trigger: filesChanged` and SSE), `/fragments/tab-files` (the
+  two-column composer). Root resolves
+  `GOON_WORKSPACE_DIR → GOON_WORKDIR → cwd`. Path safety: rejects
+  absolute paths, any literal `..` in the raw input, and resolves
+  must stay under root. 2 MB read cap; binary files (NUL byte in
+  first 8 KB) refused for editing. No execute/rename/delete from
+  this surface — the agent stays the only thing that can mutate the
+  repo in non-obvious ways. Letter shortcut `f`, also in cmd-K.
+- **Daemon wake channel.** `(*daemon.Daemon).Wake()` pushes onto a
+  buffer-1 `wakeCh` that `Run()` selects on alongside the poll ticker.
+  Used by the web `/api/answer` handler and the Telegram `/answer`
+  command so a workflow paused at an approval gate resumes in <1s
+  instead of waiting up to PollInterval (default 5 min) for the next
+  scheduled tick. Both the web and telegram packages define a local
+  `Waker` interface (just `Wake()`) and accept the daemon as that
+  interface — no import-cycle pain. Calling Wake on a daemon whose
+  wakeCh is already full is a no-op (we coalesce bursts).
+- **Gemini provider (`internal/llm/gemini.go`).** Google's
+  generativelanguage v1beta REST API, stdlib-only like every other
+  adapter. Env vars: `GEMINI_API_KEY` (or `GOOGLE_API_KEY` as
+  fallback), `GEMINI_MODEL` (default `gemini-2.5-flash`),
+  `GEMINI_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta`).
+  URL shape: `{base}/models/{model}:generateContent?key={KEY}` for
+  non-stream, `:streamGenerateContent?key={KEY}&alt=sse` for stream.
+  Auth via query param (Google's public API style) — no OAuth.
+  Roles map: system → `system_instruction.parts[*].text`, assistant
+  → "model", user/tool → "user". `Stream` parses `alt=sse` events;
+  each event carries a full `{candidates:[{content:{parts:[...]}}]}`
+  fragment, NOT a delta type like Anthropic. `probeGemini` in
+  checkup sends a 1-token generateContent ping to verify auth + model
+  in one round-trip. Wired into NewFromEnv, doctor probe,
+  cmd/config.go's known keys, web config form's groupings, README,
+  .env.example, and docs.html.
+- **Chat agent has tool use (`internal/agentctx/chat.go`).** The web
+  and Telegram chat handlers no longer call `LLM.Generate` directly —
+  they delegate to `agentctx.ChatTurn`, which runs an LLM↔tool loop
+  with up to `maxChatToolIterations=3` iterations. The LLM emits a
+  single JSON line on stdout to invoke a tool; everything else is
+  treated as the final prose answer. `parseToolCall` strips a leading
+  ```json fence if the model adds one. Tools:
+    - `jira_search` (read JQL, requires `boards.Searcher`)
+    - `jira_comment` (always available on any `boards.Board`)
+    - `jira_transition` (always available)
+    - `jira_update` (requires `boards.Updater`)
+  Read results feed back as `SEARCH RESULTS` system messages; writes
+  feed back as `ACTION OK …` or `TOOL ERROR …` so the LLM knows
+  what happened and can confirm in prose on the next turn. Search
+  hits are persisted into `Memory.SeenTicket` so the next /tickets
+  call sees them too.
+- **Two new optional board interfaces** (`internal/boards/board.go`):
+  `Searcher{Search(ctx, query, limit)}` and `Updater{Update(ctx, id,
+  TicketPatch)}`. Both are optional companions to the base `Board`
+  interface; non-implementing boards degrade gracefully (the tool
+  loop surfaces "not supported" to the LLM). `Mock` implements both
+  and records calls in `Mock.Searches` / `Mock.Updates` for tests.
+- **Jira Transition is now real** (`internal/boards/jira.go`). The
+  former stub returning `nil` is replaced with the proper two-call
+  Jira flow: GET `/rest/api/3/issue/{key}/transitions` lists the
+  project's workflow-defined transitions, then POST with the
+  best-matched transition id. Matching prefers `to.name → MapStatus`,
+  falls back to `transition.name → MapStatus`, and on no match
+  returns an error listing what WAS available so the chat agent can
+  show the user the choices.
+- **Jira Update** (`internal/boards/jira.go::(*Jira).Update`) is the
+  Updater implementation — PUT `/rest/api/3/issue/{key}` with a
+  `fields` object holding the diff. Description is wrapped in
+  minimal ADF (same shape as Comment). `TicketPatch` uses
+  pointer-to-string for Title/Description so nil = leave alone vs
+  non-nil = set; `Labels []string` uses nil-vs-empty-slice for the
+  same distinction.
 - **Pause/resume control surface.** Three drivers, one source of truth.
   `Memory.Status.Paused bool` is flipped by `goon pause` (cmd/pause.go),
   the web UI's POST `/api/daemon/pause` (renders the alternate

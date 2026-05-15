@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goon — Documentation</title>
+<link rel="icon" type="image/svg+xml" href="./logo.svg">
+<style>
+  /* ---------- design tokens ---------- */
+  :root {
+    --bg: #ffffff; --bg-soft: #f7f8fa; --bg-code: #f6f8fa; --bg-elev: #ffffff;
+    --fg: #1c1f24; --fg-soft: #4b5563; --fg-mute: #9ca3af;
+    --accent: #5b6cff; --accent-soft: #eef1ff;
+    --warn: #b45309; --err: #b91c1c; --ok: #15803d;
+    --border: #e5e7eb; --border-soft: #eef0f3;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --shadow-sm: 0 1px 2px rgba(15,23,42,0.04);
+    --shadow:    0 4px 14px -6px rgba(15,23,42,0.12);
+    --topbar-h: 56px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0d1117; --bg-soft: #11161d; --bg-code: #0a0d12; --bg-elev: #161b22;
+      --fg: #e6edf3; --fg-soft: #9ca3af; --fg-mute: #6b7280;
+      --accent: #7c8cff; --accent-soft: #1e2440;
+      --warn: #d29922; --err: #f87171; --ok: #34d399;
+      --border: #21262d; --border-soft: #1a1f26;
+    }
+  }
+  html[data-theme="light"] {
+    --bg: #ffffff; --bg-soft: #f7f8fa; --bg-code: #f6f8fa; --bg-elev: #ffffff;
+    --fg: #1c1f24; --fg-soft: #4b5563; --fg-mute: #9ca3af;
+    --accent: #5b6cff; --accent-soft: #eef1ff;
+    --warn: #b45309; --err: #b91c1c; --ok: #15803d;
+    --border: #e5e7eb; --border-soft: #eef0f3;
+  }
+  html[data-theme="dark"] {
+    --bg: #0d1117; --bg-soft: #11161d; --bg-code: #0a0d12; --bg-elev: #161b22;
+    --fg: #e6edf3; --fg-soft: #9ca3af; --fg-mute: #6b7280;
+    --accent: #7c8cff; --accent-soft: #1e2440;
+    --warn: #d29922; --err: #f87171; --ok: #34d399;
+    --border: #21262d; --border-soft: #1a1f26;
+  }
+
+  /* ---------- base ---------- */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; min-height: 100%; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15.5px; line-height: 1.65; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
+  code, pre, kbd { font-family: var(--mono); }
+  code { background: var(--bg-code); padding: 1px 6px; border-radius: 4px; font-size: 0.88em; border: 1px solid var(--border-soft); }
+  pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; position: relative; }
+  pre code { background: transparent; border: none; padding: 0; font-size: 1em; }
+  kbd { background: var(--bg-elev); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; font-size: 0.82em; box-shadow: 0 1px 0 rgba(0,0,0,0.05); }
+  hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
+  table { border-collapse: collapse; margin: 14px 0 22px; width: 100%; font-size: 0.94em; }
+  th, td { border-bottom: 1px solid var(--border-soft); padding: 10px 14px; text-align: left; vertical-align: top; }
+  thead th { font-weight: 600; color: var(--fg-soft); font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.05em; background: var(--bg-soft); }
+
+  /* ---------- callout (blockquote) ---------- */
+  blockquote { margin: 18px 0; padding: 12px 16px 12px 14px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 8px 8px 0; }
+  blockquote.warn { border-color: var(--warn); background: rgba(210, 153, 34, 0.10); }
+  blockquote.err  { border-color: var(--err);  background: rgba(248, 81, 73, 0.08); }
+  blockquote.ok   { border-color: var(--ok);   background: rgba(34, 197, 94, 0.08); }
+  blockquote p:first-child { margin-top: 0; }
+  blockquote p:last-child { margin-bottom: 0; }
+
+  /* ---------- header ---------- */
+  header.topbar {
+    position: sticky; top: 0; z-index: 50;
+    height: var(--topbar-h);
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 22px; gap: 16px;
+  }
+  header.topbar .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--fg); font-weight: 600; letter-spacing: -0.01em; font-size: 15px; }
+  header.topbar .brand .tag { font-size: 12px; font-weight: 400; color: var(--fg-mute); margin-left: 4px; }
+  header.topbar .spacer { flex: 1; }
+  header.topbar .search {
+    position: relative; max-width: 460px; flex: 1;
+  }
+  header.topbar .search input {
+    width: 100%; height: 36px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg-soft); color: var(--fg);
+    padding: 0 12px 0 36px; font-size: 13.5px; font-family: var(--sans);
+    transition: border-color 120ms, box-shadow 120ms, background 120ms;
+  }
+  header.topbar .search input:focus { outline: none; border-color: var(--accent); background: var(--bg-elev); box-shadow: 0 0 0 3px var(--accent-soft); }
+  header.topbar .search .icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--fg-mute); width: 16px; height: 16px; pointer-events: none; }
+  header.topbar .search .kbd-hint { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--fg-mute); font-size: 11px; }
+  header.topbar .pill-link { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 8px; color: var(--fg-soft); font-size: 13px; transition: background 120ms, color 120ms; }
+  header.topbar .pill-link:hover { background: var(--bg-soft); color: var(--fg); text-decoration: none; }
+  header.topbar .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 8px; border: none; background: transparent; cursor: pointer; color: var(--fg-soft); transition: background 120ms, color 120ms; }
+  header.topbar .icon-btn:hover { background: var(--bg-soft); color: var(--fg); }
+
+  /* ---------- 3-column shell ---------- */
+  .shell { display: grid; grid-template-columns: 280px minmax(0, 1fr) 260px; gap: 0; max-width: 1400px; margin: 0 auto; }
+  aside.left, aside.right { position: sticky; top: var(--topbar-h); height: calc(100vh - var(--topbar-h)); overflow-y: auto; padding: 26px 22px; }
+  aside.left { border-right: 1px solid var(--border); }
+  aside.right { border-left: 1px solid var(--border); }
+
+  /* ---------- left TOC ---------- */
+  aside.left .group-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute); margin: 18px 6px 8px; }
+  aside.left .group-label:first-child { margin-top: 0; }
+  aside.left .toc-search { position: relative; margin-bottom: 16px; }
+  aside.left .toc-search input { width: 100%; height: 32px; padding: 0 10px 0 30px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-soft); color: var(--fg); font-size: 12.5px; font-family: var(--sans); }
+  aside.left .toc-search input:focus { outline: none; border-color: var(--accent); }
+  aside.left .toc-search .icon { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--fg-mute); pointer-events: none; }
+  nav.toc ol { list-style: none; padding: 0; margin: 0; }
+  nav.toc li { margin: 2px 0; }
+  nav.toc li a { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; color: var(--fg-soft); font-size: 13.5px; line-height: 1.35; transition: background 120ms, color 120ms; }
+  nav.toc li a:hover { background: var(--bg-soft); color: var(--fg); text-decoration: none; }
+  nav.toc li a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  nav.toc li.hidden { display: none; }
+  nav.toc li a .toc-num { color: var(--fg-mute); font-variant-numeric: tabular-nums; font-size: 12px; min-width: 18px; }
+  nav.toc li a.active .toc-num { color: var(--accent); }
+
+  /* ---------- main content ---------- */
+  main.content { padding: 36px 56px 96px; min-width: 0; }
+  main.content .crumb { font-size: 12.5px; color: var(--fg-mute); margin-bottom: 18px; }
+  main.content .crumb a { color: var(--fg-soft); }
+  main.content .page-title { font-size: 2.1em; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.02em; font-weight: 700; }
+  main.content .page-blurb { color: var(--fg-soft); font-size: 1.04em; margin: 0 0 28px; }
+
+  section { margin-bottom: 56px; scroll-margin-top: calc(var(--topbar-h) + 18px); }
+  section h2 { font-size: 1.6em; margin: 0 0 4px; padding-top: 8px; letter-spacing: -0.015em; font-weight: 700; }
+  section h2 .num { display: inline-block; min-width: 28px; color: var(--fg-mute); font-weight: 500; margin-right: 6px; font-size: 0.78em; vertical-align: 0.18em; }
+  section > h2 + p, section > h2 + .lead { color: var(--fg-soft); margin-top: 6px; }
+  section h3 { font-size: 1.18em; margin: 32px 0 10px; font-weight: 600; letter-spacing: -0.005em; scroll-margin-top: calc(var(--topbar-h) + 18px); }
+  section h4 { font-size: 0.82em; margin: 22px 0 8px; color: var(--fg-soft); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  section p { margin: 0 0 14px; }
+  section ul, section ol { padding-left: 22px; }
+  section li { margin: 5px 0; }
+
+  /* ---------- pills, cards, details ---------- */
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em; }
+  .pill.ok { background: rgba(34,197,94,0.14); color: var(--ok); }
+  .pill.warn { background: rgba(210,153,34,0.16); color: var(--warn); }
+  .pill.err { background: rgba(248,81,73,0.16); color: var(--err); }
+  .pill.acc { background: var(--accent-soft); color: var(--accent); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 14px 0 22px; }
+  .card { border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; background: var(--bg-elev); box-shadow: var(--shadow-sm); }
+  .card h4 { margin-top: 0; }
+  .small { font-size: 0.92em; color: var(--fg-soft); }
+  details { margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; background: var(--bg-elev); }
+  details summary { cursor: pointer; font-weight: 600; }
+  details[open] summary { margin-bottom: 10px; }
+
+  /* ---------- right rail (on this page) ---------- */
+  aside.right .rail-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute); margin: 0 0 12px; }
+  aside.right ol.rail { list-style: none; padding: 0; margin: 0; border-left: 1px solid var(--border-soft); }
+  aside.right ol.rail li { margin: 0; }
+  aside.right ol.rail a { display: block; padding: 5px 12px; margin-left: -1px; border-left: 2px solid transparent; color: var(--fg-soft); font-size: 12.5px; line-height: 1.4; transition: color 120ms, border-color 120ms; }
+  aside.right ol.rail a:hover { color: var(--fg); text-decoration: none; }
+  aside.right ol.rail a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+
+  /* ---------- code copy button ---------- */
+  pre .copy-btn {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--bg-elev); color: var(--fg-soft);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 9px; font-size: 11px; font-family: var(--sans);
+    opacity: 0; transition: opacity 120ms, color 120ms, background 120ms;
+    cursor: pointer;
+  }
+  pre:hover .copy-btn { opacity: 1; }
+  pre .copy-btn:hover { color: var(--fg); background: var(--bg-soft); }
+  pre .copy-btn.copied { color: var(--ok); border-color: var(--ok); opacity: 1; }
+
+  /* ---------- mobile nav ---------- */
+  .mobile-toggle { display: none; }
+  @media (max-width: 1100px) {
+    .shell { grid-template-columns: 240px minmax(0, 1fr); }
+    aside.right { display: none; }
+  }
+  @media (max-width: 760px) {
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    aside.left { display: none; position: fixed; top: var(--topbar-h); left: 0; right: 0; bottom: 0; height: auto; background: var(--bg); z-index: 40; border-right: none; border-bottom: 1px solid var(--border); }
+    aside.left.open { display: block; }
+    main.content { padding: 22px 18px 70px; }
+    header.topbar { padding: 0 14px; gap: 10px; }
+    header.topbar .search { max-width: none; }
+    header.topbar .brand .tag { display: none; }
+    .mobile-toggle { display: inline-flex; }
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <button class="icon-btn mobile-toggle" id="mobile-toggle" aria-label="Toggle sidebar">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+  <a href="../" class="brand" aria-label="goon home">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+    </svg>
+    <span>goon</span>
+    <span class="tag">docs · v0.1</span>
+  </a>
+  <div class="spacer"></div>
+  <div class="search">
+    <svg class="icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+    <input id="doc-search" type="search" placeholder="Search the docs…" autocomplete="off" spellcheck="false">
+    <kbd class="kbd-hint">/</kbd>
+  </div>
+  <a class="pill-link" href="../#install" title="Install goon">Install</a>
+  <a class="pill-link" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener" title="GitHub">GitHub</a>
+  <a class="pill-link" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener" title="GitHub">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.68 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.3-.51-1.5.11-3.12 0 0 .97-.31 3.19 1.18.92-.26 1.9-.39 2.88-.4.98.01 1.96.14 2.88.4 2.22-1.49 3.19-1.18 3.19-1.18.62 1.62.23 2.82.11 3.12.73.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.4-5.25 5.69.41.35.77 1.05.77 2.12v3.14c0 .31.21.68.8.56C20.21 21.39 23.5 17.07 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+  </a>
+  <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+    <svg id="theme-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+  </button>
+</header>
+
+<div class="shell">
+
+<aside class="left" id="sidebar">
+  <nav class="toc">
+    <div class="toc-search">
+      <svg class="icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+      <input id="toc-filter" type="search" placeholder="Filter sections…" autocomplete="off">
+    </div>
+    <div class="group-label">Get started</div>
+    <ol>
+      <li><a href="#what"><span class="toc-num">1</span>What is goon</a></li>
+      <li><a href="#quickstart"><span class="toc-num">2</span>Quick start</a></li>
+      <li><a href="#config"><span class="toc-num">3</span>Configuration</a></li>
+      <li><a href="#commands"><span class="toc-num">4</span>Commands</a></li>
+    </ol>
+    <div class="group-label">Guides</div>
+    <ol>
+      <li><a href="#workflow"><span class="toc-num">5</span>The autonomous workflow</a></li>
+      <li><a href="#approval"><span class="toc-num">6</span>Approval gates</a></li>
+      <li><a href="#memory"><span class="toc-num">7</span>Memory</a></li>
+      <li><a href="#telegram"><span class="toc-num">8</span>Telegram bot</a></li>
+      <li><a href="#customize"><span class="toc-num">9</span>Customize the pipeline</a></li>
+    </ol>
+    <div class="group-label">Reference</div>
+    <ol>
+      <li><a href="#tools"><span class="toc-num">10</span>Tools shipped</a></li>
+      <li><a href="#providers"><span class="toc-num">11</span>LLM providers</a></li>
+      <li><a href="#safety"><span class="toc-num">12</span>Safety model</a></li>
+      <li><a href="#troubleshoot"><span class="toc-num">13</span>Troubleshooting</a></li>
+      <li><a href="#faq"><span class="toc-num">14</span>FAQ</a></li>
+    </ol>
+  </nav>
+</aside>
+
+<main class="content"><!-- gitbook-style: 3-column shell, content max-width comes from .content -->
+
+<div class="crumb"><a href="../">goon</a> / <span>Documentation</span></div>
+<h1 class="page-title">goon documentation</h1>
+<p class="page-blurb">Everything you need to run goon — quick start, configuration knobs, the autonomous workflow, customization, and the safety model. Use the search box (or hit <kbd>/</kbd>) to jump anywhere.</p>
+
+
+<section id="what">
+  <h2><span class="num">1</span>What is goon</h2>
+  <p>
+    <strong>goon</strong> is an autonomous AI engineer in a single Go binary.
+    It can act as a one-shot CLI agent (you ask, it executes) or run as a
+    background daemon that polls a ticket board (Jira / GitHub Issues), plans
+    each ticket, asks you to approve, codes it, tests, verifies, updates its
+    own memory, and opens a PR.
+  </p>
+  <p>You can drive it from three places, all backed by the same memory store:</p>
+  <ul>
+    <li><strong>CLI</strong> — <code>goon "task"</code>, <code>goon start</code>, <code>goon train</code>, etc.</li>
+    <li><strong>Web UI</strong> — when you run <code>goon start</code>, a dashboard at <code>/app</code> mirrors every CLI command.</li>
+    <li><strong>Telegram bot</strong> — DM your bot to monitor, approve, review PRs, or chat with the model.</li>
+  </ul>
+  <h3>Why goon is different</h3>
+  <ul>
+    <li><strong>Single binary, zero deps.</strong> Go stdlib only. Drop the binary anywhere, run.</li>
+    <li><strong>Pluggable everything.</strong> LLM (OpenAI, Anthropic, Ollama, mock), board (Jira, GitHub), git host (GitHub, GitLab, Bitbucket).</li>
+    <li><strong>Safe by default.</strong> Strict-JSON tool contract, regex blocklist on every shell command, approval gates before code lands.</li>
+    <li><strong>Persistent memory.</strong> Markdown notes the agent reads and writes across runs.</li>
+  </ul>
+</section>
+
+<section id="quickstart">
+  <h2><span class="num">2</span>Quick start</h2>
+  <p>Pick the path that matches how you want to use goon. All paths share the same setup steps; only the env vars differ.</p>
+
+  <div class="grid">
+    <div class="card">
+      <h4>Path A — Offline test</h4>
+      <p class="small">No keys, no network. See the agent loop work.</p>
+      <pre><code>GOON_LLM_PROVIDER=mock \
+GOON_MOCK_REPLIES='{"tool":"finish","args":{"message":"hello"}}' \
+goon "say hi"</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path B — One-shot CLI agent</h4>
+      <p class="small">Use goon as a personal assistant for ad-hoc tasks.</p>
+      <pre><code>goon config set GOON_LLM_PROVIDER openai
+goon config set OPENAI_API_KEY sk-...
+goon "tidy go.mod" --explain</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path C — Autonomous daemon</h4>
+      <p class="small">Polls a board, asks approval, files PRs.</p>
+      <pre><code>goon config set GOON_BOARD jira
+goon config set GOON_GIT_HOST github
+goon config set ATLASSIAN_BASE_URL https://acme.atlassian.net
+goon config set ATLASSIAN_EMAIL me@acme.com
+goon config set ATLASSIAN_API_TOKEN ...
+goon config set GITHUB_TOKEN ghp_...
+goon start --web=:8080</code></pre>
+    </div>
+    <div class="card">
+      <h4>Path D — Telegram bot</h4>
+      <p class="small">Drive goon from your phone.</p>
+      <pre><code>goon config set TELEGRAM_BOT_TOKEN ...
+goon config set GOON_TELEGRAM_SECRET <random-phrase>
+goon start
+# DM /auth &lt;random-phrase&gt; to your bot</code></pre>
+    </div>
+  </div>
+
+  <h3>Verify your setup</h3>
+  <p><code>goon doctor</code> live-probes every configured provider. Anything red is missing creds — fix in <code>.env</code> and re-run.</p>
+  <pre><code>goon doctor</code></pre>
+</section>
+
+<section id="config">
+  <h2><span class="num">3</span>Configuration</h2>
+  <p>
+    All knobs are environment variables (or <code>.env</code>). The config file
+    lives at <code>~/.config/goon/.env</code>. Manage it with the
+    <code>config</code> subcommand:
+  </p>
+  <pre><code>goon config              # show all (secrets masked)
+goon config set KEY VAL  # KEY=VAL also works
+goon config get KEY
+goon config edit         # open in $EDITOR
+goon config path         # print the config file path</code></pre>
+  <p class="small">Values exported in your shell always win over the file. <code>goon config show</code> labels each row <code>[shell]</code>, <code>[config-file]</code>, <code>[default]</code>, or <code>[unset]</code>.</p>
+
+  <h3>Tier 1 — LLM provider <span class="pill acc">required</span></h3>
+  <table>
+    <tr><th>Provider</th><th>Switch</th><th>Required env vars</th></tr>
+    <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>OPENAI_API_KEY</code></td></tr>
+    <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>ANTHROPIC_API_KEY</code></td></tr>
+    <tr><td>Gemini</td><td><code>GOON_LLM_PROVIDER=gemini</code></td><td><code>GEMINI_API_KEY</code> (or <code>GOOGLE_API_KEY</code>)</td></tr>
+    <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td>just run <code>ollama serve</code> + <code>ollama pull llama3</code></td></tr>
+    <tr><td>Mock (offline)</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td><code>GOON_MOCK_REPLIES</code> (canned JSON)</td></tr>
+  </table>
+
+  <h3>Tier 2 — Autonomous daemon <span class="pill warn">required for goon start</span></h3>
+  <table>
+    <tr><th>Variable</th><th>Purpose</th></tr>
+    <tr><td><code>GOON_BOARD</code></td><td><code>jira</code> | <code>github</code> | <code>mock</code></td></tr>
+    <tr><td><code>GOON_GIT_HOST</code></td><td><code>github</code> | <code>gitlab</code> | <code>bitbucket</code> (optional — skips PR if unset)</td></tr>
+    <tr><td><code>GOON_AUTO_APPROVE</code></td><td><code>1</code> to skip the approval gates (fully unattended)</td></tr>
+    <tr><td><code>GOON_POLL_SECONDS</code></td><td>poll interval, default <code>300</code> (5 min)</td></tr>
+    <tr><td><code>GOON_VERIFY_RUNS</code></td><td>extra verify passes before PR, default <code>3</code></td></tr>
+    <tr><td><code>GOON_REPO_MAP</code></td><td>map board project to local clone, e.g. <code>ENG=/repos/eng,*=/repos/default</code></td></tr>
+  </table>
+
+  <h3>Atlassian (Jira board + Confluence tool)</h3>
+  <p class="small">Both products share an Atlassian Account. Set these three and Jira+Confluence both work; per-product overrides win when set.</p>
+  <pre><code>ATLASSIAN_BASE_URL=https://acme.atlassian.net
+ATLASSIAN_EMAIL=me@acme.com
+ATLASSIAN_API_TOKEN=...   # id.atlassian.com/manage-profile/security/api-tokens</code></pre>
+
+  <h3>GitHub (board + PR host)</h3>
+  <pre><code>GITHUB_TOKEN=ghp_...        # repo + issues + pull_requests scopes
+GITHUB_REPOS=owner/a,owner/b   # required when GOON_BOARD=github
+GITHUB_LABEL=                  # filter to issues with this label (optional)
+GITHUB_ASSIGNEE=@me            # default @me</code></pre>
+
+  <h3>Bitbucket Cloud (PR host)</h3>
+  <p class="small">Auth is SEPARATE from your Atlassian API token — generate an app password at <a href="https://bitbucket.org/account/settings/app-passwords" target="_blank" rel="noopener">bitbucket.org/account/settings/app-passwords</a>.</p>
+  <pre><code>BITBUCKET_USERNAME=me@acme.com
+BITBUCKET_APP_PASSWORD=...
+# OR a workspace/repo access token:
+BITBUCKET_TOKEN=...</code></pre>
+
+  <h3>Telegram bot</h3>
+  <pre><code>TELEGRAM_BOT_TOKEN=123:abc           # from @BotFather
+GOON_TELEGRAM_SECRET=long-phrase     # required for inbound bot
+TELEGRAM_CHAT_ID=                    # default chat for outbound notify
+GOON_REVIEW_REPOS=owner/a,owner/b    # default repos for /prs</code></pre>
+
+  <h3>Storage layout</h3>
+  <p class="small">Per-project state under <code>./storage/</code>. Each working directory gets self-contained state you can <code>.gitignore</code>.</p>
+  <pre><code>./storage/
+├── memory.json        passive runtime state
+├── memory/            active markdown notes (PINNED.md, …)
+├── logs/goon.log      rotated structured log
+└── goon.pid           present while daemon runs</code></pre>
+  <p class="small">Override the root with <code>GOON_STORAGE_DIR</code> to share state across repos.</p>
+</section>
+
+<section id="commands">
+  <h2><span class="num">4</span>Commands</h2>
+  <table>
+    <tr><th>Command</th><th>Purpose</th></tr>
+    <tr><td><code>goon "&lt;task&gt;"</code></td><td>One-shot agent run. Add <code>--explain</code> / <code>--run</code> / <code>--auto</code>.</td></tr>
+    <tr><td><code>goon start</code></td><td>Autonomous daemon. <code>--web=:8080</code> opens this UI; <code>--once</code> runs one cycle.</td></tr>
+    <tr><td><code>goon stop</code></td><td>Stop the running daemon.</td></tr>
+    <tr><td><code>goon status</code></td><td>Daemon + queue snapshot.</td></tr>
+    <tr><td><code>goon doctor</code></td><td>Live-probe every configured provider. Add <code>--json</code> for machine-readable.</td></tr>
+    <tr><td><code>goon train</code></td><td>Answer questions queued by the agent (interactive).</td></tr>
+    <tr><td><code>goon train answer &lt;id&gt; &lt;text&gt;</code></td><td>Non-interactive answer.</td></tr>
+    <tr><td><code>goon workflow show|init|edit|hooks</code></td><td>Customize the per-ticket pipeline.</td></tr>
+    <tr><td><code>goon memory list|read|write|append|search|edit|delete|path</code></td><td>Manage the markdown notes store.</td></tr>
+    <tr><td><code>goon logs --tail|--follow|--clear|--path</code></td><td>Browse the structured log file.</td></tr>
+    <tr><td><code>goon config show|get|set|unset|path|edit</code></td><td>Manage <code>~/.config/goon/.env</code>.</td></tr>
+    <tr><td><code>goon update [&lt;ref&gt;]</code></td><td>Rebuild from upstream. Requires <code>git</code> and <code>go</code> on PATH.</td></tr>
+    <tr><td><code>goon uninstall [--yes] [--purge]</code></td><td>Remove the binary; <code>--purge</code> wipes state too.</td></tr>
+    <tr><td><code>goon pause | resume</code></td><td>Toggle the daemon's poll loop without killing the process. Same flag readable by web UI + Telegram <code>/pause</code> /<code>/resume</code>.</td></tr>
+    <tr><td><code>goon repo list|forget &lt;project&gt;|clear</code></td><td>Manage learned project→repo mappings (the cache populated by the confirm_repo gate).</td></tr>
+    <tr><td><code>goon version</code></td><td>Print version + commit + build date + Go runtime info.</td></tr>
+  </table>
+
+  <h3>Modes (for one-shot agent runs)</h3>
+  <table>
+    <tr><th>Flag</th><th>Behavior</th></tr>
+    <tr><td>(none)</td><td><strong>dry-run</strong> — prints planned actions, never executes</td></tr>
+    <tr><td><code>--explain</code></td><td>plan only — produce a step-by-step explanation</td></tr>
+    <tr><td><code>--run</code></td><td>execute, ask <kbd>y</kbd>/<kbd>N</kbd> before each mutating step</td></tr>
+    <tr><td><code>--auto</code></td><td>execute every validated step automatically</td></tr>
+    <tr><td><code>--debug</code></td><td>extra diagnostic output</td></tr>
+  </table>
+</section>
+
+<section id="workflow">
+  <h2><span class="num">5</span>The autonomous workflow</h2>
+  <p>When <code>goon start</code> picks up a ticket from the board, it runs this resumable pipeline:</p>
+  <pre><code>1. Triage          LLM produces an ordered plan + suggested repo
+2. Confirm repo  ◀ gate: "Confirm repo for ENG-123? (yes / change=&lt;path&gt; / no)"
+3. Approve plan  ◀ gate: "Approve work + test plan?  (yes / no)"
+4. Execute         agent runs each plan step, safety-validated
+5. Test            best-effort `make test` (or repo-defined test command)
+6. Verify × N      LLM re-checks the work N times (default 3)
+7. Update memory   agent distils learnings into PINNED.md / topic notes
+8. Open PR         GitHub / GitLab / Bitbucket
+9. Notify          Telegram + board comment + status transition</code></pre>
+  <p>The pipeline is a <strong>resumable state machine</strong>. When a gate fires, the workflow queues a question and exits; the daemon picks the workflow up again on a later tick once you reply.</p>
+  <p>Set <code>GOON_AUTO_APPROVE=1</code> or <code>auto_approve: true</code> in <code>workflow.json</code> to skip the gates entirely for fully unattended runs.</p>
+</section>
+
+<section id="approval">
+  <h2><span class="num">6</span>Approval gates</h2>
+  <p>Two gates fire by default before any code lands:</p>
+  <h4>confirm_repo</h4>
+  <p>After triage, goon proposes a target repo and asks you to confirm. Reply with <code>yes</code> to accept, or <code>change=/path/to/repo</code> to override.</p>
+  <h4>approve_plan</h4>
+  <p>After repo confirmation, goon shows the numbered plan it produced and asks you to approve. Reply <code>yes</code> to proceed, <code>no</code> to abort.</p>
+  <h3>How to answer</h3>
+  <p>Three equivalent ways:</p>
+  <ul>
+    <li><strong>This web UI</strong> — pending questions appear on the dashboard. Click <em>Answer</em>.</li>
+    <li><strong>CLI</strong> — <code>goon train</code> walks you through pending questions, or <code>goon train answer &lt;id&gt; &lt;text&gt;</code> for non-interactive use.</li>
+    <li><strong>Telegram</strong> — <code>/queue</code> to see what's pending, <code>/answer &lt;id&gt; yes</code> to approve.</li>
+  </ul>
+  <h3>Reply formats</h3>
+  <ul>
+    <li><strong>confirm_repo:</strong> <code>yes</code>, <code>change=/path/to/repo</code>, or <code>no</code> (aborts).</li>
+    <li><strong>approve_plan:</strong> <code>yes</code> to proceed, <code>no</code> or any feedback (e.g. <code>"refactor the auth helper first"</code>) to <strong>re-plan</strong>. The feedback is woven into the next triage prompt so the model knows what to change. Capped at 3 rejections before the workflow gives up — prevents infinite re-plan loops.</li>
+  </ul>
+  <blockquote class="warn">
+    A <code>no</code> at <code>confirm_repo</code> permanently fails the workflow
+    (the ticket is marked failed in <code>memory.json</code>; no PR opened, no
+    board transition). At <code>approve_plan</code>, only the 4th rejection
+    fails — the first three trigger a re-plan.
+  </blockquote>
+</section>
+
+<section id="memory">
+  <h2><span class="num">7</span>Memory</h2>
+  <p>goon has two memory layers that serve different jobs.</p>
+
+  <h3>Passive memory (<code>memory.json</code>)</h3>
+  <p class="small">Runtime state. Don't edit by hand — goon manages it.</p>
+  <p>Holds:</p>
+  <ul>
+    <li>Last 200 interactions and a per-command frequency counter</li>
+    <li>Tickets the daemon has seen</li>
+    <li>Workflow records (with state, stage, plan, approvals, PR URL)</li>
+    <li>The question queue (asked, answered, pending)</li>
+    <li>Daemon status snapshot</li>
+    <li>Authorized Telegram chat IDs</li>
+  </ul>
+
+  <h3>Active memory (markdown notes)</h3>
+  <p class="small">Plain <code>.md</code> files at <code>./storage/memory/</code>. The agent reads + writes them via tool calls. Knowledge survives across runs and any LLM provider can use them — they're just markdown.</p>
+  <pre><code>goon memory init               # creates the dir + seeds PINNED.md
+goon memory list               # * = auto-loaded
+goon memory edit PINNED.md
+goon memory read learnings/regex.md
+goon memory search "auth"      # case-insensitive grep</code></pre>
+  <h4>Five tools the agent gets automatically</h4>
+  <table>
+    <tr><th>Tool</th><th>Purpose</th></tr>
+    <tr><td><code>memory_list</code></td><td>enumerate every note</td></tr>
+    <tr><td><code>memory_read</code></td><td>fetch one note's contents</td></tr>
+    <tr><td><code>memory_write</code></td><td>create or REPLACE a note</td></tr>
+    <tr><td><code>memory_append</code></td><td>add to an existing note (preferred)</td></tr>
+    <tr><td><code>memory_search</code></td><td>case-insensitive substring scan</td></tr>
+  </table>
+  <h4>PINNED.md — the always-loaded note</h4>
+  <p>When <code>./storage/memory/PINNED.md</code> exists, its contents are injected into the agent's system prompt on every call. Use it for facts that should always be top-of-mind: codebase conventions, names of services/people, "don't do this" rules. Keep it short and high-signal.</p>
+</section>
+
+<section id="telegram">
+  <h2><span class="num">8</span>Telegram bot</h2>
+  <p>A bidirectional bot — sends notifications <em>and</em> lets you drive goon from your phone.</p>
+  <h3>Setup</h3>
+  <ol>
+    <li>Open Telegram, message <strong>@BotFather</strong>, send <code>/newbot</code>, copy the token.</li>
+    <li>Add to <code>.env</code>:
+      <pre><code>TELEGRAM_BOT_TOKEN=123456:abc-from-botfather
+GOON_TELEGRAM_SECRET=any-random-phrase-you-pick
+GOON_REVIEW_REPOS=owner/a,owner/b   # optional</code></pre>
+    </li>
+    <li>Restart goon: <code>goon stop && goon start</code></li>
+    <li>DM your bot: <code>/auth any-random-phrase-you-pick</code></li>
+  </ol>
+  <p>The bot publishes its full command list to Telegram's menu — tap the ☰ button next to the input bar after authentication.</p>
+  <h3>Commands</h3>
+  <table>
+    <tr><th>Group</th><th>Commands</th></tr>
+    <tr><td>monitor</td><td><code>/status</code> · <code>/logs [n]</code> · <code>/workflows [n]</code> · <code>/tickets [filter]</code> · <code>/ticket &lt;id&gt;</code> · <code>/memory list|read|search</code></td></tr>
+    <tr><td>daemon control</td><td><code>/pause</code> · <code>/resume</code> (toggles the same flag <code>goon pause</code> writes; bot itself stays responsive)</td></tr>
+    <tr><td>queue</td><td><code>/queue</code> · <code>/answer &lt;id&gt; &lt;text&gt;</code></td></tr>
+    <tr><td>PR review</td><td><code>/prs [repo]</code> · <code>/review &lt;repo&gt; &lt;num&gt;</code> · <code>/approve</code> · <code>/decline</code> · <code>/comment</code></td></tr>
+    <tr><td>agent</td><td><code>/run &lt;task&gt;</code> · plain text → LLM chat (6-turn history)</td></tr>
+    <tr><td>session</td><td><code>/whoami</code> · <code>/logout</code> · <code>/help</code></td></tr>
+    <tr><td>passthrough</td><td>any other <code>/&lt;subcmd&gt;</code> shells out to <code>goon &lt;subcmd&gt;</code></td></tr>
+  </table>
+  <p class="small">Disallowed: <code>/start</code>, <code>/stop</code>, <code>/uninstall</code>, <code>/update</code>.</p>
+  <h3>Typical session</h3>
+  <pre><code>you →  /queue
+bot →  1 pending: [q-3] Approve work + test plan for ENG-42?
+you →  /answer q-3 yes
+bot →  ✓ answered q-3   (daemon resumes ENG-42 next poll)
+you →  /prs
+bot →  3 open PRs: …
+you →  /review owner/repo 17
+bot →  Review of #17 — Refactor auth …
+       SUMMARY / RISKS / NITS / RECOMMENDATION
+you →  /decline owner/repo 17 needs error handling on token refresh
+bot →  ✓ requested changes</code></pre>
+</section>
+
+<section id="customize">
+  <h2><span class="num">9</span>Customize the pipeline</h2>
+  <p>Drop a <code>workflow.json</code> in your repo root and goon picks it up on the next poll — no rebuild, no restart.</p>
+  <pre><code>goon workflow init     # writes a starter ./workflow.json
+goon workflow show     # prints the resolved config
+goon workflow edit     # open in $EDITOR
+goon workflow hooks    # list every hook name + env vars</code></pre>
+  <h3>Minimal example</h3>
+  <pre><code>{
+  "version": 1,
+  "name": "engineering-prod",
+  "branch_prefix": "feature/",
+  "test_command": "make ci",
+  "verify_runs": 5,
+  "auto_approve": false,
+  "pr_title_template": "FIX({{.Key}}): {{.Title}}",
+  "pr_body_template": "Resolves {{.Key}}\n\nBranch: {{.Branch}}",
+  "extra_labels": ["customer-x"],
+  "hooks": {
+    "before_execute": ["echo 'goon picked up {{.Key}}'"],
+    "before_test":    ["make build"],
+    "before_pr":      ["go fmt ./...", "goimports -w ."],
+    "on_failure":     ["echo \"goon failed on $TICKET_KEY\" | mail -s goon you@x"]
+  }
+}</code></pre>
+  <p>Hook commands run sequentially through <code>sh -c</code> in the repo dir, with ticket env vars exported (<code>$TICKET_KEY</code>, <code>$TICKET_URL</code>, <code>$REPO</code>, <code>$BRANCH</code>, etc.) and Go-template substitution inside the command itself. Failed hooks fail the workflow phase. <code>on_failure</code> is best-effort.</p>
+  <h3>Replace the pipeline (declarative stages)</h3>
+  <p>For non-engineering work — marketing, sales, ops — you can replace the built-in pipeline wholesale with a <code>stages</code> array:</p>
+  <pre><code>{
+  "version": 2,
+  "stages": [
+    {"name": "triage",  "type": "llm",   "json_mode": true,
+     "prompt": "Break {{.Key}} into 3-7 atomic steps. Reply JSON {\"steps\":[{\"title\":\"...\"}]}."},
+    {"name": "execute", "type": "agent",
+     "task": "Implement: {{(index (index .Stages.triage.steps 0) \"title\")}}"},
+    {"name": "verify",  "type": "agent", "repeat": 3,
+     "task": "Verify {{.Key}} is done. List defects via finish."}
+  ]
+}</code></pre>
+  <p>Stage types are <code>llm</code> or <code>agent</code>. Each stage's output is available to later stages via <code>{{.Stages.&lt;name&gt;.field}}</code>.</p>
+</section>
+
+<section id="tools">
+  <h2><span class="num">10</span>Tools shipped</h2>
+  <p>The agent picks tools by name from this manifest each turn:</p>
+  <table>
+    <tr><th>Tool</th><th>Purpose</th></tr>
+    <tr><td><code>run_command</code></td><td>shell command (safety-validated)</td></tr>
+    <tr><td><code>read_file</code></td><td>up to 64KB</td></tr>
+    <tr><td><code>list_dir</code></td><td>up to 100 entries</td></tr>
+    <tr><td><code>confluence</code></td><td>search/get pages (Atlassian Cloud)</td></tr>
+    <tr><td><code>telegram</code></td><td>send a message via Bot API</td></tr>
+    <tr><td><code>ask_user</code></td><td>queue a question for the user (daemon mode)</td></tr>
+    <tr><td><code>memory_*</code></td><td>five tools for the markdown notes store</td></tr>
+    <tr><td><code>finish</code></td><td>end the loop with a summary</td></tr>
+  </table>
+  <h3>The model contract</h3>
+  <p>The LLM must emit exactly one JSON object per turn:</p>
+  <pre><code>{
+  "tool": "run_command",
+  "args": { "command": "ls -la internal" },
+  "rationale": "list packages before reading"
+}</code></pre>
+  <p>Parse errors are fed back to the model so it self-corrects. Unknown tool names are rejected.</p>
+</section>
+
+<section id="providers">
+  <h2><span class="num">11</span>LLM providers</h2>
+  <table>
+    <tr><th>Provider</th><th>Switch</th><th>Default model</th></tr>
+    <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>gpt-4o-mini</code></td></tr>
+    <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>claude-sonnet-4-5</code></td></tr>
+    <tr><td>Gemini</td><td><code>GOON_LLM_PROVIDER=gemini</code></td><td><code>gemini-2.5-flash</code></td></tr>
+    <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td><code>llama3</code></td></tr>
+    <tr><td>Mock</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td>(offline fixtures)</td></tr>
+  </table>
+  <p>For Ollama, install from <a href="https://ollama.com" target="_blank" rel="noopener">ollama.com</a>, then:</p>
+  <pre><code>ollama serve
+ollama pull qwen2.5-coder:7b      # or llama3 / mistral
+goon config set GOON_LLM_PROVIDER ollama
+goon config set OLLAMA_MODEL qwen2.5-coder:7b</code></pre>
+  <p>Internally goon posts to <code>http://localhost:11434/api/chat</code> with <code>format=json</code> so the model is forced into the strict-JSON tool-call contract.</p>
+</section>
+
+<section id="safety">
+  <h2><span class="num">12</span>Safety model</h2>
+  <p>Three layers — each independent, all must pass.</p>
+  <h4>1. The strict-JSON contract</h4>
+  <p>Every model output must parse as a <code>ToolCall</code>. Bad JSON is fed back as a parse error so the model self-corrects.</p>
+  <h4>2. The regex blocklist</h4>
+  <p><code>internal/safety</code> blocks the most dangerous patterns regardless of mode: <code>rm -rf /</code>, <code>rm -rf ~</code>, <code>mkfs.*</code>, <code>dd of=/dev/*</code>, fork bombs, <code>shutdown</code>/<code>reboot</code>/<code>halt</code>, <code>chmod -R 777 /</code>, <code>curl … | sh</code>. Hooks go through the same validator.</p>
+  <h4>3. Mode-aware execution</h4>
+  <p>In <code>--run</code> mode the executor asks <kbd>y</kbd>/<kbd>N</kbd> before any mutating tool call. Default mode is dry-run — prints what would happen, never executes.</p>
+  <h4>4. Approval gates</h4>
+  <p>In daemon mode, no code lands without <code>confirm_repo</code> + <code>approve_plan</code> approval (unless you set <code>GOON_AUTO_APPROVE=1</code>).</p>
+</section>
+
+<section id="troubleshoot">
+  <h2><span class="num">13</span>Troubleshooting</h2>
+
+  <details>
+    <summary>"goon doctor" all green but the daemon never opens a PR</summary>
+    <p>Check that <code>GOON_GIT_HOST</code> is set. <code>doctor</code> reports "skipped" (not red) when it's missing. Set the var, supply matching auth (e.g. <code>GITHUB_TOKEN</code>), restart.</p>
+  </details>
+
+  <details>
+    <summary>"goon start" prints "waiting for config" forever</summary>
+    <p>The daemon needs <code>GOON_LLM_PROVIDER</code> AND <code>GOON_BOARD</code> at minimum. Run <code>goon doctor</code>; anything red is missing creds.</p>
+  </details>
+
+  <details>
+    <summary>The daemon stops at "awaiting approval" and never resumes</summary>
+    <p>That's a gate firing. Answer the question via this web UI's queue panel, or <code>goon train</code>, or your Telegram bot's <code>/answer</code>. The daemon resumes on the next poll cycle (default 5 min — set <code>GOON_POLL_SECONDS=30</code> for faster feedback during testing).</p>
+  </details>
+
+  <details>
+    <summary>Telegram bot says "PR review unavailable" or "not yet implemented"</summary>
+    <p>The first means <code>GOON_GIT_HOST</code> isn't set. The second means the configured host's adapter doesn't support review yet — currently only <strong>github</strong> and <strong>bitbucket</strong> do; gitlab is read-only.</p>
+  </details>
+
+  <details>
+    <summary>Telegram bot accepts /auth but no commands appear in the menu</summary>
+    <p>Telegram caches the menu briefly per client. Close and reopen the chat. The bot logs <code>→ telegram bot: 16 commands registered in menu</code> at startup if registration succeeded.</p>
+  </details>
+
+  <details>
+    <summary>"goon train" shows no questions but the workflow paused</summary>
+    <p><code>goon train --all</code> shows answered + pending; <code>goon train</code> only shows pending. If both are empty, the workflow may have failed before queueing — check <code>goon logs --tail=50</code>.</p>
+  </details>
+
+  <details>
+    <summary>Want faster feedback during testing</summary>
+    <pre><code>GOON_POLL_SECONDS=15 GOON_VERIFY_RUNS=1 GOON_AUTO_APPROVE=1 goon start</code></pre>
+    <p>Tight poll interval, single verify pass, no approval gates. Don't ship like this.</p>
+  </details>
+
+  <details>
+    <summary>How to wipe everything and start fresh</summary>
+    <pre><code>goon stop
+rm -rf ./storage          # clears state for THIS project only
+# OR for global clean:
+rm -rf ~/.config/goon
+goon uninstall --yes --purge   # also removes the binary</code></pre>
+  </details>
+</section>
+
+<section id="faq">
+  <h2><span class="num">14</span>FAQ</h2>
+
+  <h4>Does goon work on Windows?</h4>
+  <p>Yes — both CLI one-shot mode and daemon mode are supported on Windows alongside Linux and macOS. Workflow hooks and <code>run_command</code> use <code>cmd /C</code> on Windows and <code>sh -c</code> on POSIX, so cross-platform hook scripts should either stick to commands both shells understand or branch on the platform inside the hook. The same multi-process <code>memory.json</code> caveat applies on every OS: a sibling lockfile coordinates writes, and on filesystems that don't support atomic file creation reliably (some network mounts) you may see a "lockfile held by another process" warning. WSL also works fine if you prefer a POSIX environment.</p>
+
+  <h4>Can I run goon without an LLM API key?</h4>
+  <p>Yes — use Ollama for local models, or the <code>mock</code> provider for offline testing. Both are zero-cost.</p>
+
+  <h4>How does goon decide which repo to work on?</h4>
+  <p>By <code>GOON_REPO_MAP</code> (mapping board project keys to local paths) or by the ticket's project field. The <code>confirm_repo</code> gate gives you a chance to override before any code is written.</p>
+
+  <h4>What does goon write to memory.json that I should know about?</h4>
+  <p>Tickets seen, workflow records (state + plan + approvals + PR URL), the question queue, daemon status snapshot, and authorized Telegram chat IDs. No source code, no secrets — secrets stay in <code>.env</code>, never in <code>memory.json</code>.</p>
+
+  <h4>Can I share state across projects?</h4>
+  <p>Yes — set <code>GOON_STORAGE_DIR=~/.goon-state</code> to a shared path. Default is per-project (<code>./storage/</code>) so each repo gets clean state.</p>
+
+  <h4>What if the LLM hallucinates a tool call?</h4>
+  <p>It's rejected (the agent loop validates against the registered tool list and feeds the error back). After max steps without a valid call, the agent surrenders with a "max steps reached" message rather than executing anything random.</p>
+
+  <h4>How do I add a new tool?</h4>
+  <p>Implement <code>tools.Tool</code> and register in <code>DefaultRegistry</code>. The model picks it up automatically through the manifest line in the system prompt.</p>
+
+  <h4>How do I add a new LLM provider?</h4>
+  <p>Implement <code>llm.Provider</code> and route in <code>llm.NewFromEnv</code>. The agent loop is provider-agnostic.</p>
+
+  <h4>How do I add a new git host (e.g. Gitea)?</h4>
+  <p>Implement <code>githost.Host</code> and route in <code>githost.NewFromEnv</code>. To enable PR review via the Telegram bot, also implement the <code>githost.PRReviewer</code> companion interface.</p>
+</section>
+
+<hr>
+<p class="small">Documentation embedded in the goon binary · for the latest source, see <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">github.com/harisaginting/goon</a></p>
+
+</main>
+
+<aside class="right">
+  <div class="rail-label">On this page</div>
+  <ol class="rail" id="page-outline"></ol>
+</aside>
+
+</div><!-- /shell -->
+
+<script>
+(function() {
+  // ---------- theme toggle ----------
+  // Saved preference in localStorage; falls back to OS preference.
+  const root = document.documentElement;
+  const applyTheme = (t) => {
+    if (t === 'auto' || !t) { root.removeAttribute('data-theme'); return; }
+    root.setAttribute('data-theme', t);
+  };
+  try { applyTheme(localStorage.getItem('goonDocsTheme')); } catch (_) {}
+  document.getElementById('theme-toggle').addEventListener('click', () => {
+    const current = root.getAttribute('data-theme');
+    // cycle: auto -> light -> dark -> auto
+    const next = !current ? 'light' : (current === 'light' ? 'dark' : 'auto');
+    applyTheme(next);
+    try { localStorage.setItem('goonDocsTheme', next); } catch (_) {}
+  });
+
+  // ---------- mobile sidebar ----------
+  const sidebar = document.getElementById('sidebar');
+  document.getElementById('mobile-toggle').addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+  });
+  // Auto-close on link click (mobile).
+  sidebar.addEventListener('click', (e) => {
+    if (e.target.closest('a')) sidebar.classList.remove('open');
+  });
+
+  // ---------- left TOC filter ----------
+  const filterInput = document.getElementById('toc-filter');
+  filterInput.addEventListener('input', () => {
+    const q = filterInput.value.trim().toLowerCase();
+    sidebar.querySelectorAll('nav.toc li').forEach((li) => {
+      const text = li.textContent.toLowerCase();
+      li.classList.toggle('hidden', q !== '' && !text.includes(q));
+    });
+  });
+
+  // ---------- top search: jumps to first matching section ----------
+  const search = document.getElementById('doc-search');
+  const sections = Array.from(document.querySelectorAll('main.content section'));
+  function findMatch(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return null;
+    // prefer exact h2 match, then h3, then any text.
+    for (const s of sections) {
+      const h2 = s.querySelector('h2');
+      if (h2 && h2.textContent.toLowerCase().includes(q)) return s;
+    }
+    for (const s of sections) {
+      const h3 = s.querySelector('h3');
+      if (h3 && h3.textContent.toLowerCase().includes(q)) return h3.closest('section');
+    }
+    for (const s of sections) {
+      if (s.textContent.toLowerCase().includes(q)) return s;
+    }
+    return null;
+  }
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const hit = findMatch(search.value);
+      if (hit) {
+        history.replaceState(null, '', '#' + hit.id);
+        hit.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    } else if (e.key === 'Escape') {
+      search.value = ''; search.blur();
+    }
+  });
+
+  // '/' focuses search from anywhere.
+  document.addEventListener('keydown', (e) => {
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement.isContentEditable;
+    if (e.key === '/' && !inField) {
+      e.preventDefault(); search.focus(); search.select();
+    }
+  });
+
+  // ---------- copy buttons on <pre> ----------
+  document.querySelectorAll('main.content pre').forEach((pre) => {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'copy-btn'; btn.textContent = 'copy';
+    btn.addEventListener('click', () => {
+      const code = pre.querySelector('code') || pre;
+      const text = code.textContent;
+      try {
+        navigator.clipboard.writeText(text).then(() => {
+          btn.textContent = 'copied'; btn.classList.add('copied');
+          setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1400);
+        });
+      } catch (_) {
+        // Fallback: temporary textarea
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); btn.textContent = 'copied'; } catch (__) {}
+        document.body.removeChild(ta);
+        setTimeout(() => { btn.textContent = 'copy'; }, 1400);
+      }
+    });
+    pre.appendChild(btn);
+  });
+
+  // ---------- right rail: "On this page" outline + scroll-spy ----------
+  // Auto-generated from the current section's h3s, refreshed on hash change.
+  const outline = document.getElementById('page-outline');
+  function buildOutlineFor(section) {
+    if (!section) { outline.innerHTML = ''; return []; }
+    const h3s = Array.from(section.querySelectorAll('h3'));
+    // Give every h3 a stable id so anchor links work.
+    h3s.forEach((h, i) => { if (!h.id) h.id = section.id + '--' + (i+1); });
+    outline.innerHTML = h3s.map((h) =>
+      `<li><a href="#${h.id}" data-anchor="${h.id}">${h.textContent}</a></li>`
+    ).join('');
+    return h3s;
+  }
+  let trackedH3s = [];
+  function currentSection() {
+    // Pick the section closest to the top of the viewport.
+    let best = sections[0], bestTop = -Infinity;
+    for (const s of sections) {
+      const top = s.getBoundingClientRect().top;
+      if (top <= 120 && top > bestTop) { best = s; bestTop = top; }
+    }
+    return best;
+  }
+  function refreshRail() {
+    const sec = currentSection();
+    if (!sec) { trackedH3s = []; return; }
+    if (outline.dataset.section !== sec.id) {
+      trackedH3s = buildOutlineFor(sec);
+      outline.dataset.section = sec.id;
+    }
+    // active link in left TOC
+    document.querySelectorAll('nav.toc a').forEach((a) => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + sec.id);
+    });
+    // active anchor in right rail
+    const y = 140;
+    let active = trackedH3s[0];
+    for (const h of trackedH3s) {
+      if (h.getBoundingClientRect().top <= y) active = h;
+    }
+    document.querySelectorAll('aside.right ol.rail a').forEach((a) => {
+      a.classList.toggle('active', active && a.getAttribute('data-anchor') === active.id);
+    });
+  }
+  let rafScheduled = false;
+  window.addEventListener('scroll', () => {
+    if (rafScheduled) return;
+    rafScheduled = true;
+    requestAnimationFrame(() => { refreshRail(); rafScheduled = false; });
+  }, { passive: true });
+  window.addEventListener('hashchange', refreshRail);
+  refreshRail();
+})();
+</script>
+
+</body>
+</html>

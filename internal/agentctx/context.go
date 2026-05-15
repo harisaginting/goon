@@ -21,6 +21,8 @@ import (
 
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/notes"
+	"github.com/harisaginting/goon/internal/personal"
+	"github.com/harisaginting/goon/internal/skills"
 )
 
 // Build returns the full context — state + knowledge — concatenated.
@@ -30,12 +32,35 @@ import (
 // empty, notes.New("") falls back to $GOON_MEMORY_DIR / storage.
 func Build(mem *memory.Memory, notesDir string) string {
 	var sb strings.Builder
+	// Personal first — character shapes how everything below is
+	// delivered. Always present (the seed defaults guarantee a file
+	// after first boot), but skipped cleanly if the user emptied it.
+	if pb := BuildPersonal(); pb != "" {
+		sb.WriteString(pb)
+		sb.WriteByte('\n')
+	}
 	sb.WriteString(BuildState(mem))
 	if kb := BuildKnowledge(notesDir); kb != "" {
 		sb.WriteByte('\n')
 		sb.WriteString(kb)
 	}
+	if sk := BuildSkills(""); sk != "" {
+		sb.WriteByte('\n')
+		sb.WriteString(sk)
+	}
 	return sb.String()
+}
+
+// BuildPersonal returns the personality block injected into every
+// chat / agent turn. Reads ./storage/personal.md (override via
+// $GOON_PERSONAL_FILE). Empty when the file is missing or all
+// whitespace.
+func BuildPersonal() string {
+	body := personal.Read()
+	if body == "" {
+		return ""
+	}
+	return "GOON CHARACTER (how to talk and decide — always loaded):\n" + body + "\n"
 }
 
 // BuildState renders the live-runtime block from passive memory.
@@ -296,6 +321,140 @@ func ReadNote(notesDir, name string) (string, error) {
 		return "", err
 	}
 	return store.Read(name)
+}
+
+// WriteNote replaces or creates a memory note. Returns the resolved
+// path on success — useful for confirmation messages.
+func WriteNote(notesDir, name, body string) (string, error) {
+	store, err := notes.New(notesDir)
+	if err != nil {
+		return "", err
+	}
+	if err := store.Write(name, body); err != nil {
+		return "", err
+	}
+	p, _ := store.Resolve(name)
+	return p, nil
+}
+
+// DeleteNote removes a memory note. Returns os.ErrNotExist when
+// absent so the caller can render a friendly message.
+func DeleteNote(notesDir, name string) error {
+	store, err := notes.New(notesDir)
+	if err != nil {
+		return err
+	}
+	return store.Delete(name)
+}
+
+// --- Skills (specialist procedures / role definitions) ---------------------
+//
+// Skills are markdown files stored under ./storage/skills/ that
+// codify HOW-tos, roles, and procedures — distinct from memory
+// (which carries facts). They're listed in the GOON STATE block by
+// name + headline so the LLM can ask the user to apply one ("want me
+// to use the writer skill?") but they are NOT auto-injected.
+
+// BuildSkills returns the skills block for the system prompt — a
+// short index of every skill with a one-line headline. Empty when no
+// skills exist (so callers can omit the block cleanly).
+func BuildSkills(skillsDir string) string {
+	store, err := skills.New(skillsDir)
+	if err != nil {
+		return ""
+	}
+	names, err := store.List()
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "[skills: %d available — specialist procedures the user can ask you to apply]\n", len(names))
+	const maxIndex = 30
+	shown := names
+	if len(shown) > maxIndex {
+		shown = shown[:maxIndex]
+	}
+	for _, n := range shown {
+		body, err := store.Read(n)
+		headline := ""
+		if err == nil {
+			for _, line := range strings.SplitN(strings.TrimSpace(body), "\n", 2) {
+				line = strings.TrimSpace(strings.TrimLeft(line, "#- "))
+				if line != "" {
+					headline = snippet(line, 80)
+					break
+				}
+			}
+		}
+		if headline == "" {
+			fmt.Fprintf(&sb, "  %s\n", n)
+		} else {
+			fmt.Fprintf(&sb, "  %s — %s\n", n, headline)
+		}
+	}
+	if len(names) > maxIndex {
+		fmt.Fprintf(&sb, "  …%d more\n", len(names)-maxIndex)
+	}
+	return sb.String()
+}
+
+// SkillsIndex mirrors KnowledgeIndex but for the skills store.
+func SkillsIndex(skillsDir string) []IndexEntry {
+	store, err := skills.New(skillsDir)
+	if err != nil {
+		return nil
+	}
+	names, err := store.List()
+	if err != nil {
+		return nil
+	}
+	out := make([]IndexEntry, 0, len(names))
+	for _, n := range names {
+		entry := IndexEntry{Name: n}
+		body, err := store.Read(n)
+		if err == nil {
+			for _, line := range strings.SplitN(strings.TrimSpace(body), "\n", 2) {
+				line = strings.TrimSpace(strings.TrimLeft(line, "#- "))
+				if line != "" {
+					entry.Headline = snippet(line, 200)
+					break
+				}
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// ReadSkill returns one skill's full body.
+func ReadSkill(skillsDir, name string) (string, error) {
+	store, err := skills.New(skillsDir)
+	if err != nil {
+		return "", err
+	}
+	return store.Read(name)
+}
+
+// WriteSkill creates or replaces a skill.
+func WriteSkill(skillsDir, name, body string) (string, error) {
+	store, err := skills.New(skillsDir)
+	if err != nil {
+		return "", err
+	}
+	if err := store.Write(name, body); err != nil {
+		return "", err
+	}
+	p, _ := store.Resolve(name)
+	return p, nil
+}
+
+// DeleteSkill removes a skill.
+func DeleteSkill(skillsDir, name string) error {
+	store, err := skills.New(skillsDir)
+	if err != nil {
+		return err
+	}
+	return store.Delete(name)
 }
 
 func humanizeAge(d time.Duration) string {

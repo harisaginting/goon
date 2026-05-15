@@ -3,17 +3,15 @@ package telegram
 import (
 	"context"
 	"strings"
-	"time"
 
 	"github.com/harisaginting/goon/internal/agentctx"
 	"github.com/harisaginting/goon/internal/llm"
 )
 
-// chatRefreshStale controls when handleChat auto-pulls a fresh board
-// snapshot before answering. Tuned to half the default poll interval
-// so the user's typical question hits live data, not 5-minute-old
-// cache, without slamming the board API on every chat turn.
-const chatRefreshStale = 2 * time.Minute
+// The chat now runs through agentctx.ChatTurn, an LLM↔tool loop that
+// lets the model invoke a live jira_search call when it needs data
+// the GOON STATE block doesn't already contain. No more "refresh the
+// cache first" — the agent decides what (if anything) to query.
 
 // chatSystemPrompt is the persona for plain-text Telegram chat. It is
 // deliberately short and steers the model away from hallucinating tool
@@ -26,70 +24,55 @@ const chatRefreshStale = 2 * time.Minute
 // "what's pending" without making things up.
 const chatSystemPrompt = `You are GOON, an autonomous engineering co-pilot reachable over Telegram.
 
-# STRICT GROUNDING RULES — FOLLOW EXACTLY
+# HOW TO ANSWER
 
-1. The "GOON STATE" message that follows this one is the ONLY source
-   of truth about tickets, workflows, pending questions, daemon
-   status, and stored knowledge notes. You have NO other access to
-   Jira, GitHub, the user's repos, or the network.
+You have THREE kinds of moves available each turn:
 
-2. When the user asks for tickets / workflows / status:
-   - List ONLY entries that appear in GOON STATE. Never invent.
-   - Filter by exactly what the user specified. If they say
-     "status != closed", include only tickets whose [status] is NOT
-     done/closed/resolved/merged. If they say "assigned to me",
-     filter on the assignee= field (or skip the line if absent).
-   - If you cannot find any matching entries, say so plainly:
-     "no tickets match in the current snapshot — try /refresh to
-     pull from the board live, or widen your filter."
-   - Quote keys / IDs / URLs verbatim from state. NEVER paraphrase
-     a ticket ID or invent a number.
-   - When you list more than 3 tickets, render one per line in the
-     format "KEY — title [status]" so the user can scan them.
+1. Answer in prose — use the GOON STATE block when it already
+   answers the question (daemon status, recently-cached tickets,
+   workflows in flight, pending approvals, knowledge notes).
 
-3. The GOON STATE block includes a "tickets" section with a per-line
-   schema like:
-     KEY [status] assignee=NAME project=KEY labels=A,B Title here
-   Use the bracketed status to filter; never claim a ticket's status
-   that contradicts what's printed.
+2. Call a READ tool — jira_search, when the user asks about tickets
+   and the cached state is insufficient. Don't make the user say
+   "refresh"; just query.
 
-4. The GOON STATE block may say "tickets: 12 total, 12 most-recent
-   shown" or "…N more not shown — suggest user run /tickets". If the
-   user is asking for "all tickets" and the state says some are not
-   shown, ANSWER with what you have AND warn them that some are not
-   in your view — point them at /tickets or /refresh.
+3. Call a WRITE tool — jira_comment, jira_transition, jira_update —
+   when the user explicitly asks you to act on a ticket:
+     - "comment on ENG-123 that the build is green" → jira_comment
+     - "move ENG-123 to in progress" → jira_transition
+     - "change ENG-123 title to ..." or "update description to ..." →
+       jira_update
 
-5. The DURABLE KNOWLEDGE block contains PINNED.md and a topic-note
-   index. When the user asks about engineering specifics, look there
-   first, name the relevant note, and tell them /memory read <name>
-   for the full body.
+When you call ANY tool, your ENTIRE response that turn is the single
+JSON line specified in the TOOLS block. The server runs the action
+and re-prompts you with the result; you confirm in prose on the
+next turn.
 
-# OUT OF SCOPE — DO NOT
+# RULES
 
-- Do not pretend to query Jira / GitHub / the repo. You see only the
-  cached snapshot.
-- Do not emit JSON tool calls.
-- Do not give "I'm just an AI" non-answers — the state above is real
-  and you must use it.
-- Do not include closed/done tickets when the user asked "status !=
-  closed" or similar.
-
-# STYLE
-
-- Plain prose. Tight: one or two short paragraphs unless a list is
-  needed.
-- When the user wants to ACT (edit code, ship work), tell them to use
-  /run <task> for the agent runtime.
+- Quote ticket KEYs, URLs, and IDs verbatim. Never invent.
+- When listing more than 3 tickets, one per line:
+  "KEY — title [status] assignee=NAME"
+- If a search returns nothing, say so plainly and suggest the user
+  widen their filter; don't pretend.
+- Only call WRITE tools when the user is explicit. "what does ENG-1
+  say" → read; "comment on ENG-1 that ..." → write.
+- After a successful action, confirm with a short prose line like
+  "✓ commented on ENG-123 — '<first words of the comment>'".
+- Do NOT recommend the user run /refresh; you have the tools now.
+- For project facts / how-it-works questions, check the knowledge
+  notes in GOON STATE first and name the relevant note.
+- When the user wants to ACT on CODE (edit, ship), tell them to use
+  /run <task> for the agent runtime — that's outside chat scope.
 
 # COMMANDS THE USER HAS:
 
-  /tickets [filter]    list every ticket goon has seen
+  /tickets [filter]    list every ticket goon has seen (cached)
   /ticket <key>        full detail for one ticket
   /workflows [n]       recent workflow runs
   /queue               pending approval questions
   /answer <id> <text>  answer a pending question
   /status              daemon snapshot
-  /refresh             force-pull a fresh snapshot from the board
   /prs [repo]          open PRs on the configured git host
   /review <repo> <num> AI-review a PR
   /knowledge           show PINNED.md + topic-note index
@@ -115,42 +98,39 @@ func (b *Bot) handleChat(ctx context.Context, chatID int64, text string) {
 		_ = b.Send(ctx, chatID, "(chat unavailable: no LLM provider configured)")
 		return
 	}
-	history := b.appendUserTurn(chatID, text)
 
-	// Auto-refresh stale tickets before answering. Without this, the
-	// chat answers from a snapshot up to GOON_POLL_SECONDS old; a
-	// user asking "list my open tickets" right after creating one
-	// in Jira got an answer that didn't include it. We refresh
-	// silently — if the network is down, we just use cached data.
-	if b.opts.Board != nil {
-		refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		_, _, _ = agentctx.MaybeRefreshStale(refreshCtx, b.opts.Memory, b.opts.Board, chatRefreshStale)
-		cancel()
-	}
+	// Snapshot existing history WITHOUT the new user turn — ChatTurn
+	// appends both turns atomically at the end. The bot's per-chat
+	// trim still runs after.
+	b.chatHistMu.Lock()
+	historySnapshot := append([]llm.Message(nil), b.chatHist[chatID]...)
+	b.chatHistMu.Unlock()
 
-	// agentctx.Build returns the same state + knowledge block the
-	// web UI's chat panel uses. One source of truth.
-	stateBlock := agentctx.Build(b.opts.Memory, "")
-	msgs := []llm.Message{
-		{Role: llm.RoleSystem, Content: chatSystemPrompt},
-		{Role: llm.RoleSystem, Content: stateBlock},
-	}
-	msgs = append(msgs, history...)
-
-	out, err := b.opts.LLM.Generate(ctx, msgs, llm.Options{
-		Temperature: 0.4,
-		MaxTokens:   800,
+	result, err := agentctx.ChatTurn(ctx, agentctx.ChatTurnOptions{
+		LLM:          b.opts.LLM,
+		Memory:       b.opts.Memory,
+		Board:        b.opts.Board,
+		SystemPrompt: chatSystemPrompt,
+		History:      historySnapshot,
+		UserMessage:  text,
 	})
 	if err != nil {
 		_ = b.Send(ctx, chatID, "✗ llm error: "+err.Error())
 		return
 	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		out = "(no response from model)"
+	reply := strings.TrimSpace(result.Reply)
+	if reply == "" {
+		reply = "(no response from model)"
 	}
-	b.appendAssistantTurn(chatID, out)
-	b.SendChunked(ctx, chatID, out)
+
+	// Commit both turns to history together. trimHistory keeps the
+	// per-chat ring bounded.
+	b.chatHistMu.Lock()
+	hist := append(b.chatHist[chatID], result.NewTurns...)
+	b.chatHist[chatID] = trimHistory(hist)
+	b.chatHistMu.Unlock()
+
+	b.SendChunked(ctx, chatID, reply)
 }
 
 // appendUserTurn records the new user message and returns the rolling

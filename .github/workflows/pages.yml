@@ -1,0 +1,53 @@
+# Deploys the static landing page at /docs to GitHub Pages.
+#
+# Triggers:
+#   - push to main when anything in /docs/** changes (or when this
+#     workflow file itself is touched)
+#   - manual run via the "workflow_dispatch" button in the UI
+#
+# Setup (one-time, in repo settings):
+#   Settings → Pages → Source = "GitHub Actions"
+#
+# Site URL after first successful run:
+#   https://harisaginting.github.io/goon/
+
+name: Deploy landing to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Single concurrent deploy; cancel in-flight runs when a newer one starts.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload /docs as Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs
+
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

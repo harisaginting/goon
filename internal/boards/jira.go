@@ -145,6 +145,45 @@ func (j *Jira) List(ctx context.Context) ([]Ticket, error) {
 	return out, nil
 }
 
+// Search runs an arbitrary JQL query and returns matching tickets.
+// Used by the chat agent to answer live questions ("show me tickets
+// assigned to bob in project ENG that are not done") without needing
+// the daemon's cached snapshot to already contain them.
+//
+// Limits: capped at jiraPageSize per page (50); we deliberately do not
+// auto-paginate (same rationale as List). If the user wants more,
+// they should narrow the JQL.
+//
+// limit==0 means "default" (jiraPageSize). limit values above
+// jiraPageSize are clamped down to jiraPageSize.
+func (j *Jira) Search(ctx context.Context, jql string, limit int) ([]Ticket, error) {
+	jql = strings.TrimSpace(jql)
+	if jql == "" {
+		return nil, fmt.Errorf("jira search: empty JQL")
+	}
+	if limit <= 0 || limit > jiraPageSize {
+		limit = jiraPageSize
+	}
+	q := url.Values{}
+	q.Set("jql", jql)
+	q.Set("fields", "summary,description,status,labels,project,assignee,updated")
+	q.Set("maxResults", fmt.Sprintf("%d", limit))
+	u := j.BaseURL + "/rest/api/3/search/jql?" + q.Encode()
+	body, err := j.do(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("jira search: %w", err)
+	}
+	var sr jiraSearchResponse
+	if err := json.Unmarshal(body, &sr); err != nil {
+		return nil, fmt.Errorf("jira search decode: %w", err)
+	}
+	out := make([]Ticket, 0, len(sr.Issues))
+	for _, is := range sr.Issues {
+		out = append(out, j.toTicket(is))
+	}
+	return out, nil
+}
+
 // Get fetches a single ticket by id (Jira issue key like "ENG-123").
 func (j *Jira) Get(ctx context.Context, id string) (Ticket, error) {
 	u := j.BaseURL + "/rest/api/3/issue/" + url.PathEscape(id) +
@@ -181,11 +220,121 @@ func (j *Jira) Comment(ctx context.Context, id, body string) error {
 	return err
 }
 
-// Transition is a stub for now — Jira transitions require a project-specific
-// workflow id mapping. We log it and return nil so the daemon can proceed.
-func (*Jira) Transition(_ context.Context, _ string, _ Status) error {
-	// Implementing this properly requires per-project workflow lookups
-	// (GET /issue/{key}/transitions). Out of scope for v1.
+// Transition moves a ticket to a goon-known Status by finding the
+// best-matching workflow transition for the project. Two-step:
+//  1. GET /issue/{key}/transitions to list available transitions
+//     (these are workflow-defined — names like "Start Progress",
+//     "In Review", "Done" depend on the project's Jira workflow).
+//  2. POST /issue/{key}/transitions with the chosen transition id.
+//
+// We pick the transition whose Name fuzzy-matches the target Status
+// via MapStatus. If no match is found we return an error listing the
+// available transitions so the caller can surface that to the user.
+func (j *Jira) Transition(ctx context.Context, id string, s Status) error {
+	u := j.BaseURL + "/rest/api/3/issue/" + url.PathEscape(id) + "/transitions"
+	body, err := j.do(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return fmt.Errorf("jira list transitions %s: %w", id, err)
+	}
+	var resp struct {
+		Transitions []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+			To   struct {
+				Name string `json:"name"`
+			} `json:"to"`
+		} `json:"transitions"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return fmt.Errorf("jira transitions decode: %w", err)
+	}
+	if len(resp.Transitions) == 0 {
+		return fmt.Errorf("jira: no transitions available for %s", id)
+	}
+
+	// Best match: prefer a transition whose "to" state maps to the
+	// target Status; fall back to matching the transition's own name.
+	pickID := ""
+	pickName := ""
+	for _, t := range resp.Transitions {
+		if MapStatus(t.To.Name) == s {
+			pickID = t.ID
+			pickName = t.Name
+			break
+		}
+	}
+	if pickID == "" {
+		for _, t := range resp.Transitions {
+			if MapStatus(t.Name) == s {
+				pickID = t.ID
+				pickName = t.Name
+				break
+			}
+		}
+	}
+	if pickID == "" {
+		// Report what was available — the LLM (or user) can pick
+		// from the list on the next turn.
+		var avail []string
+		for _, t := range resp.Transitions {
+			avail = append(avail, fmt.Sprintf("%q → %q", t.Name, t.To.Name))
+		}
+		return fmt.Errorf("jira: no transition on %s maps to status %q (available: %s)",
+			id, s, strings.Join(avail, ", "))
+	}
+
+	postURL := u
+	payload := map[string]any{
+		"transition": map[string]any{"id": pickID},
+	}
+	buf, _ := json.Marshal(payload)
+	if _, err := j.do(ctx, http.MethodPost, postURL, bytes.NewReader(buf)); err != nil {
+		return fmt.Errorf("jira transition %s via %q: %w", id, pickName, err)
+	}
+	return nil
+}
+
+// Update edits a ticket's mutable fields. Only fields whose pointer
+// is non-nil are sent — passing &"" explicitly clears a field; nil
+// leaves it untouched. We send via PUT /rest/api/3/issue/{key} with
+// the standard fields map. Description goes as ADF since the API
+// rejects plain strings.
+func (j *Jira) Update(ctx context.Context, id string, patch TicketPatch) error {
+	if patch.Title == nil && patch.Description == nil && patch.Labels == nil {
+		return nil // nothing to do
+	}
+	fields := map[string]any{}
+	if patch.Title != nil {
+		fields["summary"] = *patch.Title
+	}
+	if patch.Description != nil {
+		// Wrap the plain string in a minimal ADF document — single
+		// paragraph holding one text node. Matches what we do in
+		// Comment so the round-trip stays consistent.
+		fields["description"] = map[string]any{
+			"type":    "doc",
+			"version": 1,
+			"content": []map[string]any{{
+				"type": "paragraph",
+				"content": []map[string]any{{
+					"type": "text",
+					"text": *patch.Description,
+				}},
+			}},
+		}
+	}
+	if patch.Labels != nil {
+		// Jira accepts a plain []string for labels — empty slice
+		// clears them. patch.Labels==nil leaves them alone (handled
+		// above by skipping this branch).
+		fields["labels"] = patch.Labels
+	}
+	payload := map[string]any{"fields": fields}
+	buf, _ := json.Marshal(payload)
+	u := j.BaseURL + "/rest/api/3/issue/" + url.PathEscape(id)
+	if _, err := j.do(ctx, http.MethodPut, u, bytes.NewReader(buf)); err != nil {
+		return fmt.Errorf("jira update %s: %w", id, err)
+	}
 	return nil
 }
 

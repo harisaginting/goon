@@ -69,6 +69,17 @@ func NewFromEnv() (Provider, error) {
 		base := envOr("OLLAMA_BASE_URL", "http://localhost:11434")
 		model := envOr("OLLAMA_MODEL", "llama3")
 		return NewOllama(OllamaConfig{BaseURL: base, Model: model}), nil
+	case "gemini", "google":
+		// GEMINI_API_KEY is the canonical env name; GOOGLE_API_KEY
+		// is the fallback because the same key is used by Google's
+		// other AI surfaces and many users export it as that.
+		key := envOr("GEMINI_API_KEY", os.Getenv("GOOGLE_API_KEY"))
+		if key == "" {
+			return nil, errors.New("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set")
+		}
+		base := envOr("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+		model := envOr("GEMINI_MODEL", "gemini-2.5-flash")
+		return NewGemini(GeminiConfig{APIKey: key, BaseURL: base, Model: model}), nil
 	case "mock":
 		// Optionally seed replies via GOON_MOCK_REPLIES, separated by "<|>".
 		// Each entry should be a complete JSON ToolCall.
@@ -83,7 +94,7 @@ func NewFromEnv() (Provider, error) {
 		}
 		return NewMock(replies), nil
 	default:
-		return nil, fmt.Errorf("unknown GOON_LLM_PROVIDER %q (want openai|anthropic|ollama|mock)", name)
+		return nil, fmt.Errorf("unknown GOON_LLM_PROVIDER %q (want openai|anthropic|gemini|ollama|mock)", name)
 	}
 }
 

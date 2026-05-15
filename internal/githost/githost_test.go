@@ -367,3 +367,30 @@ func TestMock_OpenPR(t *testing.T) {
 		t.Errorf("expected 1 recorded call")
 	}
 }
+
+// TestNormalizeRepoSlug covers the URL → slug coercion. The bug
+// motivating this: a user pasted full Bitbucket URLs into
+// GOON_REVIEW_REPOS; ListPRs then concatenated them into the API
+// path producing "unsupported protocol scheme ''" errors.
+func TestNormalizeRepoSlug(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"owner/name", "owner/name"},
+		{"meditap/data-aggregator-service", "meditap/data-aggregator-service"},
+		{"https://github.com/owner/name", "owner/name"},
+		{"https://github.com/owner/name.git", "owner/name"},
+		{"https://github.com/owner/name/pull/42", "owner/name"},
+		{"https://bitbucket.org/meditap/data-aggregator-service", "meditap/data-aggregator-service"},
+		{"https://bitbucket.org/meditap/data-aggregator-service/src/main", "meditap/data-aggregator-service"},
+		{"git@github.com:owner/name.git", "owner/name"},
+		{"  owner/name  ", "owner/name"},
+		{"owner/name/", "owner/name"},
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, c := range cases {
+		got := NormalizeRepoSlug(c.in)
+		if got != c.want {
+			t.Errorf("NormalizeRepoSlug(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

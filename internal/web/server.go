@@ -14,14 +14,17 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/checkup"
+	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/util"
 )
 
 // Reconfigurable is the small slice of *daemon.Daemon the web layer touches.
@@ -31,6 +34,14 @@ import (
 type Reconfigurable interface {
 	Reconfigure() []string
 	Configured() bool
+}
+
+// Waker is an optional companion interface — when implemented, the web
+// answer handler calls Wake() so the daemon resumes a paused workflow
+// in <1s instead of waiting for the next poll tick (which defaults to
+// 5 minutes — long enough for users to assume it's broken).
+type Waker interface {
+	Wake()
 }
 
 // Options bundles dependencies for the Server.
@@ -46,7 +57,12 @@ type Options struct {
 	// inside the chat handler. When nil, refresh attempts respond
 	// with a friendly "no board configured" message; chat falls back
 	// to whatever's already in memory.json.
-	Board  boards.Board
+	Board boards.Board
+	// Host enables direct PR management endpoints in the web UI
+	// (list, comment, approve, request-changes) — no LLM needed.
+	// When nil, the PR panel renders a "no git host configured"
+	// hint instead of a list.
+	Host   githost.Host
 	Stdout io.Writer
 	Stderr io.Writer
 }
@@ -63,18 +79,28 @@ type Server struct {
 	// browser tab — simpler and matches the user model.
 	chatMu      sync.Mutex
 	chatHistory []llm.Message
+
+	// events is the SSE broker — every mutation handler calls
+	// events.Publish("…") so connected browsers refresh in-place
+	// instead of polling. nil-safe: handlers degrade to the old
+	// "client polls" behaviour if construction is skipped.
+	events *eventBus
 }
 
 // NewServer wires the Server.
 func NewServer(opts Options) *Server {
-	return &Server{opts: opts}
+	return &Server{opts: opts, events: newEventBus()}
 }
 
 // mux builds the routing table. Split out so tests can use it directly via
 // httptest.NewRecorder without binding a real port.
 func (s *Server) mux() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
+	// Root is the marketing landing page; the dashboard moved to /app.
+	// /home is an alias of /app for users who type it by habit.
+	mux.HandleFunc("/", s.handleLanding)
+	mux.HandleFunc("/app", s.handleApp)
+	mux.HandleFunc("/home", s.handleApp)
 	mux.HandleFunc("/docs", s.handleDocs)
 	mux.HandleFunc("/api/status", s.handleAPIStatus)
 	mux.HandleFunc("/api/tickets", s.handleAPITickets)
@@ -88,14 +114,51 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/api/chat", s.handleChat)
 	mux.HandleFunc("/api/chat/reset", s.handleChatReset)
 	mux.HandleFunc("/api/knowledge/note", s.handleKnowledgeNote)
+	mux.HandleFunc("/api/memory/write", s.handleMemoryWrite)
+	mux.HandleFunc("/api/memory/delete", s.handleMemoryDelete)
+	mux.HandleFunc("/api/skills/note", s.handleSkillNote)
+	mux.HandleFunc("/api/skills/write", s.handleSkillWrite)
+	mux.HandleFunc("/api/skills/delete", s.handleSkillDelete)
+	mux.HandleFunc("/api/personal/save", s.handlePersonalSave)
+	mux.HandleFunc("/fragments/skills-list", s.fragSkillsList)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
+	mux.HandleFunc("/api/events", s.handleEvents) // SSE: server → browser change pings
+
+	// Direct Jira/Bitbucket actions — no LLM in the loop.
+	mux.HandleFunc("/api/ticket/comment", s.handleTicketComment)
+	mux.HandleFunc("/api/ticket/transition", s.handleTicketTransition)
+	mux.HandleFunc("/api/ticket/edit", s.handleTicketEdit)
+	mux.HandleFunc("/fragments/prs", s.handlePRList)
+	mux.HandleFunc("/api/pr/comment", s.handlePRComment)
+	mux.HandleFunc("/api/pr/approve", s.handlePRApprove)
+	mux.HandleFunc("/api/pr/request-changes", s.handlePRRequestChanges)
+	// Repo picker: list all repos visible to the token, save the
+	// selected subset into GOON_REVIEW_REPOS without restart.
+	mux.HandleFunc("/fragments/repos-picker", s.handleReposPicker)
+	mux.HandleFunc("/api/repos/save", s.handleReposSave)
+	// Plan editor — replace wf.Plan with user-edited steps and
+	// approve the approve_plan gate in one shot.
+	mux.HandleFunc("/api/plan/save", s.handlePlanSave)
+	// In-browser file tree + editor. Lets the user browse and edit
+	// the workspace goon is working on without switching tools. See
+	// internal/web/files.go for the safety rules (no "..", no abs
+	// paths, 2 MB read cap, refuses binary).
+	mux.HandleFunc("/api/files/tree", s.handleFilesTree)
+	mux.HandleFunc("/api/files/read", s.handleFilesRead)
+	mux.HandleFunc("/api/files/write", s.handleFilesWrite)
 	mux.HandleFunc("/htmx.min.js", s.handleHTMX)
+	// Brand. Served from a stable URL so favicon, og:image, and external
+	// links don't need to be updated when the file moves.
+	mux.HandleFunc("/logo.svg", s.handleLogo)
+	mux.HandleFunc("/favicon.ico", s.handleLogo) // browsers ask for this automatically; serve the SVG
 	// Underlying fragments — render the raw component (used by tests
 	// and direct htmx polls).
 	mux.HandleFunc("/fragments/status", s.fragStatus)
 	mux.HandleFunc("/fragments/tickets", s.fragTickets)
 	mux.HandleFunc("/fragments/questions", s.fragQuestions)
 	mux.HandleFunc("/fragments/workflows", s.fragWorkflows)
+	// Per-workflow detail panel — path-parameterized.
+	mux.HandleFunc("/fragments/workflow/", s.fragWorkflowDetail)
 	mux.HandleFunc("/fragments/config", s.fragConfig)
 	mux.HandleFunc("/fragments/setup", s.fragSetup)
 	// Header + chrome fragments served separately so the dashboard
@@ -105,13 +168,30 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/fragments/questions-banner", s.fragQuestionsBanner)
 	// Tab content composers — wrap the underlying fragments with a
 	// section title + spacing so each tab feels purpose-built.
-	mux.HandleFunc("/fragments/tab-overview", s.fragTabOverview)
-	mux.HandleFunc("/fragments/tab-tickets", s.fragTabTickets)
-	mux.HandleFunc("/fragments/tab-workflows", s.fragTabWorkflows)
+	// Tab composers. Four standalone pages now — Questions /
+	// Workflows / Tickets / Pull-requests — each one of its own.
+	// Legacy aliases (tab-work, tab-overview) route to Questions so
+	// old bookmarks still resolve to a sensible landing page.
+	// Four standalone primary pages. Each has its own tab composer.
+	mux.HandleFunc("/fragments/tab-dashboard", s.fragTabDashboard)
+	mux.HandleFunc("/fragments/tab-home", s.fragTabDashboard) // alias
 	mux.HandleFunc("/fragments/tab-questions", s.fragTabQuestions)
+	mux.HandleFunc("/fragments/tab-workflows", s.fragTabWorkflows)
+	mux.HandleFunc("/fragments/tab-tickets", s.fragTabTickets)
+	mux.HandleFunc("/fragments/tab-prs", s.fragTabPRs)
+	// Legacy compatibility — old bookmarks still resolve.
+	mux.HandleFunc("/fragments/tab-work", s.fragTabQuestions)
+	mux.HandleFunc("/fragments/tab-overview", s.fragTabQuestions)
 	mux.HandleFunc("/fragments/tab-config", s.fragTabConfig)
 	mux.HandleFunc("/fragments/tab-chat", s.fragTabChat)
-	mux.HandleFunc("/fragments/tab-knowledge", s.fragTabKnowledge)
+	// Memory tab is a segmented control over Knowledge + Skills.
+	// The two stores keep separate endpoints for management; the
+	// composer below renders both.
+	mux.HandleFunc("/fragments/tab-memory", s.fragTabMemory)
+	mux.HandleFunc("/fragments/tab-knowledge", s.fragTabMemory) // legacy → memory
+	mux.HandleFunc("/fragments/tab-skills", s.fragTabMemory)    // legacy → memory
+	// File browser tab composer (sidebar entry "Files").
+	mux.HandleFunc("/fragments/tab-files", s.fragTabFiles)
 	return mux
 }
 
@@ -169,7 +249,32 @@ var htmxJS []byte
 //go:embed static/docs.html
 var docsHTML string
 
-func (s *Server) handleIndex(w http.ResponseWriter, _ *http.Request) {
+//go:embed static/logo.svg
+var logoSVG []byte
+
+//go:embed static/landing.html
+var landingHTML string
+
+// handleLanding serves the marketing landing page at `/`. Two CTAs:
+// "Go to app" → /app (the dashboard), "Documentation" → /docs. The
+// dashboard is a separate URL so deep-linking + back/forward navigation
+// behave like a real product, and the landing page is cacheable
+// (no per-request state to compute).
+func (s *Server) handleLanding(w http.ResponseWriter, r *http.Request) {
+	// Only serve the landing on the exact root path — `/foo` would
+	// otherwise fall through here from the default ServeMux pattern.
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	_, _ = io.WriteString(w, landingHTML)
+}
+
+// handleApp serves the dashboard SPA shell. Used to live at `/`; now
+// at `/app` so the landing page can sit at the root.
+func (s *Server) handleApp(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = io.WriteString(w, indexHTML)
 }
@@ -189,6 +294,15 @@ func (s *Server) handleHTMX(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	w.Header().Set("Cache-Control", "public, max-age=86400")
 	_, _ = w.Write(htmxJS)
+}
+
+// handleLogo serves the embedded brand SVG so the favicon, og:image,
+// and any external "where's the logo" lookup all resolve from a single
+// canonical URL. Cached aggressively — the SVG is immutable per binary.
+func (s *Server) handleLogo(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "image/svg+xml; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	_, _ = w.Write(logoSVG)
 }
 
 // --- JSON API --------------------------------------------------------------
@@ -232,9 +346,23 @@ func (s *Server) handleAnswer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "question not found or already answered", http.StatusNotFound)
 		return
 	}
-	// htmx reload trigger.
-	w.Header().Set("HX-Trigger", "questionsChanged")
-	_, _ = io.WriteString(w, `<div class="rounded-md bg-emerald-500/10 border border-emerald-500/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">recorded ✓ — daemon resumes on next poll</div>`)
+	// Wake the daemon so it resumes the paused workflow immediately
+	// instead of waiting up to PollInterval (5 min default). Fall
+	// back silently if the daemon doesn't implement Waker — the
+	// workflow still resumes on the next scheduled tick.
+	if waker, ok := s.opts.Daemon.(Waker); ok {
+		waker.Wake()
+	}
+	// Same triggers via two channels:
+	//   (1) HX-Trigger headers — picked up by the originating browser
+	//   (2) events bus — broadcast to every connected dashboard via SSE
+	// (2) is what makes a second browser tab refresh in step with the
+	// one that performed the action.
+	w.Header().Set("HX-Trigger", "questionsChanged, workflowsChanged, workflowDetailRefresh")
+	s.events.Publish("questionsChanged")
+	s.events.Publish("workflowsChanged")
+	s.events.Publish("workflowDetailRefresh")
+	_, _ = io.WriteString(w, `<div class="rounded-md bg-emerald-500/10 border border-emerald-500/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">recorded ✓ — daemon resuming now</div>`)
 }
 
 // handleDaemonPause flips the daemon's Paused flag in shared memory.
@@ -249,6 +377,7 @@ func (s *Server) handleDaemonPause(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opts.Memory.SetPaused(true)
 	w.Header().Set("HX-Trigger", "statusChanged")
+	s.events.Publish("statusChanged")
 	_, _ = io.WriteString(w, resumeButton())
 }
 
@@ -260,6 +389,7 @@ func (s *Server) handleDaemonResume(w http.ResponseWriter, r *http.Request) {
 	}
 	s.opts.Memory.SetPaused(false)
 	w.Header().Set("HX-Trigger", "statusChanged")
+	s.events.Publish("statusChanged")
 	_, _ = io.WriteString(w, pauseButton())
 }
 
@@ -292,12 +422,13 @@ type configKey struct {
 // webConfigKeys mirrors cmd/config.go's knownConfigKeys but is local to the
 // web package so we don't reach across boundaries. Keep them in sync.
 var webConfigKeys = []configKey{
-	{Name: "GOON_LLM_PROVIDER", Default: "openai", Group: "agent", Hint: "openai | anthropic | ollama | mock"},
+	{Name: "GOON_LLM_PROVIDER", Default: "openai", Group: "agent", Hint: "openai | anthropic | gemini | ollama | mock"},
 	{Name: "GOON_BOARD", Group: "agent", Hint: "jira | github | mock"},
 	{Name: "GOON_GIT_HOST", Group: "agent", Hint: "github | gitlab | bitbucket | mock (optional)"},
 	{Name: "GOON_POLL_SECONDS", Default: "300", Group: "agent"},
 	{Name: "GOON_VERIFY_RUNS", Default: "3", Group: "agent"},
 	{Name: "GOON_REPO_MAP", Group: "agent", Hint: `e.g. ENG=/repos/eng,*=/repos/default`},
+	{Name: "GOON_WORKSPACE_DIR", Group: "agent", Hint: `parent directory holding multiple git repos — confirm_repo gate offers them as a numbered menu`},
 
 	{Name: "OPENAI_API_KEY", Sensitive: true, Group: "openai"},
 	{Name: "OPENAI_MODEL", Default: "gpt-4o-mini", Group: "openai"},
@@ -309,6 +440,10 @@ var webConfigKeys = []configKey{
 
 	{Name: "OLLAMA_BASE_URL", Default: "http://localhost:11434", Group: "ollama"},
 	{Name: "OLLAMA_MODEL", Default: "llama3", Group: "ollama"},
+
+	{Name: "GEMINI_API_KEY", Sensitive: true, Group: "gemini", Hint: "from aistudio.google.com/apikey — falls back to GOOGLE_API_KEY"},
+	{Name: "GEMINI_MODEL", Default: "gemini-2.5-flash", Group: "gemini"},
+	{Name: "GEMINI_BASE_URL", Default: "https://generativelanguage.googleapis.com/v1beta", Group: "gemini"},
 
 	// Shared Atlassian credentials. Both Jira and Confluence fall back to
 	// these, so a typical Cloud user only fills these three.
@@ -410,6 +545,8 @@ func (s *Server) serveConfigWrite(w http.ResponseWriter, r *http.Request) {
 	// (configChanged) all refresh in the same paint. htmx accepts
 	// comma-separated triggers.
 	w.Header().Set("HX-Trigger", "configChanged, statusChanged")
+	s.events.Publish("configChanged")
+	s.events.Publish("statusChanged")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprintf(w, `<div class="rounded-md bg-emerald-500/10 border border-emerald-500/30 px-3 py-2 text-sm text-emerald-700 dark:text-emerald-400">saved %d field(s) ✓</div>`, len(written))
 	if len(notes) > 0 {
@@ -693,15 +830,23 @@ func (s *Server) fragStatusPill(w http.ResponseWriter, _ *http.Request) {
 	if !st.LastPoll.IsZero() {
 		last = humanizeAgo(time.Since(st.LastPoll))
 	}
-	fmt.Fprintf(w, `<div class="inline-flex items-center gap-2 px-2.5 py-1 rounded-full border border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface text-[11px] font-medium text-gray-700 dark:text-gray-300" title="Last poll: %s">
-		<span class="relative flex h-2 w-2">
+	pausedFlag := "0"
+	if st.Paused {
+		pausedFlag = "1"
+	}
+	// The data-paused attribute lets the sidebar pause/resume button
+	// query "what's the current state" without a separate API call.
+	fmt.Fprintf(w, `<div class="flex items-center gap-3 text-[11px] font-medium text-gray-700 dark:text-gray-300" data-paused="%s" title="Last poll: %s">
+		<span class="relative flex h-2 w-2 shrink-0">
 			<span class="absolute inline-flex h-full w-full rounded-full %s opacity-60 animate-ping"></span>
 			<span class="relative inline-flex rounded-full h-2 w-2 %s"></span>
 		</span>
-		<span class="uppercase tracking-wider">%s</span>
-		<span class="hidden md:inline text-gray-500">·</span>
-		<span class="hidden md:inline text-gray-500 font-mono">%s</span>
-	</div>`, html.EscapeString(last), dotClass, dotClass, state, html.EscapeString(last))
+		<div class="min-w-0 flex-1">
+			<div class="uppercase tracking-wider text-[10px] text-gray-500">Daemon</div>
+			<div class="text-sm font-semibold">%s</div>
+			<div class="text-[11px] text-gray-500 font-mono mt-0.5">last poll %s</div>
+		</div>
+	</div>`, pausedFlag, html.EscapeString(last), dotClass, dotClass, state, html.EscapeString(last))
 }
 
 // fragQuestionsBanner renders a yellow strip above the tabs when there
@@ -757,6 +902,7 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 				<th class="px-4 py-2.5 text-left font-semibold">Assignee</th>
 				<th class="px-4 py-2.5 text-left font-semibold">Project</th>
 				<th class="px-4 py-2.5 text-left font-semibold">Updated</th>
+				<th class="px-4 py-2.5 text-right font-semibold">Actions</th>
 			</tr>
 		</thead>
 		<tbody class="divide-y divide-gray-100 dark:divide-surface-border/60">`)
@@ -774,6 +920,11 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 		if project == "" {
 			project = `<span class="text-gray-400">—</span>`
 		}
+		// Actions popover — toggles a hidden row revealing comment /
+		// transition / edit forms specific to this ticket.
+		safeID := strings.ReplaceAll(html.EscapeString(t.Key), "/", "-")
+		actionsRowID := "ta-" + safeID
+		actions := fmt.Sprintf(`<button type="button" onclick="document.getElementById('%s').classList.toggle('hidden')" class="text-xs text-accent hover:underline">⋯ actions</button>`, actionsRowID)
 		fmt.Fprintf(w, `<tr data-ticket-row data-status="%s" class="hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition-colors">
 			<td class="px-4 py-2.5 font-mono whitespace-nowrap">%s</td>
 			<td class="px-4 py-2.5 max-w-md truncate">%s</td>
@@ -781,9 +932,57 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 			<td class="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap">%s</td>
 			<td class="px-4 py-2.5 font-mono text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap">%s</td>
 			<td class="px-4 py-2.5 text-gray-500 text-xs whitespace-nowrap">%s</td>
-		</tr>`, html.EscapeString(strings.ToLower(t.Status)), key, html.EscapeString(t.Title),
+			<td class="px-4 py-2.5 text-right whitespace-nowrap">%s</td>
+		</tr>
+		<tr id="%s" data-action-row class="hidden bg-gray-50/40 dark:bg-surface-sunken/40">
+			<td colspan="7" class="px-4 py-3">
+				<div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+					<form hx-post="/api/ticket/comment" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
+						<label class="font-semibold uppercase tracking-wider text-gray-500">Comment</label>
+						<input type="hidden" name="key" value="%s">
+						<textarea name="body" rows="2" required placeholder="add a comment…"
+							class="w-full font-mono rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none"></textarea>
+						<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1 font-medium hover:brightness-110 transition">post</button>
+					</form>
+					<form hx-post="/api/ticket/transition" hx-target="#%s-r" hx-swap="innerHTML" class="space-y-2">
+						<label class="font-semibold uppercase tracking-wider text-gray-500">Transition</label>
+						<input type="hidden" name="key" value="%s">
+						<select name="status" class="w-full rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
+							<option value="open">open</option>
+							<option value="in_progress">in progress</option>
+							<option value="in_review">in review</option>
+							<option value="blocked">blocked</option>
+							<option value="done">done</option>
+						</select>
+						<button type="submit" class="rounded-md border border-accent/40 text-accent px-3 py-1 font-medium hover:bg-accent-soft transition">move</button>
+					</form>
+					<form hx-post="/api/ticket/edit" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
+						<label class="font-semibold uppercase tracking-wider text-gray-500">Edit field</label>
+						<input type="hidden" name="key" value="%s">
+						<div class="flex gap-1">
+							<select name="field" class="rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
+								<option value="title">title</option>
+								<option value="desc">description</option>
+								<option value="labels">labels (a,b,c)</option>
+							</select>
+						</div>
+						<input type="text" name="value" required placeholder="new value…"
+							class="w-full font-mono rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+						<button type="submit" class="rounded-md border border-accent/40 text-accent px-3 py-1 font-medium hover:bg-accent-soft transition">apply</button>
+					</form>
+				</div>
+				<div id="%s-r" class="mt-2 text-xs"></div>
+			</td>
+		</tr>`,
+			html.EscapeString(strings.ToLower(t.Status)), key, html.EscapeString(t.Title),
 			ticketStatusPill(t.Status), assignee, project,
-			html.EscapeString(fuzzyTime(t.UpdatedAt)))
+			html.EscapeString(fuzzyTime(t.UpdatedAt)), actions,
+			actionsRowID,
+			actionsRowID, html.EscapeString(t.Key),
+			actionsRowID, html.EscapeString(t.Key),
+			actionsRowID, html.EscapeString(t.Key),
+			actionsRowID,
+		)
 	}
 	fmt.Fprint(w, `</tbody></table></div>`)
 }
@@ -818,12 +1017,40 @@ func ticketStatusPill(status string) string {
 // fragWorkflows renders the workflow card list for the Workflows tab.
 // Cards beat tables here — each workflow has plan progress that needs
 // vertical space, and rows would crowd it.
+//
+// De-dupe by ticket: we show only the most-recent workflow per
+// TicketID. Older attempts (failed triage, replans, re-runs of the
+// same ticket) live inside the detail view's history list. Without
+// this the list got cluttered when one ticket failed multiple times
+// in a row (e.g. before we raised the MaxTokens cap).
 func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
-	wfs := s.opts.Memory.ListWorkflows(50)
+	all := s.opts.Memory.ListWorkflows(0) // 0 = unbounded; we cap after dedupe
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// Keep one workflow per ticket — the newest (ListWorkflows already
+	// returns newest first). Workflows with no TicketID (synthetic)
+	// pass through with a unique key so they don't collide.
+	seen := map[string]int{}
+	wfs := make([]memory.Workflow, 0, len(all))
+	for _, wf := range all {
+		key := wf.TicketID
+		if key == "" {
+			key = "_" + wf.ID
+		}
+		if n, ok := seen[key]; ok {
+			seen[key] = n + 1
+			continue
+		}
+		seen[key] = 1
+		wfs = append(wfs, wf)
+	}
+	if len(wfs) > 50 {
+		wfs = wfs[:50]
+	}
+
 	if len(wfs) == 0 {
 		_, _ = io.WriteString(w, emptyState("No workflows yet.",
-			"Workflow runs appear here as soon as a ticket is picked up. Each card shows plan progress, the PR link, and any pending approval."))
+			"Workflow runs appear here as soon as a ticket is picked up. Click a card to see plan progress, approvals, errors, and answer any pending question."))
 		return
 	}
 	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">`)
@@ -873,92 +1100,344 @@ func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
 			barTone = "bg-amber-500"
 		}
 
-		fmt.Fprint(w, `<div class="relative overflow-hidden rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 shadow-card hover:shadow-lift transition-shadow">`)
-		fmt.Fprintf(w, `<div class="absolute left-0 top-0 bottom-0 w-1 %s"></div>`, edgeTone)
-		fmt.Fprintf(w, `<div class="flex items-start justify-between gap-3 mb-3">
+		// History badge: when this ticket has prior attempts in
+		// memory.json, surface a tiny "Nx" pill so the user knows
+		// the detail view will show more than one entry.
+		historyBadge := ""
+		if wf.TicketID != "" {
+			if n, ok := seen[wf.TicketID]; ok && n > 1 {
+				historyBadge = fmt.Sprintf(`<span class="ml-1 inline-flex items-center rounded-full bg-gray-100 dark:bg-surface-sunken text-gray-600 dark:text-gray-300 px-1.5 py-0.5 text-[10px] font-mono" title="%d total attempts for this ticket">%dx</span>`, n, n)
+			}
+		}
+
+		// Flat card. No shadow at rest — borders carry the visual weight.
+		// Hover gets the subtle lift so interactivity is still hinted.
+		// The 2px left-edge color is the only chrome that depends on
+		// state; everything else is plain typography.
+		fmt.Fprintf(w, `<div class="group relative rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
+			<div class="absolute left-0 top-0 bottom-0 w-0.5 %s rounded-l-lg"></div>
+			<details>
+				<summary class="cursor-pointer list-none px-4 py-3 select-none">`, edgeTone)
+		fmt.Fprintf(w, `<div class="flex items-center justify-between gap-3">
 			<div class="min-w-0 flex-1">
-				<div class="font-mono text-sm font-semibold text-gray-900 dark:text-gray-100">%s</div>
+				<div class="flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-100">
+					<span class="font-mono">%s</span>%s
+				</div>
 				<div class="mt-0.5 text-sm text-gray-600 dark:text-gray-400 truncate" title="%s">%s</div>
 			</div>
 			%s
-		</div>`, ticket, title, title, stateChip)
+		</div>`, ticket, historyBadge, title, title, stateChip)
 
-		// Meta row — stage + updated.
-		fmt.Fprintf(w, `<div class="flex items-center gap-4 text-[11px] uppercase tracking-wider text-gray-500 mb-4">
-			<div class="flex items-center gap-1.5">
-				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
-				<span>stage</span>
-				<span class="font-mono normal-case tracking-normal text-gray-700 dark:text-gray-300">%s</span>
-			</div>
-			<div class="flex items-center gap-1.5">
-				<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
-				<span class="normal-case tracking-normal text-gray-500">%s</span>
-			</div>
-		</div>`, stage, html.EscapeString(fuzzyTime(wf.UpdatedAt)))
+		// Compact meta + progress on a single row. No SVG icons, no
+		// uppercase tracking labels — just text. Quieter.
+		fmt.Fprintf(w, `<div class="mt-2.5 flex items-center justify-between gap-4 text-[11px] text-gray-500">
+			<div class="flex items-center gap-3">
+				<span><span class="text-gray-400">stage</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span></span>
+				<span class="text-gray-300 dark:text-gray-600">·</span>
+				<span class="font-mono">%s</span>
+			</div>`, stage, html.EscapeString(fuzzyTime(wf.UpdatedAt)))
 
-		// Plan progress bar — only visible when plan exists.
 		if total > 0 {
-			fmt.Fprintf(w, `<div class="mb-3">
-				<div class="flex items-center justify-between text-xs mb-1.5">
-					<span class="text-gray-500 dark:text-gray-400">plan progress</span>
-					<span class="font-mono text-gray-700 dark:text-gray-300">%d / %d <span class="text-gray-400">· %d%%</span></span>
-				</div>
-				<div class="h-2 w-full rounded-full bg-gray-100 dark:bg-surface-sunken overflow-hidden">
-					<div class="h-full %s transition-all duration-500" style="width: %d%%"></div>
-				</div>
-			</div>`, done, total, pct, barTone, pct)
-		} else {
-			fmt.Fprintf(w, `<div class="mb-3 text-xs text-gray-400 italic">no plan yet</div>`)
+			fmt.Fprintf(w, `<span class="font-mono">%d/%d</span>`, done, total)
 		}
-
-		// PR link — pill button style.
-		if wf.PRURL != "" {
-			fmt.Fprintf(w, `<a href="%s" target="_blank" rel="noopener" class="group inline-flex items-center gap-1.5 max-w-full rounded-md border border-accent/30 bg-accent-soft/40 hover:bg-accent-soft hover:border-accent px-2.5 py-1 text-xs font-medium text-accent transition">
-				<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
-				<span class="font-mono truncate min-w-0">%s</span>
-				<svg class="h-3 w-3 shrink-0 opacity-50 group-hover:opacity-100 transition-opacity" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7"/><polyline points="7 7 17 7 17 17"/></svg>
-			</a>`, html.EscapeString(wf.PRURL), html.EscapeString(wf.PRURL))
-		}
-
-		// Pending question hint — amber callout.
-		if wf.PendingQuestionID != "" {
-			fmt.Fprintf(w, `<button type="button" onclick="document.querySelector('button[data-tab=questions]')?.click()" class="mt-3 flex items-center gap-2 w-full text-left rounded-md border border-amber-500/30 bg-amber-500/5 hover:bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400 transition">
-				<svg class="h-4 w-4 shrink-0 animate-pulse-dot" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="10" y1="9" x2="10" y2="15"/><line x1="14" y1="9" x2="14" y2="15"/></svg>
-				<span class="flex-1">paused — awaiting <span class="font-mono">%s</span></span>
-				<span class="font-medium opacity-80 group-hover:opacity-100">answer →</span>
-			</button>`, html.EscapeString(wf.PendingQuestionID))
-		}
-
-		// Error — rose callout.
-		if wf.Error != "" {
-			fmt.Fprintf(w, `<div class="mt-3 flex items-start gap-2 rounded-md border border-rose-500/30 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">
-				<svg class="h-4 w-4 shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-				<span class="break-words">%s</span>
-			</div>`, html.EscapeString(wf.Error))
-		}
-
 		fmt.Fprint(w, `</div>`)
+
+		if total > 0 {
+			fmt.Fprintf(w, `<div class="mt-2 h-1 w-full rounded-full bg-gray-100 dark:bg-surface-sunken overflow-hidden">
+				<div class="h-full %s transition-all duration-500" style="width: %d%%"></div>
+			</div>`, barTone, pct)
+		}
+
+		fmt.Fprintf(w, `</summary>
+				<div class="border-t border-gray-100 dark:border-surface-border/60 px-4 py-3"
+					hx-get="/fragments/workflow/%s" hx-trigger="toggle from:closest details once, workflowDetailRefresh from:body" hx-swap="innerHTML">
+					<div class="text-xs text-gray-500">Loading detail…</div>
+				</div>
+			</details>`, html.EscapeString(wf.ID))
+
+		// Action strip — flatter than before. No animated dot, no SVG
+		// noise. Each row a plain link/button with one accent color.
+		hasAction := wf.PRURL != "" || wf.PendingQuestionID != "" || wf.Error != ""
+		if hasAction {
+			fmt.Fprint(w, `<div class="px-4 pb-3 pt-0 space-y-1.5">`)
+			if wf.PRURL != "" {
+				fmt.Fprintf(w, `<a href="%s" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 max-w-full text-xs text-accent hover:underline">
+					<span class="font-mono truncate min-w-0">↗ %s</span>
+				</a>`, html.EscapeString(wf.PRURL), html.EscapeString(wf.PRURL))
+			}
+			if wf.PendingQuestionID != "" {
+				fmt.Fprintf(w, `<button type="button"
+					onclick="this.closest('div.group').querySelector('details').open = true"
+					class="flex items-center gap-2 w-full text-left rounded-md bg-amber-500/10 hover:bg-amber-500/15 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400 transition">
+					<span class="flex-1">⏸ paused — answer needed (<span class="font-mono">%s</span>)</span>
+					<span class="font-medium">open</span>
+				</button>`, html.EscapeString(wf.PendingQuestionID))
+			}
+			if wf.Error != "" {
+				fmt.Fprintf(w, `<div class="rounded-md bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-700 dark:text-rose-400 break-words">
+					✗ %s
+				</div>`, html.EscapeString(wf.Error))
+			}
+			fmt.Fprint(w, `</div>`)
+		}
+
+		fmt.Fprint(w, `</div>`) // close card frame
 	}
 	fmt.Fprint(w, `</div>`)
 }
 
-// workflowStateChip renders a small colored badge for a workflow state.
-// Paired light/dark text colors keep the chip readable on both modes.
+// fragWorkflowDetail renders the in-card detail panel for one workflow:
+// plan steps with done state, approvals/feedback, branch+repo info,
+// the pending-question form (when paused), and a history block listing
+// prior attempts for the same ticket. URL shape:
+//
+//	/fragments/workflow/{id}
+//
+// We embed an answer form here too so users don't have to flip to the
+// Questions tab. handleAnswer routes the POST back through the same
+// memory.AnswerQuestion + daemon.Wake path.
+func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/fragments/workflow/")
+	id = strings.TrimSpace(id)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	wf, ok := s.opts.Memory.GetWorkflow(id)
+	if !ok {
+		fmt.Fprintf(w, `<div class="text-xs text-rose-500">workflow %s not found</div>`, html.EscapeString(id))
+		return
+	}
+
+	// Top: ticket meta strip.
+	fmt.Fprint(w, `<div class="space-y-4">`)
+	fmt.Fprintf(w, `<div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-gray-500 dark:text-gray-400">
+		<span><span class="uppercase tracking-wider">started</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span></span>
+		<span><span class="uppercase tracking-wider">updated</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span></span>
+		<span><span class="uppercase tracking-wider">id</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span></span>
+	</div>`,
+		html.EscapeString(fuzzyTime(wf.StartedAt)),
+		html.EscapeString(fuzzyTime(wf.UpdatedAt)),
+		html.EscapeString(wf.ID),
+	)
+	if wf.Repo != "" || wf.Branch != "" || len(wf.Repos) > 0 {
+		fmt.Fprint(w, `<div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">`)
+		if wf.Repo != "" {
+			fmt.Fprintf(w, `<span class="text-gray-500">primary repo:</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span>`, html.EscapeString(wf.Repo))
+		}
+		if len(wf.Repos) > 1 {
+			extras := wf.Repos[1:]
+			parts := make([]string, len(extras))
+			for i, r := range extras {
+				parts[i] = html.EscapeString(r)
+			}
+			fmt.Fprintf(w, `<span class="text-gray-500">+ %d other%s:</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span>`,
+				len(extras), plural(len(extras), "s"), strings.Join(parts, ", "))
+		}
+		if wf.Branch != "" {
+			fmt.Fprintf(w, `<span class="text-gray-500">branch:</span> <span class="font-mono text-gray-700 dark:text-gray-300">%s</span>`, html.EscapeString(wf.Branch))
+		}
+		fmt.Fprint(w, `</div>`)
+	}
+
+	// Pending question — inline answer form. For the approve_plan
+	// gate specifically, also surface an editable plan so the user
+	// can tweak steps directly (delete, edit, reorder via drag) and
+	// approve the modified version in one shot.
+	if wf.PendingQuestionID != "" {
+		if q, ok := s.opts.Memory.GetQuestion(wf.PendingQuestionID); ok && q.Pending() {
+			isApprovePlan := wf.Stage == "approve_plan" && len(wf.Plan) > 0
+			pickButtons := renderRepoPickButtons(q.Question)
+
+			fmt.Fprint(w, `<div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
+				<div class="flex items-center gap-2 text-[11px] uppercase tracking-wider text-amber-700 dark:text-amber-400 font-semibold">
+					<span class="inline-block h-1.5 w-1.5 rounded-full bg-amber-500"></span>
+					paused — awaiting your answer
+					<span class="ml-auto font-mono normal-case tracking-normal text-gray-400">id `+html.EscapeString(q.ID)+`</span>
+				</div>
+				<div class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">`+html.EscapeString(q.Question)+`</div>`)
+			fmt.Fprint(w, pickButtons)
+
+			// Plan editor for approve_plan only. Each step is an
+			// editable text input; an "+ add step" button appends a
+			// blank input; the ✕ on each row removes it. Submit
+			// posts step[] in DOM order to /api/plan/save which
+			// replaces wf.Plan and approves the gate.
+			if isApprovePlan {
+				fmt.Fprintf(w, `<form hx-post="/api/plan/save" hx-target="#plan-save-result-%s" hx-swap="innerHTML"
+					class="rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-3 space-y-2">
+					<div class="flex items-baseline justify-between gap-2">
+						<h4 class="text-[11px] font-semibold uppercase tracking-wider text-gray-500">Edit plan</h4>
+						<span class="text-[11px] text-gray-400">drag titles or rewrite — empty rows are dropped on save</span>
+					</div>
+					<input type="hidden" name="wf_id" value="%s">
+					<input type="hidden" name="q_id" value="%s">
+					<ol id="plan-editor-%s" class="space-y-1.5">`,
+					html.EscapeString(wf.ID),
+					html.EscapeString(wf.ID),
+					html.EscapeString(q.ID),
+					html.EscapeString(wf.ID),
+				)
+				for i, ps := range wf.Plan {
+					fmt.Fprintf(w, `<li class="flex items-center gap-2">
+						<span class="font-mono text-xs text-gray-400 w-6 text-right shrink-0">%d.</span>
+						<input type="text" name="step" value="%s"
+							class="flex-1 font-mono text-sm rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+						<button type="button" onclick="this.closest('li').remove()" title="remove step"
+							class="text-xs text-gray-400 hover:text-rose-500 transition px-2 py-1">✕</button>
+					</li>`, i+1, html.EscapeString(ps.Title))
+				}
+				fmt.Fprintf(w, `</ol>
+					<div class="flex items-center justify-between gap-2 pt-1">
+						<button type="button"
+							onclick="(function(ol){var li=document.createElement('li');li.className='flex items-center gap-2';li.innerHTML='<span class=\'font-mono text-xs text-gray-400 w-6 text-right shrink-0\'>+</span><input type=\'text\' name=\'step\' placeholder=\'new step…\' class=\'flex-1 font-mono text-sm rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none\'><button type=\'button\' onclick=\'this.closest(&quot;li&quot;).remove()\' class=\'text-xs text-gray-400 hover:text-rose-500 transition px-2 py-1\'>✕</button>';ol.appendChild(li);li.querySelector('input').focus();})(document.getElementById('plan-editor-%s'))"
+							class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2 py-1 hover:border-accent hover:text-accent transition">+ add step</button>
+						<div class="flex items-center gap-2">
+							<span id="plan-save-result-%s" class="text-xs"></span>
+							<button type="submit"
+								class="inline-flex items-center gap-1 rounded-lg bg-accent text-surface px-3 py-1.5 text-sm font-semibold hover:brightness-110 transition">save plan &amp; approve</button>
+						</div>
+					</div>
+				</form>`,
+					html.EscapeString(wf.ID),
+					html.EscapeString(wf.ID),
+				)
+			}
+
+			// Always-on yes / no / free-form path. For approve_plan
+			// this is the "accept as-is" / "reject" / "rephrase &
+			// replan" alternative to editing.
+			fmt.Fprintf(w, `<form hx-post="/api/answer" hx-target="this" hx-swap="outerHTML"
+				class="space-y-2">
+				<input type="hidden" name="id" value="%s">
+				<div class="flex flex-col sm:flex-row gap-2">
+					<input type="text" name="answer" autocomplete="off"
+						placeholder="yes &nbsp;·&nbsp; no &nbsp;·&nbsp; change=/path/to/repo &nbsp;·&nbsp; free-form feedback"
+						class="flex-1 font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
+					<div class="flex gap-2">
+						<button type="submit" name="answer" value="yes" formnovalidate class="inline-flex items-center gap-1 rounded-lg bg-emerald-500 text-white px-3 py-2 text-sm font-semibold hover:bg-emerald-600 transition">yes</button>
+						<button type="submit" name="answer" value="no" formnovalidate class="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 bg-rose-500/5 text-rose-700 dark:text-rose-400 px-3 py-2 text-sm font-semibold hover:bg-rose-500/10 transition">no</button>
+						<button type="submit" class="inline-flex items-center gap-1 rounded-lg bg-accent text-surface px-3 py-2 text-sm font-semibold hover:brightness-110 transition">send →</button>
+					</div>
+				</div>
+			</form>`,
+				html.EscapeString(q.ID),
+			)
+			fmt.Fprint(w, `</div>`)
+		}
+	}
+
+	// Plan steps — checklist.
+	if len(wf.Plan) > 0 {
+		fmt.Fprintf(w, `<div>
+			<h4 class="text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-2">Plan (%d steps)</h4>
+			<ol class="space-y-1.5">`, len(wf.Plan))
+		for i, ps := range wf.Plan {
+			mark := `<span class="inline-flex h-4 w-4 items-center justify-center rounded-full border border-gray-300 dark:border-gray-700"></span>`
+			cls := "text-gray-700 dark:text-gray-300"
+			if ps.Done {
+				mark = `<span class="inline-flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white"><svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>`
+				cls = "text-gray-500 dark:text-gray-500 line-through"
+			}
+			fmt.Fprintf(w, `<li class="flex items-start gap-2 text-sm %s">
+				%s
+				<div class="flex-1 min-w-0">
+					<span class="font-mono text-xs text-gray-400 mr-1">%d.</span>
+					<span>%s</span>
+				</div>
+			</li>`, cls, mark, i+1, html.EscapeString(ps.Title))
+		}
+		fmt.Fprint(w, `</ol></div>`)
+	}
+
+	// Approvals dict — chronological.
+	if len(wf.Approvals) > 0 {
+		// Sort keys for stable output (otherwise map iteration order
+		// makes the panel jiggle on every refresh).
+		keys := make([]string, 0, len(wf.Approvals))
+		for k := range wf.Approvals {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Fprint(w, `<div>
+			<h4 class="text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-2">Approvals &amp; gates</h4>
+			<dl class="space-y-1 text-sm">`)
+		for _, k := range keys {
+			v := wf.Approvals[k]
+			fmt.Fprintf(w, `<div class="flex items-baseline gap-2">
+				<dt class="font-mono text-xs text-gray-500 min-w-[140px]">%s</dt>
+				<dd class="font-mono text-xs text-gray-700 dark:text-gray-300 break-words">%s</dd>
+			</div>`, html.EscapeString(k), html.EscapeString(v))
+		}
+		fmt.Fprint(w, `</dl></div>`)
+	}
+
+	// Note (occasional engine annotation).
+	if wf.Note != "" {
+		fmt.Fprintf(w, `<div class="rounded-md border border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface-sunken px-3 py-2 text-xs text-gray-700 dark:text-gray-300"><span class="text-gray-500 uppercase tracking-wider mr-2">note</span>%s</div>`,
+			html.EscapeString(wf.Note))
+	}
+
+	// Verify runs (only meaningful when set).
+	if wf.VerifyRuns > 0 {
+		fmt.Fprintf(w, `<div class="text-xs text-gray-500">verify runs: <span class="font-mono text-gray-700 dark:text-gray-300">%d</span></div>`, wf.VerifyRuns)
+	}
+
+	// History: prior workflow attempts for this ticket.
+	if wf.TicketID != "" {
+		history := s.opts.Memory.HistoryWorkflowsFor(wf.TicketID)
+		// Filter out the current workflow.
+		filtered := make([]memory.Workflow, 0, len(history))
+		for _, h := range history {
+			if h.ID != wf.ID {
+				filtered = append(filtered, h)
+			}
+		}
+		if len(filtered) > 0 {
+			fmt.Fprintf(w, `<div>
+				<h4 class="text-[11px] font-semibold uppercase tracking-wider text-gray-500 mb-2">History (%d earlier attempt%s)</h4>
+				<ul class="space-y-1 text-xs">`, len(filtered), plural(len(filtered), "s"))
+			for _, h := range filtered {
+				note := h.Stage
+				if h.Error != "" {
+					note = "✗ " + h.Error
+				}
+				fmt.Fprintf(w, `<li class="flex items-baseline gap-2">
+					<span class="font-mono text-gray-400 min-w-[88px]">%s</span>
+					%s
+					<span class="text-gray-700 dark:text-gray-300 truncate">%s</span>
+				</li>`,
+					html.EscapeString(fuzzyTime(h.UpdatedAt)),
+					workflowStateChip(string(h.State)),
+					html.EscapeString(util.Truncate(note, 200)),
+				)
+			}
+			fmt.Fprint(w, `</ul></div>`)
+		}
+	}
+
+	fmt.Fprint(w, `</div>`)
+}
+
+// workflowStateChip renders a small workflow-state badge. Flat —
+// no border, low-opacity background, paired text colors. Less
+// visual weight than the bordered-and-shadowed previous version.
 func workflowStateChip(state string) string {
-	cls := "bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/30"
+	cls := "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
 	switch state {
 	case "done":
-		cls = "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30"
+		cls = "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400"
 	case "failed":
-		cls = "bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-500/30"
+		cls = "bg-rose-50 text-rose-700 dark:bg-rose-500/15 dark:text-rose-400"
 	case "awaiting_approval":
-		cls = "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+		cls = "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400"
 	case "executing", "testing", "verifying", "opening_pr", "notifying", "updating_memory":
-		cls = "bg-sky-500/15 text-sky-700 dark:text-sky-400 border-sky-500/30"
+		cls = "bg-sky-50 text-sky-700 dark:bg-sky-500/15 dark:text-sky-400"
 	case "triaging", "planning":
-		cls = "bg-violet-500/15 text-violet-700 dark:text-violet-400 border-violet-500/30"
+		cls = "bg-violet-50 text-violet-700 dark:bg-violet-500/15 dark:text-violet-400"
 	}
-	return fmt.Sprintf(`<span class="inline-flex shrink-0 items-center rounded-full border px-2 py-0.5 text-xs font-medium %s">%s</span>`,
+	return fmt.Sprintf(`<span class="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-medium %s">%s</span>`,
 		cls, html.EscapeString(state))
 }
 
@@ -988,6 +1467,11 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 		if q.TicketID != "" {
 			ticketLabel = fmt.Sprintf(`<span class="inline-flex items-center gap-1 text-xs font-mono text-gray-500 dark:text-gray-400"><svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>%s</span>`, html.EscapeString(q.TicketID))
 		}
+		// Parse the question body for a numbered repo menu (lines like
+		// " * 1. eng-app"). When present, render each as a clickable
+		// button that submits the corresponding number — no typing
+		// required.
+		pickButtons := renderRepoPickButtons(q.Question)
 		fmt.Fprintf(w, `<form hx-post="/api/answer" hx-target="this" hx-swap="outerHTML"
 			class="relative overflow-hidden rounded-xl border border-amber-500/40 bg-white dark:bg-surface-raised shadow-card hover:shadow-lift transition-shadow">
 			<div class="absolute left-0 top-0 bottom-0 w-1 bg-amber-500"></div>
@@ -1001,6 +1485,7 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 					<span class="text-[11px] font-mono text-gray-400 ml-auto">id %s</span>
 				</div>
 				<div class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">%s</div>
+				%s
 				<input type="hidden" name="id" value="%s">
 				<div class="flex flex-col sm:flex-row gap-2 pt-1">
 					<input type="text" name="answer" autocomplete="off" autofocus
@@ -1024,9 +1509,124 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 					</div>
 				</div>
 			</div>
-		</form>`, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(q.Question), html.EscapeString(q.ID))
+		</form>`, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(q.Question), pickButtons, html.EscapeString(q.ID))
 	}
 	fmt.Fprint(w, `</div>`)
+}
+
+// renderRepoPickButtons scans the question body for the numbered menu
+// format that buildRepoGateQuestion in internal/workflow emits:
+//
+//	   1. repo-a
+//	 * 2. repo-b              (the "*" marks the suggested one)
+//	   3. repo-c
+//	   4. owner/svc (remote)  (remote-tagged entries)
+//
+// and returns a multi-select panel: a row of checkboxes (so the user
+// can pick more than one) plus a "select picks" submit button that
+// submits a comma-separated answer. Single-click "Pick N" buttons
+// stay as a quick-path for the common single-pick case. Returns "" if
+// no menu is detected.
+func renderRepoPickButtons(question string) string {
+	type opt struct {
+		num      int
+		name     string
+		isSug    bool
+		isRemote bool
+	}
+	var opts []opt
+	for _, raw := range strings.Split(question, "\n") {
+		line := strings.TrimRight(raw, " \t")
+		trimmed := strings.TrimLeft(line, " \t")
+		isSug := false
+		if strings.HasPrefix(trimmed, "*") {
+			isSug = true
+			trimmed = strings.TrimSpace(trimmed[1:])
+		}
+		dot := strings.IndexByte(trimmed, '.')
+		if dot <= 0 {
+			continue
+		}
+		n, err := strconv.Atoi(strings.TrimSpace(trimmed[:dot]))
+		if err != nil || n < 1 || n > 99 {
+			continue
+		}
+		rest := strings.TrimSpace(trimmed[dot+1:])
+		if rest == "" {
+			continue
+		}
+		isRemote := false
+		if strings.HasSuffix(rest, "(remote)") {
+			isRemote = true
+			rest = strings.TrimSpace(strings.TrimSuffix(rest, "(remote)"))
+		}
+		opts = append(opts, opt{num: n, name: rest, isSug: isSug, isRemote: isRemote})
+	}
+	if len(opts) < 2 {
+		return ""
+	}
+
+	// Unique form id so the multi-select JS doesn't collide if the
+	// page renders several pending questions.
+	mid := fmt.Sprintf("ms%d", time.Now().UnixNano())
+
+	var sb strings.Builder
+	sb.WriteString(`<div class="space-y-2 pt-1">`)
+	sb.WriteString(`<div class="text-[11px] uppercase tracking-wider text-gray-500">Pick one or more — first selected becomes the primary repo:</div>`)
+	fmt.Fprintf(&sb, `<div class="flex flex-wrap gap-2" data-pick-group="%s">`, mid)
+	for _, o := range opts {
+		cls := "border-gray-300 dark:border-surface-border bg-white dark:bg-surface text-gray-700 dark:text-gray-300 hover:border-accent"
+		badge := ""
+		if o.isSug {
+			cls = "border-accent/50 bg-accent-soft text-accent hover:bg-accent hover:text-surface"
+			badge = `<span class="text-[10px] uppercase tracking-wider opacity-70">suggested</span>`
+		}
+		remoteBadge := ""
+		if o.isRemote {
+			remoteBadge = `<span class="text-[10px] uppercase tracking-wider text-violet-600 dark:text-violet-400">remote</span>`
+		}
+		fmt.Fprintf(&sb, `<label class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition cursor-pointer %s">
+			<input type="checkbox" data-pick="%d" data-group="%s" class="h-3.5 w-3.5 accent-accent" onchange="goonPickToggle('%s')">
+			<span class="font-mono text-xs opacity-60">%d</span>
+			<span>%s</span>
+			%s
+			%s
+		</label>`, cls, o.num, mid, mid, o.num, html.EscapeString(o.name), badge, remoteBadge)
+	}
+	sb.WriteString(`</div>`)
+	fmt.Fprintf(&sb, `<div class="flex items-center gap-2 pt-1">
+		<button type="submit" name="answer" data-pick-submit="%s" formnovalidate disabled
+			class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-3 py-1.5 text-sm font-semibold opacity-40 cursor-not-allowed transition">
+			<span data-pick-label="%s">pick a repo</span>
+		</button>
+		<span class="text-[11px] text-gray-500" data-pick-summary="%s"></span>
+	</div>`, mid, mid, mid)
+	sb.WriteString(`</div>`)
+	// One small script — the renderer is called per-question so we
+	// guard via window flag to avoid redefining the function.
+	sb.WriteString(`<script>
+		window.goonPickToggle = window.goonPickToggle || function(mid) {
+			var boxes = document.querySelectorAll('input[data-group="' + mid + '"]:checked');
+			var btn = document.querySelector('button[data-pick-submit="' + mid + '"]');
+			var lbl = document.querySelector('[data-pick-label="' + mid + '"]');
+			var sum = document.querySelector('[data-pick-summary="' + mid + '"]');
+			var nums = Array.from(boxes).map(function(b){ return b.getAttribute('data-pick'); });
+			if (nums.length === 0) {
+				btn.disabled = true;
+				btn.classList.add('opacity-40','cursor-not-allowed');
+				btn.value = '';
+				lbl.textContent = 'pick a repo';
+				if (sum) sum.textContent = '';
+			} else {
+				btn.disabled = false;
+				btn.classList.remove('opacity-40','cursor-not-allowed');
+				btn.value = nums.join(',');
+				lbl.textContent = (nums.length === 1 ? 'use pick' : 'use ' + nums.length + ' picks') + ' →';
+				if (sum) sum.textContent = 'primary: #' + nums[0] + (nums.length > 1 ? ' · others: ' + nums.slice(1).map(function(n){return '#'+n;}).join(', ') : '');
+			}
+		};
+	</script>`)
+	return sb.String()
 }
 
 // emptyState is the standardized empty-list panel — title + helpful hint.
@@ -1043,102 +1643,401 @@ func emptyState(title, hint string) string {
 // Each tab is a small wrapper that sets the section heading + spacing,
 // then defers to the underlying fragment for the actual data.
 
-func (s *Server) fragTabOverview(w http.ResponseWriter, _ *http.Request) {
+// pageHeader renders the common title + optional description + action
+// strip used by every standalone tab composer. Keeps tabs visually
+// consistent.
+func pageHeader(title, blurb, action string) string {
+	desc := ""
+	if blurb != "" {
+		desc = fmt.Sprintf(`<p class="mt-1 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">%s</p>`, blurb)
+	}
+	act := ""
+	if action != "" {
+		act = action
+	}
+	return fmt.Sprintf(`<div class="mb-5 flex items-start justify-between gap-4 flex-wrap">
+		<div>
+			<h2 class="text-xl font-semibold tracking-tight">%s</h2>
+			%s
+		</div>
+		%s
+	</div>`, html.EscapeString(title), desc, act)
+}
+
+// refreshButton is the small "↻ refresh from board" button reused on
+// Questions/Workflows/Tickets/PRs page headers.
+func refreshButton() string {
+	return `<button type="button" hx-post="/api/refresh" hx-target="#page-refresh-result" hx-swap="innerHTML"
+		class="inline-flex items-center gap-1.5 rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1.5 text-xs text-gray-600 dark:text-gray-400 hover:border-accent hover:text-accent transition">
+		<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+		refresh
+	</button>
+	<span id="page-refresh-result"></span>`
+}
+
+// fragTabQuestions — landing page. Pending approvals, blocking work.
+// Inline answer forms (yes / no / repo-pick / free text) so users
+// unblock workflows in one place without flipping tabs.
+func (s *Server) fragTabQuestions(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	st := s.opts.Memory.GetStatus()
-	pending := len(s.opts.Memory.PendingQuestions())
-	wfs := s.opts.Memory.ListWorkflows(20)
-	active, awaiting, done, failed := 0, 0, 0, 0
-	for _, w := range wfs {
-		switch w.State {
-		case memory.WFDone:
-			done++
-		case memory.WFFailed:
-			failed++
-		case memory.WFAwaitingApproval:
-			awaiting++
-		default:
-			active++
-		}
-	}
-
-	// Hero line — "what is goon doing right now?"
-	hero := "Idle — no active workflow."
-	heroTone := "text-gray-500"
-	if !st.Running {
-		hero = "Daemon is stopped. Run `goon start` to begin polling."
-		heroTone = "text-gray-500"
-	} else if st.Paused {
-		hero = "Paused — no new tickets are being picked up."
-		heroTone = "text-amber-700 dark:text-amber-400"
-	} else if active > 0 {
-		hero = fmt.Sprintf("Working on %d ticket%s right now.", active, plural(active, ""))
-		heroTone = "text-accent"
-	} else if awaiting > 0 {
-		hero = fmt.Sprintf("Waiting on you — %d workflow%s paused for approval.", awaiting, plural(awaiting, "s"))
-		heroTone = "text-amber-700 dark:text-amber-400"
-	} else if pending > 0 {
-		hero = fmt.Sprintf("%d question%s waiting for your reply.", pending, plural(pending, "s"))
-		heroTone = "text-amber-700 dark:text-amber-400"
-	}
-
-	// Quick-stat cards across the top.
-	fmt.Fprintf(w, `<div class="mb-6">
-		<h1 class="text-2xl font-semibold tracking-tight">Overview</h1>
-		<p class="mt-1 text-base %s">%s</p>
-	</div>
-
-	<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-		%s
-		%s
-		%s
-		%s
-	</div>`,
-		heroTone, html.EscapeString(hero),
-		statCard("Tickets seen", fmt.Sprintf("%d", len(s.opts.Memory.ListTickets())), "indigo"),
-		statCard("Active workflows", fmt.Sprintf("%d", active), pickTone(active, "accent")),
-		statCard("Pending approval", fmt.Sprintf("%d", awaiting+pending), pickTone(awaiting+pending, "amber")),
-		statCard("Completed", fmt.Sprintf("%d", done), "emerald"),
-	)
-
-	// Two-column main grid: status (left), questions (right).
-	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-
-		<section class="lg:col-span-1 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 shadow-card">
-			<div hx-get="/fragments/status" hx-trigger="load, every 5s, statusChanged from:body" hx-swap="innerHTML">
-				<div class="space-y-3"><div class="skel h-4 w-1/3"></div><div class="skel h-3 w-full"></div><div class="skel h-3 w-2/3"></div></div>
-			</div>
-		</section>
-
-		<section class="lg:col-span-2 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 shadow-card">
-			<h2 class="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-3 flex items-center gap-2">
-				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-				Pending questions
-			</h2>
-			<div hx-get="/fragments/questions" hx-trigger="load, every 5s, questionsChanged from:body" hx-swap="innerHTML">
-				<div class="space-y-2"><div class="skel h-4 w-3/4"></div><div class="skel h-3 w-1/2"></div></div>
-			</div>
-		</section>
-
-		<section class="lg:col-span-3 mt-2">
-			<div class="flex items-baseline justify-between mb-3">
-				<h2 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Recent workflows</h2>
-				<button type="button" onclick="document.querySelector('button[data-tab=workflows]').click()" class="text-xs text-gray-500 hover:text-accent transition">view all →</button>
-			</div>
-			<div hx-get="/fragments/workflows" hx-trigger="load, every 6s" hx-swap="innerHTML">
-				<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-					<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4 space-y-3"><div class="skel h-4 w-1/3"></div><div class="skel h-3 w-full"></div><div class="skel h-2 w-2/3"></div></div>
-					<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4 space-y-3"><div class="skel h-4 w-1/3"></div><div class="skel h-3 w-full"></div><div class="skel h-2 w-2/3"></div></div>
-				</div>
-			</div>
-		</section>
-
+	fmt.Fprint(w, pageHeader("Questions",
+		"Workflows pause here at <code class=\"font-mono text-xs\">confirm_repo</code> and <code class=\"font-mono text-xs\">approve_plan</code> gates. Answer to unblock — replies route to the matching workflow within a second.",
+		""))
+	fmt.Fprint(w, `<div hx-get="/fragments/questions" hx-trigger="load, questionsChanged from:body" hx-swap="morph">
+		<div class="text-sm text-gray-500">Loading approvals…</div>
 	</div>`)
 }
 
-// statCard renders a small KPI tile. Tone maps to a Tailwind palette so
-// the card visually echoes its meaning (e.g. amber for things needing
-// attention, emerald for completed).
+// fragTabWorkflows — workflow runs, deduped per ticket, expandable
+// cards. Auto-refreshes via the workflowsChanged SSE event.
+func (s *Server) fragTabWorkflows(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Workflows",
+		"What goon is doing right now. Each card shows plan progress, the open PR, errors, and a clickable history of earlier attempts.",
+		""))
+	fmt.Fprint(w, `<div hx-get="/fragments/workflows" hx-trigger="load, workflowsChanged from:body" hx-swap="morph">
+		<div class="text-sm text-gray-500">Loading workflows…</div>
+	</div>`)
+}
+
+// fragTabTickets — full ticket table + client-side filter + refresh
+// button. The board mirror, unfiltered by default.
+func (s *Server) fragTabTickets(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Tickets",
+		"Live mirror of the configured board. Click <code class=\"font-mono text-xs\">⋯ actions</code> on any row to comment, transition, or edit the ticket directly.",
+		refreshButton()))
+	// Filter bar.
+	fmt.Fprint(w, `<div class="flex flex-wrap items-center gap-3 mb-3 p-3 rounded-lg bg-gray-50 dark:bg-surface-sunken border border-gray-200 dark:border-surface-border">
+		<div class="relative flex-1 min-w-[200px]">
+			<svg class="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+			<input id="ticket-filter" type="text" placeholder="filter by key, title, assignee, project, label…"
+				class="w-full pl-9 pr-3 py-1.5 text-sm rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"
+				oninput="filterTickets(this.value)">
+		</div>
+		<div class="flex items-center gap-2 text-xs">
+			<span class="text-gray-500">status:</span>
+			<select id="ticket-status-filter" onchange="filterTickets(document.getElementById('ticket-filter').value)"
+				class="rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
+				<option value="">all</option>
+				<option value="open">open</option>
+				<option value="in_progress">in progress</option>
+				<option value="in_review">in review</option>
+				<option value="blocked">blocked</option>
+				<option value="done">done</option>
+			</select>
+		</div>
+		<div class="text-xs text-gray-500 ml-auto"><span id="ticket-count">—</span></div>
+	</div>
+
+	<div hx-get="/fragments/tickets" hx-trigger="load, ticketsChanged from:body" hx-swap="morph">
+		<div class="text-sm text-gray-500">Loading tickets…</div>
+	</div>
+
+	<script>
+	(function() {
+		if (window.filterTickets) return; // defined on first reveal, reuse after.
+		window.filterTickets = function(q) {
+			q = (q || '').trim().toLowerCase();
+			const status = document.getElementById('ticket-status-filter')?.value || '';
+			const rows = document.querySelectorAll('tr[data-ticket-row]');
+			let visible = 0;
+			rows.forEach(function(r) {
+				const text = (r.textContent || '').toLowerCase();
+				const rowStatus = (r.getAttribute('data-status') || '').toLowerCase();
+				const textOK = !q || text.includes(q);
+				const statusOK = !status || rowStatus.includes(status);
+				const show = textOK && statusOK;
+				r.style.display = show ? '' : 'none';
+				if (show) visible++;
+			});
+			const cn = document.getElementById('ticket-count');
+			if (cn) cn.textContent = visible + ' of ' + rows.length + ' shown';
+		};
+		document.body.addEventListener('htmx:afterSwap', function() {
+			const f = document.getElementById('ticket-filter');
+			if (f) filterTickets(f.value);
+		});
+	})();
+	</script>`)
+}
+
+// fragTabPRs — pull requests page. Same content as the in-Work
+// inline section but standalone with a proper page header.
+func (s *Server) fragTabPRs(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, pageHeader("Pull requests",
+		"Approve, comment, or request changes — straight from here, no LLM round-trip. Use <code class=\"font-mono text-xs\">⚙ manage which repos goon follows</code> inside the list to scope the queue.",
+		""))
+	fmt.Fprint(w, `<div hx-get="/fragments/prs" hx-trigger="load, prsChanged from:body" hx-swap="innerHTML">
+		<div class="text-sm text-gray-500">Loading pull requests…</div>
+	</div>`)
+}
+
+// fragTabDashboard — the Home page. Snapshot-of-everything view:
+// stats strip, the live workflow goon is chewing on, blocking
+// questions, recent tickets. Designed to be the first thing a user
+// sees on every visit so they don't have to click around to know
+// "what's happening right now."
+//
+// Every section listens to its own SSE event so the page is
+// incremental — no full reload, just morphs in place when state
+// changes.
+func (s *Server) fragTabDashboard(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	mem := s.opts.Memory
+	st := mem.GetStatus()
+	pending := mem.PendingQuestions()
+	wfs := mem.ListWorkflows(50)
+	tix := mem.ListTickets()
+
+	// --- stats strip --------------------------------------------------
+	// Active workflow count = anything not in a terminal state. Cheap
+	// linear scan — workflow list capped at 50 by ListWorkflows.
+	active := 0
+	var liveWF *memory.Workflow
+	for i := range wfs {
+		w := wfs[i]
+		switch w.State {
+		case memory.WFDone, memory.WFFailed:
+			// terminal
+		default:
+			active++
+			if liveWF == nil || w.UpdatedAt.After(liveWF.UpdatedAt) {
+				cp := w
+				liveWF = &cp
+			}
+		}
+	}
+	lastPoll := "—"
+	if !st.LastPoll.IsZero() {
+		lastPoll = humanizeSince(st.LastPoll)
+	}
+	pendingTone := "neutral"
+	if len(pending) > 0 {
+		pendingTone = "amber"
+	}
+	activeTone := "neutral"
+	if active > 0 {
+		activeTone = "accent"
+	}
+	daemonState := "stopped"
+	daemonTone := "rose"
+	if st.Running {
+		daemonState = "running"
+		daemonTone = "emerald"
+		if st.Paused {
+			daemonState = "paused"
+			daemonTone = "amber"
+		}
+	}
+
+	fmt.Fprint(w, pageHeader("Home",
+		"At-a-glance view of what goon is doing — blocking questions, the live workflow, the daemon's pulse. Everything below auto-refreshes via SSE.",
+		refreshButton()))
+
+	fmt.Fprint(w, `<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">`)
+	fmt.Fprint(w, statCard("pending questions", fmt.Sprintf("%d", len(pending)), pendingTone))
+	fmt.Fprint(w, statCard("active workflows", fmt.Sprintf("%d", active), activeTone))
+	fmt.Fprint(w, statCard("tickets seen", fmt.Sprintf("%d", len(tix)), "neutral"))
+	fmt.Fprint(w, statCard("daemon · "+lastPoll, daemonState, daemonTone))
+	fmt.Fprint(w, `</div>`)
+
+	// --- two-column body: live workflow + sidebar list ----------------
+	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">`)
+
+	// Left column (2/3): live workflow + recent tickets.
+	fmt.Fprint(w, `<div class="lg:col-span-2 space-y-6">`)
+	fmt.Fprint(w, `<section>
+		<div class="flex items-center justify-between mb-2">
+			<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Live workflow</h3>
+			<a href="#" onclick="showPage('workflows');return false;" class="text-xs text-gray-500 hover:text-accent transition">see all →</a>
+		</div>`)
+	if liveWF == nil {
+		fmt.Fprint(w, `<div class="rounded-lg border border-dashed border-gray-300 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40 p-6 text-center text-sm text-gray-500">
+			Nothing running right now. goon polls the board every <code class="font-mono">PollInterval</code> — once a ticket matches, it'll appear here.
+		</div>`)
+	} else {
+		stage := liveWF.Stage
+		if stage == "" {
+			stage = string(liveWF.State)
+		}
+		title := liveWF.Title
+		if title == "" {
+			title = liveWF.TicketKey
+		}
+		fmt.Fprintf(w, `<div class="rounded-lg border border-accent/30 bg-accent/5 p-4">
+			<div class="flex items-start justify-between gap-3">
+				<div class="min-w-0">
+					<div class="text-xs font-mono text-accent">%s · %s</div>
+					<div class="mt-1 text-sm font-semibold truncate">%s</div>
+					<div class="mt-2 text-xs text-gray-500">stage: <code class="font-mono">%s</code> · updated %s</div>
+				</div>
+				<a href="#" onclick="showPage('workflows');return false;" class="text-xs rounded-md border border-accent/40 text-accent px-2.5 py-1 hover:bg-accent/10 transition">open</a>
+			</div>
+		</div>`,
+			html.EscapeString(liveWF.TicketKey),
+			html.EscapeString(string(liveWF.State)),
+			html.EscapeString(title),
+			html.EscapeString(stage),
+			html.EscapeString(humanizeSince(liveWF.UpdatedAt)),
+		)
+	}
+	fmt.Fprint(w, `</section>`)
+
+	// Recent tickets (top 5).
+	fmt.Fprint(w, `<section>
+		<div class="flex items-center justify-between mb-2">
+			<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Recent tickets</h3>
+			<a href="#" onclick="showPage('tickets');return false;" class="text-xs text-gray-500 hover:text-accent transition">see all →</a>
+		</div>`)
+	if len(tix) == 0 {
+		fmt.Fprint(w, `<div class="rounded-lg border border-dashed border-gray-300 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40 p-6 text-center text-sm text-gray-500">
+			No tickets yet. Configure a board under <a href="#" onclick="showPage('setup');return false;" class="text-accent hover:underline">Setup</a> and hit refresh.
+		</div>`)
+	} else {
+		// Sort by UpdatedAt desc, take top 5.
+		recent := append([]memory.TicketSnapshot(nil), tix...)
+		sort.SliceStable(recent, func(i, j int) bool {
+			return recent[i].UpdatedAt.After(recent[j].UpdatedAt)
+		})
+		if len(recent) > 5 {
+			recent = recent[:5]
+		}
+		fmt.Fprint(w, `<ul class="rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised divide-y divide-gray-100 dark:divide-surface-border/60">`)
+		for _, t := range recent {
+			key := t.Key
+			if key == "" {
+				key = t.ID
+			}
+			title := t.Title
+			if title == "" {
+				title = "(no title)"
+			}
+			status := t.Status
+			if status == "" {
+				status = "—"
+			}
+			fmt.Fprintf(w, `<li class="px-3 py-2.5 flex items-center gap-3 text-sm">
+				<span class="font-mono text-xs text-gray-500 shrink-0">%s</span>
+				<span class="flex-1 min-w-0 truncate">%s</span>
+				<span class="text-[11px] font-mono text-gray-500 shrink-0">%s</span>
+				<span class="text-[11px] text-gray-400 shrink-0">%s</span>
+			</li>`,
+				html.EscapeString(key),
+				html.EscapeString(title),
+				html.EscapeString(status),
+				html.EscapeString(humanizeSince(t.UpdatedAt)),
+			)
+		}
+		fmt.Fprint(w, `</ul>`)
+	}
+	fmt.Fprint(w, `</section>`)
+	fmt.Fprint(w, `</div>`) // end left column
+
+	// Right column (1/3): pending questions + quick actions.
+	fmt.Fprint(w, `<div class="space-y-6">`)
+	fmt.Fprint(w, `<section>
+		<div class="flex items-center justify-between mb-2">
+			<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300">Blocking questions</h3>
+			<a href="#" onclick="showPage('questions');return false;" class="text-xs text-gray-500 hover:text-accent transition">answer →</a>
+		</div>`)
+	if len(pending) == 0 {
+		fmt.Fprint(w, `<div class="rounded-lg border border-emerald-500/30 bg-emerald-500/5 p-4 text-sm text-emerald-700 dark:text-emerald-400">
+			✓ no pending approvals. Nothing is waiting on you.
+		</div>`)
+	} else {
+		preview := pending
+		if len(preview) > 3 {
+			preview = preview[:3]
+		}
+		fmt.Fprint(w, `<ul class="space-y-2">`)
+		for _, q := range preview {
+			text := q.Question
+			if len(text) > 140 {
+				text = text[:137] + "…"
+			}
+			fmt.Fprintf(w, `<li class="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-sm">
+				<div class="text-[11px] font-mono text-amber-700 dark:text-amber-400">%s · %s</div>
+				<div class="mt-1 text-gray-700 dark:text-gray-300">%s</div>
+			</li>`,
+				html.EscapeString(q.TicketID),
+				html.EscapeString(humanizeSince(q.When)),
+				html.EscapeString(text),
+			)
+		}
+		fmt.Fprint(w, `</ul>`)
+		if len(pending) > 3 {
+			fmt.Fprintf(w, `<div class="mt-2 text-xs text-gray-500">+%d more — <a href="#" onclick="showPage('questions');return false;" class="text-accent hover:underline">go answer them</a></div>`,
+				len(pending)-3)
+		}
+	}
+	fmt.Fprint(w, `</section>`)
+
+	// Quick actions strip.
+	fmt.Fprint(w, `<section>
+		<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-2">Quick actions</h3>
+		<div class="rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised divide-y divide-gray-100 dark:divide-surface-border/60 text-sm">
+			<button type="button" hx-post="/api/refresh" hx-target="#dash-action-result" hx-swap="innerHTML"
+				class="w-full text-left flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition">
+				<svg class="h-4 w-4 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+				<span>Refresh from board</span>
+			</button>
+			<button type="button" onclick="goonDaemonToggle()"
+				class="w-full text-left flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition">
+				<svg class="h-4 w-4 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+				<span>Pause / resume daemon</span>
+			</button>
+			<a href="#" onclick="showPage('chat');return false;"
+				class="block flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition">
+				<svg class="h-4 w-4 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+				<span>Open chat with goon</span>
+			</a>
+			<a href="#" onclick="showPage('files');return false;"
+				class="block flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition">
+				<svg class="h-4 w-4 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+				<span>Browse the workspace</span>
+			</a>
+			<a href="/docs" target="_blank" rel="noopener"
+				class="block flex items-center gap-3 px-3 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition">
+				<svg class="h-4 w-4 text-gray-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
+				<span>Open documentation</span>
+			</a>
+		</div>
+		<div id="dash-action-result" class="mt-2 text-xs text-gray-500"></div>
+	</section>`)
+
+	fmt.Fprint(w, `</div>`) // end right column
+	fmt.Fprint(w, `</div>`) // end grid
+}
+
+// humanizeSince formats a "X ago" string for any time. Empty for zero
+// values so callers can decide what to show.
+func humanizeSince(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	case d < 7*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+	default:
+		return t.Format("2006-01-02")
+	}
+}
+
+// statCard / pickTone were used by the old Overview tab's KPI grid.
+// The consolidated Work tab dropped that stat strip in favour of a
+// single hero sentence + actionable sections, but the helpers stay
+// here so future tabs can reuse the look without redefining.
+//
+//nolint:unused // retained as a reusable UI primitive.
 func statCard(label, value, tone string) string {
 	var ring, accent string
 	switch tone {
@@ -1167,12 +2066,21 @@ func statCard(label, value, tone string) string {
 	</div>`, ring, html.EscapeString(label), accent, html.EscapeString(value))
 }
 
+// pickTone is the neutral-vs-active selector that complements statCard.
+//
+//nolint:unused
 func pickTone(n int, tone string) string {
 	if n > 0 {
 		return tone
 	}
 	return "neutral"
 }
+
+// Keep package-level references so the unused-helpers above survive
+// dead-code elimination warnings on stricter tooling. The blank var
+// is the conventional Go idiom.
+var _ = statCard
+var _ = pickTone
 
 func plural(n int, suffix string) string {
 	if n == 1 {
@@ -1182,124 +2090,6 @@ func plural(n int, suffix string) string {
 		return "s"
 	}
 	return suffix
-}
-
-func (s *Server) fragTabTickets(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<section>
-		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Tickets</h2>
-				<p class="mt-0.5 text-sm text-gray-500">Live mirror of the configured board. Refreshes automatically while polling.</p>
-			</div>
-			<button type="button" hx-post="/api/refresh" hx-target="#refresh-result" hx-swap="innerHTML"
-				class="inline-flex items-center gap-2 rounded-md border border-accent/40 text-accent px-3.5 py-2 text-sm font-medium hover:bg-accent-soft hover:border-accent transition shadow-sm">
-				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
-				<span>Refresh from board</span>
-			</button>
-		</div>
-		<div id="refresh-result" class="mb-4"></div>
-
-		<!-- Filter bar: built-in client-side search across all rendered rows. -->
-		<div class="flex flex-wrap items-center gap-3 mb-3 p-3 rounded-lg bg-gray-50 dark:bg-surface-sunken border border-gray-200 dark:border-surface-border">
-			<div class="relative flex-1 min-w-[200px]">
-				<svg class="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
-				<input id="ticket-filter" type="text" placeholder="filter by key, title, assignee, project, label…"
-					class="w-full pl-9 pr-3 py-1.5 text-sm rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"
-					oninput="filterTickets(this.value)">
-			</div>
-			<div class="flex items-center gap-2 text-xs">
-				<span class="text-gray-500">status:</span>
-				<select id="ticket-status-filter" onchange="filterTickets(document.getElementById('ticket-filter').value)"
-					class="rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
-					<option value="">all</option>
-					<option value="open">open</option>
-					<option value="in_progress">in progress</option>
-					<option value="in_review">in review</option>
-					<option value="blocked">blocked</option>
-					<option value="done">done</option>
-				</select>
-			</div>
-			<div class="text-xs text-gray-500 ml-auto"><span id="ticket-count">—</span></div>
-		</div>
-
-		<div hx-get="/fragments/tickets" hx-trigger="load, every 6s, statusChanged from:body, ticketsChanged from:body" hx-swap="innerHTML">
-			<div class="rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4 space-y-2">
-				<div class="skel h-4 w-1/4"></div>
-				<div class="skel h-4 w-full"></div>
-				<div class="skel h-4 w-full"></div>
-				<div class="skel h-4 w-5/6"></div>
-			</div>
-		</div>
-	</section>
-
-	<script>
-	// Client-side filter — searches across every visible row's text content
-	// and the data-status attribute. Updates the ticket count summary.
-	(function() {
-		window.filterTickets = function(q) {
-			q = (q || '').trim().toLowerCase();
-			const status = document.getElementById('ticket-status-filter')?.value || '';
-			const rows = document.querySelectorAll('tr[data-ticket-row]');
-			let visible = 0;
-			rows.forEach(r => {
-				const text = (r.textContent || '').toLowerCase();
-				const rowStatus = (r.getAttribute('data-status') || '').toLowerCase();
-				const textOK = !q || text.includes(q);
-				const statusOK = !status || rowStatus.includes(status);
-				const show = textOK && statusOK;
-				r.style.display = show ? '' : 'none';
-				if (show) visible++;
-			});
-			const cn = document.getElementById('ticket-count');
-			if (cn) cn.textContent = visible + ' of ' + rows.length + ' shown';
-		};
-		// Re-apply filter after every htmx swap so freshly-loaded rows respect it.
-		document.body.addEventListener('htmx:afterSwap', () => {
-			const f = document.getElementById('ticket-filter');
-			if (f) filterTickets(f.value);
-		});
-	})();
-	</script>`)
-}
-
-func (s *Server) fragTabWorkflows(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<section>
-		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Workflow runs</h2>
-				<p class="mt-0.5 text-sm text-gray-500">Most recent first. Plan progress, PR link, errors — auto-refreshes every few seconds.</p>
-			</div>
-		</div>
-		<div hx-get="/fragments/workflows" hx-trigger="load, every 4s" hx-swap="innerHTML">
-			<div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
-				<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3"><div class="skel h-4 w-1/3"></div><div class="skel h-3 w-3/4"></div><div class="skel h-2 w-full"></div><div class="skel h-2 w-1/2"></div></div>
-				<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3"><div class="skel h-4 w-1/3"></div><div class="skel h-3 w-3/4"></div><div class="skel h-2 w-full"></div><div class="skel h-2 w-1/2"></div></div>
-			</div>
-		</div>
-	</section>`)
-}
-
-func (s *Server) fragTabQuestions(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<section>
-		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Pending approvals</h2>
-				<p class="mt-0.5 text-sm text-gray-500 max-w-2xl">
-					Workflows pause here at the <code class="font-mono text-xs">confirm_repo</code> and
-					<code class="font-mono text-xs">approve_plan</code> gates. Answer to unblock — replies
-					are routed to the matching workflow on the next daemon tick.
-				</p>
-			</div>
-		</div>
-		<div hx-get="/fragments/questions" hx-trigger="load, every 3s, questionsChanged from:body" hx-swap="innerHTML">
-			<div class="space-y-3">
-				<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3"><div class="skel h-4 w-1/4"></div><div class="skel h-3 w-full"></div><div class="skel h-9 w-full"></div></div>
-			</div>
-		</div>
-	</section>`)
 }
 
 func (s *Server) fragTabConfig(w http.ResponseWriter, _ *http.Request) {

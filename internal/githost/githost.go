@@ -39,6 +39,29 @@ type Host interface {
 	OpenPR(ctx context.Context, opts CreateOptions) (PR, error)
 }
 
+// Repo is one repository hosted on the git provider, surfaced by
+// RepoLister so users can pick from a fetched list at the
+// confirm_repo gate (no typing required, no local checkout needed).
+type Repo struct {
+	Slug          string `json:"slug"`           // "owner/name" — host-native id
+	Name          string `json:"name,omitempty"` // human-friendly display name (often same as basename of slug)
+	URL           string `json:"url,omitempty"`  // HTTPS clone URL
+	DefaultBranch string `json:"default_branch,omitempty"`
+	Description   string `json:"description,omitempty"`
+	Private       bool   `json:"private,omitempty"`
+}
+
+// RepoLister is an optional companion interface for hosts that can
+// enumerate the user's accessible repos. The confirm_repo gate uses
+// this to present a numbered menu so users can multi-pick by number
+// instead of typing paths. Hosts that don't implement it gracefully
+// degrade — the gate falls back to local workspace dir + free-text
+// input.
+type RepoLister interface {
+	Host
+	ListRepos(ctx context.Context) ([]Repo, error)
+}
+
 // PRReviewer is a companion interface for hosts that support reading and
 // reviewing existing PRs (used by the Telegram bot's /prs and /review flows).
 //
@@ -62,6 +85,57 @@ type PRReviewer interface {
 	ApprovePR(ctx context.Context, repo string, number int, body string) error
 	// RequestChangesPR submits a "request changes" review.
 	RequestChangesPR(ctx context.Context, repo string, number int, body string) error
+}
+
+// NormalizeRepoSlug turns whatever the user pasted for a "repo"
+// into the canonical "owner/name" form the host adapters expect.
+//
+// Inputs we accept and what they reduce to:
+//
+//	owner/name                                  → owner/name      (already canonical)
+//	https://github.com/owner/name               → owner/name
+//	https://github.com/owner/name.git           → owner/name
+//	https://github.com/owner/name/pull/42       → owner/name
+//	git@github.com:owner/name.git               → owner/name
+//	https://bitbucket.org/workspace/slug        → workspace/slug
+//	https://bitbucket.org/workspace/slug/src/   → workspace/slug
+//	@owner/name (or owner/name with whitespace) → owner/name
+//
+// Anything we can't parse is returned trimmed and lower-cased to
+// "owner/name" if it has exactly two non-empty path segments —
+// otherwise returned as-is so the host can decide.
+func NormalizeRepoSlug(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return s
+	}
+	// SSH style: git@host:owner/name(.git)?
+	if i := strings.Index(s, "@"); i >= 0 && strings.Contains(s, ":") && !strings.Contains(s, "://") {
+		// strip "git@host:" prefix
+		if colon := strings.Index(s, ":"); colon > i {
+			s = s[colon+1:]
+		}
+	}
+	// HTTPS / HTTP style: drop scheme + host.
+	if idx := strings.Index(s, "://"); idx >= 0 {
+		rest := s[idx+3:]
+		if slash := strings.Index(rest, "/"); slash >= 0 {
+			s = rest[slash+1:]
+		} else {
+			s = ""
+		}
+	}
+	// Drop trailing .git
+	s = strings.TrimSuffix(s, ".git")
+	// Trim leading/trailing slashes.
+	s = strings.Trim(s, "/")
+	// Keep only the first two path segments — "owner/repo/pull/42"
+	// reduces to "owner/repo".
+	parts := strings.Split(s, "/")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "/" + parts[1]
+	}
+	return s
 }
 
 // NewFromEnv selects an adapter by GOON_GIT_HOST.
@@ -96,6 +170,16 @@ type Mock struct {
 	Comments     []MockComment
 	Approved     []int
 	ChangesAsked []MockComment
+	// Repos backs the Mock's ListRepos implementation so tests can
+	// pre-seed an expected menu and assert on the chosen subset.
+	Repos []Repo
+}
+
+// ListRepos returns the prefilled mock repo list.
+func (m *Mock) ListRepos(_ context.Context) ([]Repo, error) {
+	out := make([]Repo, len(m.Repos))
+	copy(out, m.Repos)
+	return out, nil
 }
 
 // MockComment is the structure recorded for posted comments / reviews.

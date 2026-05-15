@@ -4,107 +4,259 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goon — Documentation</title>
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
+  /* ---------- design tokens ---------- */
   :root {
-    --bg: #0e1116; --bg-soft: #161b22; --bg-code: #0a0d12;
-    --fg: #d8dee4; --fg-soft: #8b949e; --fg-mute: #6a737d;
-    --accent: #58a6ff; --accent-soft: #1f6feb33;
-    --warn: #d29922; --err: #f85149; --ok: #3fb950;
-    --border: #30363d;
-    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --bg: #ffffff; --bg-soft: #f7f8fa; --bg-code: #f6f8fa; --bg-elev: #ffffff;
+    --fg: #1c1f24; --fg-soft: #4b5563; --fg-mute: #9ca3af;
+    --accent: #5b6cff; --accent-soft: #eef1ff;
+    --warn: #b45309; --err: #b91c1c; --ok: #15803d;
+    --border: #e5e7eb; --border-soft: #eef0f3;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --shadow-sm: 0 1px 2px rgba(15,23,42,0.04);
+    --shadow:    0 4px 14px -6px rgba(15,23,42,0.12);
+    --topbar-h: 56px;
   }
-  @media (prefers-color-scheme: light) {
+  @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #ffffff; --bg-soft: #f6f8fa; --bg-code: #f6f8fa;
-      --fg: #1f2328; --fg-soft: #57606a; --fg-mute: #6e7781;
-      --accent: #0969da; --accent-soft: #ddf4ff;
-      --warn: #9a6700; --err: #cf222e; --ok: #1a7f37;
-      --border: #d0d7de;
+      --bg: #0d1117; --bg-soft: #11161d; --bg-code: #0a0d12; --bg-elev: #161b22;
+      --fg: #e6edf3; --fg-soft: #9ca3af; --fg-mute: #6b7280;
+      --accent: #7c8cff; --accent-soft: #1e2440;
+      --warn: #d29922; --err: #f87171; --ok: #34d399;
+      --border: #21262d; --border-soft: #1a1f26;
     }
   }
+  html[data-theme="light"] {
+    --bg: #ffffff; --bg-soft: #f7f8fa; --bg-code: #f6f8fa; --bg-elev: #ffffff;
+    --fg: #1c1f24; --fg-soft: #4b5563; --fg-mute: #9ca3af;
+    --accent: #5b6cff; --accent-soft: #eef1ff;
+    --warn: #b45309; --err: #b91c1c; --ok: #15803d;
+    --border: #e5e7eb; --border-soft: #eef0f3;
+  }
+  html[data-theme="dark"] {
+    --bg: #0d1117; --bg-soft: #11161d; --bg-code: #0a0d12; --bg-elev: #161b22;
+    --fg: #e6edf3; --fg-soft: #9ca3af; --fg-mute: #6b7280;
+    --accent: #7c8cff; --accent-soft: #1e2440;
+    --warn: #d29922; --err: #f87171; --ok: #34d399;
+    --border: #21262d; --border-soft: #1a1f26;
+  }
+
+  /* ---------- base ---------- */
   * { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15px; line-height: 1.6; }
+  html, body { margin: 0; padding: 0; min-height: 100%; background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 15.5px; line-height: 1.65; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
   a { color: var(--accent); text-decoration: none; }
-  a:hover { text-decoration: underline; }
+  a:hover { text-decoration: underline; text-underline-offset: 3px; }
   code, pre, kbd { font-family: var(--mono); }
-  code { background: var(--bg-code); padding: 1px 5px; border-radius: 3px; font-size: 0.92em; border: 1px solid var(--border); }
-  pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; overflow-x: auto; font-size: 0.92em; line-height: 1.5; }
+  code { background: var(--bg-code); padding: 1px 6px; border-radius: 4px; font-size: 0.88em; border: 1px solid var(--border-soft); }
+  pre { background: var(--bg-code); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; overflow-x: auto; font-size: 13.5px; line-height: 1.55; position: relative; }
   pre code { background: transparent; border: none; padding: 0; font-size: 1em; }
-  kbd { background: var(--bg-soft); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 3px; padding: 1px 5px; font-size: 0.85em; }
-  blockquote { margin: 0 0 16px; padding: 8px 14px; border-left: 3px solid var(--accent); background: var(--accent-soft); color: var(--fg); border-radius: 0 4px 4px 0; }
-  blockquote.warn { border-color: var(--warn); background: rgba(210, 153, 34, 0.12); }
+  kbd { background: var(--bg-elev); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; font-size: 0.82em; box-shadow: 0 1px 0 rgba(0,0,0,0.05); }
   hr { border: none; border-top: 1px solid var(--border); margin: 32px 0; }
-  table { border-collapse: collapse; margin: 12px 0 20px; width: 100%; }
-  th, td { border-bottom: 1px solid var(--border); padding: 8px 12px; text-align: left; vertical-align: top; }
-  th { font-weight: 600; color: var(--fg-soft); font-size: 0.92em; text-transform: uppercase; letter-spacing: 0.04em; }
-  /* layout */
-  .wrap { display: flex; min-height: 100vh; }
-  nav.toc { width: 260px; flex-shrink: 0; border-right: 1px solid var(--border); padding: 28px 20px; position: sticky; top: 0; align-self: flex-start; max-height: 100vh; overflow-y: auto; background: var(--bg-soft); }
-  nav.toc h1 { font-size: 1.4em; margin: 0 0 4px; letter-spacing: -0.02em; }
-  nav.toc h1 a { color: var(--fg); }
-  nav.toc .tag { font-size: 0.78em; color: var(--fg-mute); margin-bottom: 18px; }
-  nav.toc ol { list-style: none; padding: 0; margin: 0; counter-reset: section; }
-  nav.toc ol li { counter-increment: section; margin: 4px 0; font-size: 0.93em; }
-  nav.toc ol li::before { content: counter(section) ". "; color: var(--fg-mute); }
-  nav.toc ol li a { color: var(--fg-soft); }
-  nav.toc ol li a:hover, nav.toc ol li a.active { color: var(--accent); text-decoration: none; }
-  nav.toc .back { display: inline-block; margin-top: 18px; font-size: 0.85em; color: var(--fg-mute); }
-  main { max-width: 860px; padding: 36px 48px 80px; flex: 1; }
-  section { margin-bottom: 48px; scroll-margin-top: 24px; }
-  section h2 { font-size: 1.65em; margin: 0 0 6px; padding-bottom: 8px; border-bottom: 1px solid var(--border); letter-spacing: -0.01em; }
-  section h2 .num { color: var(--fg-mute); margin-right: 8px; font-weight: 500; }
-  section h3 { font-size: 1.18em; margin: 28px 0 10px; }
-  section h4 { font-size: 1em; margin: 20px 0 6px; color: var(--fg-soft); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 600; }
+  table { border-collapse: collapse; margin: 14px 0 22px; width: 100%; font-size: 0.94em; }
+  th, td { border-bottom: 1px solid var(--border-soft); padding: 10px 14px; text-align: left; vertical-align: top; }
+  thead th { font-weight: 600; color: var(--fg-soft); font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.05em; background: var(--bg-soft); }
+
+  /* ---------- callout (blockquote) ---------- */
+  blockquote { margin: 18px 0; padding: 12px 16px 12px 14px; border-left: 3px solid var(--accent); background: var(--accent-soft); border-radius: 0 8px 8px 0; }
+  blockquote.warn { border-color: var(--warn); background: rgba(210, 153, 34, 0.10); }
+  blockquote.err  { border-color: var(--err);  background: rgba(248, 81, 73, 0.08); }
+  blockquote.ok   { border-color: var(--ok);   background: rgba(34, 197, 94, 0.08); }
+  blockquote p:first-child { margin-top: 0; }
+  blockquote p:last-child { margin-bottom: 0; }
+
+  /* ---------- header ---------- */
+  header.topbar {
+    position: sticky; top: 0; z-index: 50;
+    height: var(--topbar-h);
+    background: color-mix(in srgb, var(--bg) 90%, transparent);
+    backdrop-filter: saturate(140%) blur(10px);
+    -webkit-backdrop-filter: saturate(140%) blur(10px);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; padding: 0 22px; gap: 16px;
+  }
+  header.topbar .brand { display: inline-flex; align-items: center; gap: 9px; color: var(--fg); font-weight: 600; letter-spacing: -0.01em; font-size: 15px; }
+  header.topbar .brand .tag { font-size: 12px; font-weight: 400; color: var(--fg-mute); margin-left: 4px; }
+  header.topbar .spacer { flex: 1; }
+  header.topbar .search {
+    position: relative; max-width: 460px; flex: 1;
+  }
+  header.topbar .search input {
+    width: 100%; height: 36px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg-soft); color: var(--fg);
+    padding: 0 12px 0 36px; font-size: 13.5px; font-family: var(--sans);
+    transition: border-color 120ms, box-shadow 120ms, background 120ms;
+  }
+  header.topbar .search input:focus { outline: none; border-color: var(--accent); background: var(--bg-elev); box-shadow: 0 0 0 3px var(--accent-soft); }
+  header.topbar .search .icon { position: absolute; left: 12px; top: 50%; transform: translateY(-50%); color: var(--fg-mute); width: 16px; height: 16px; pointer-events: none; }
+  header.topbar .search .kbd-hint { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); color: var(--fg-mute); font-size: 11px; }
+  header.topbar .pill-link { display: inline-flex; align-items: center; gap: 6px; padding: 7px 10px; border-radius: 8px; color: var(--fg-soft); font-size: 13px; transition: background 120ms, color 120ms; }
+  header.topbar .pill-link:hover { background: var(--bg-soft); color: var(--fg); text-decoration: none; }
+  header.topbar .icon-btn { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 8px; border: none; background: transparent; cursor: pointer; color: var(--fg-soft); transition: background 120ms, color 120ms; }
+  header.topbar .icon-btn:hover { background: var(--bg-soft); color: var(--fg); }
+
+  /* ---------- 3-column shell ---------- */
+  .shell { display: grid; grid-template-columns: 280px minmax(0, 1fr) 260px; gap: 0; max-width: 1400px; margin: 0 auto; }
+  aside.left, aside.right { position: sticky; top: var(--topbar-h); height: calc(100vh - var(--topbar-h)); overflow-y: auto; padding: 26px 22px; }
+  aside.left { border-right: 1px solid var(--border); }
+  aside.right { border-left: 1px solid var(--border); }
+
+  /* ---------- left TOC ---------- */
+  aside.left .group-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute); margin: 18px 6px 8px; }
+  aside.left .group-label:first-child { margin-top: 0; }
+  aside.left .toc-search { position: relative; margin-bottom: 16px; }
+  aside.left .toc-search input { width: 100%; height: 32px; padding: 0 10px 0 30px; border-radius: 7px; border: 1px solid var(--border); background: var(--bg-soft); color: var(--fg); font-size: 12.5px; font-family: var(--sans); }
+  aside.left .toc-search input:focus { outline: none; border-color: var(--accent); }
+  aside.left .toc-search .icon { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--fg-mute); pointer-events: none; }
+  nav.toc ol { list-style: none; padding: 0; margin: 0; }
+  nav.toc li { margin: 2px 0; }
+  nav.toc li a { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-radius: 6px; color: var(--fg-soft); font-size: 13.5px; line-height: 1.35; transition: background 120ms, color 120ms; }
+  nav.toc li a:hover { background: var(--bg-soft); color: var(--fg); text-decoration: none; }
+  nav.toc li a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  nav.toc li.hidden { display: none; }
+  nav.toc li a .toc-num { color: var(--fg-mute); font-variant-numeric: tabular-nums; font-size: 12px; min-width: 18px; }
+  nav.toc li a.active .toc-num { color: var(--accent); }
+
+  /* ---------- main content ---------- */
+  main.content { padding: 36px 56px 96px; min-width: 0; }
+  main.content .crumb { font-size: 12.5px; color: var(--fg-mute); margin-bottom: 18px; }
+  main.content .crumb a { color: var(--fg-soft); }
+  main.content .page-title { font-size: 2.1em; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.02em; font-weight: 700; }
+  main.content .page-blurb { color: var(--fg-soft); font-size: 1.04em; margin: 0 0 28px; }
+
+  section { margin-bottom: 56px; scroll-margin-top: calc(var(--topbar-h) + 18px); }
+  section h2 { font-size: 1.6em; margin: 0 0 4px; padding-top: 8px; letter-spacing: -0.015em; font-weight: 700; }
+  section h2 .num { display: inline-block; min-width: 28px; color: var(--fg-mute); font-weight: 500; margin-right: 6px; font-size: 0.78em; vertical-align: 0.18em; }
+  section > h2 + p, section > h2 + .lead { color: var(--fg-soft); margin-top: 6px; }
+  section h3 { font-size: 1.18em; margin: 32px 0 10px; font-weight: 600; letter-spacing: -0.005em; scroll-margin-top: calc(var(--topbar-h) + 18px); }
+  section h4 { font-size: 0.82em; margin: 22px 0 8px; color: var(--fg-soft); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
   section p { margin: 0 0 14px; }
-  ul, ol { padding-left: 22px; }
-  li { margin: 4px 0; }
-  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 0.78em; font-weight: 600; letter-spacing: 0.02em; }
-  .pill.ok { background: rgba(63,185,80,0.15); color: var(--ok); }
-  .pill.warn { background: rgba(210,153,34,0.15); color: var(--warn); }
-  .pill.err { background: rgba(248,81,73,0.15); color: var(--err); }
+  section ul, section ol { padding-left: 22px; }
+  section li { margin: 5px 0; }
+
+  /* ---------- pills, cards, details ---------- */
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 600; letter-spacing: 0.02em; }
+  .pill.ok { background: rgba(34,197,94,0.14); color: var(--ok); }
+  .pill.warn { background: rgba(210,153,34,0.16); color: var(--warn); }
+  .pill.err { background: rgba(248,81,73,0.16); color: var(--err); }
   .pill.acc { background: var(--accent-soft); color: var(--accent); }
-  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin: 12px 0 20px; }
-  .card { border: 1px solid var(--border); border-radius: 6px; padding: 14px 16px; background: var(--bg-soft); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 14px 0 22px; }
+  .card { border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; background: var(--bg-elev); box-shadow: var(--shadow-sm); }
   .card h4 { margin-top: 0; }
   .small { font-size: 0.92em; color: var(--fg-soft); }
-  details { margin: 8px 0; border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px; background: var(--bg-soft); }
+  details { margin: 10px 0; border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; background: var(--bg-elev); }
   details summary { cursor: pointer; font-weight: 600; }
-  details[open] summary { margin-bottom: 8px; }
+  details[open] summary { margin-bottom: 10px; }
+
+  /* ---------- right rail (on this page) ---------- */
+  aside.right .rail-label { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute); margin: 0 0 12px; }
+  aside.right ol.rail { list-style: none; padding: 0; margin: 0; border-left: 1px solid var(--border-soft); }
+  aside.right ol.rail li { margin: 0; }
+  aside.right ol.rail a { display: block; padding: 5px 12px; margin-left: -1px; border-left: 2px solid transparent; color: var(--fg-soft); font-size: 12.5px; line-height: 1.4; transition: color 120ms, border-color 120ms; }
+  aside.right ol.rail a:hover { color: var(--fg); text-decoration: none; }
+  aside.right ol.rail a.active { color: var(--accent); border-left-color: var(--accent); font-weight: 600; }
+
+  /* ---------- code copy button ---------- */
+  pre .copy-btn {
+    position: absolute; top: 8px; right: 8px;
+    background: var(--bg-elev); color: var(--fg-soft);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 4px 9px; font-size: 11px; font-family: var(--sans);
+    opacity: 0; transition: opacity 120ms, color 120ms, background 120ms;
+    cursor: pointer;
+  }
+  pre:hover .copy-btn { opacity: 1; }
+  pre .copy-btn:hover { color: var(--fg); background: var(--bg-soft); }
+  pre .copy-btn.copied { color: var(--ok); border-color: var(--ok); opacity: 1; }
+
+  /* ---------- mobile nav ---------- */
+  .mobile-toggle { display: none; }
+  @media (max-width: 1100px) {
+    .shell { grid-template-columns: 240px minmax(0, 1fr); }
+    aside.right { display: none; }
+  }
   @media (max-width: 760px) {
-    .wrap { flex-direction: column; }
-    nav.toc { width: 100%; position: static; max-height: none; border-right: none; border-bottom: 1px solid var(--border); }
-    main { padding: 24px 18px 60px; }
+    .shell { grid-template-columns: minmax(0, 1fr); }
+    aside.left { display: none; position: fixed; top: var(--topbar-h); left: 0; right: 0; bottom: 0; height: auto; background: var(--bg); z-index: 40; border-right: none; border-bottom: 1px solid var(--border); }
+    aside.left.open { display: block; }
+    main.content { padding: 22px 18px 70px; }
+    header.topbar { padding: 0 14px; gap: 10px; }
+    header.topbar .search { max-width: none; }
+    header.topbar .brand .tag { display: none; }
+    .mobile-toggle { display: inline-flex; }
     .grid { grid-template-columns: 1fr; }
   }
 </style>
 </head>
 <body>
-<div class="wrap">
 
-<nav class="toc">
-  <h1><a href="/">goon</a></h1>
-  <div class="tag">documentation · v0.1</div>
-  <ol>
-    <li><a href="#what">What is goon</a></li>
-    <li><a href="#quickstart">Quick start</a></li>
-    <li><a href="#config">Configuration</a></li>
-    <li><a href="#commands">Commands</a></li>
-    <li><a href="#workflow">The autonomous workflow</a></li>
-    <li><a href="#approval">Approval gates</a></li>
-    <li><a href="#memory">Memory</a></li>
-    <li><a href="#telegram">Telegram bot</a></li>
-    <li><a href="#customize">Customize the pipeline</a></li>
-    <li><a href="#tools">Tools shipped</a></li>
-    <li><a href="#providers">LLM providers</a></li>
-    <li><a href="#safety">Safety model</a></li>
-    <li><a href="#troubleshoot">Troubleshooting</a></li>
-    <li><a href="#faq">FAQ</a></li>
-  </ol>
-  <a class="back" href="/">← back to dashboard</a>
-</nav>
+<header class="topbar">
+  <button class="icon-btn mobile-toggle" id="mobile-toggle" aria-label="Toggle sidebar">
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+  </button>
+  <a href="/" class="brand" aria-label="goon home">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+    </svg>
+    <span>goon</span>
+    <span class="tag">docs · v0.1</span>
+  </a>
+  <div class="spacer"></div>
+  <div class="search">
+    <svg class="icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+    <input id="doc-search" type="search" placeholder="Search the docs…" autocomplete="off" spellcheck="false">
+    <kbd class="kbd-hint">/</kbd>
+  </div>
+  <a class="pill-link" href="/app" title="Open the dashboard">Dashboard</a>
+  <a class="pill-link" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener" title="GitHub">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .5C5.65.5.5 5.65.5 12c0 5.08 3.29 9.39 7.86 10.91.58.11.79-.25.79-.56v-2c-3.2.7-3.87-1.54-3.87-1.54-.52-1.32-1.27-1.67-1.27-1.67-1.04-.71.08-.7.08-.7 1.15.08 1.76 1.18 1.76 1.18 1.02 1.75 2.68 1.25 3.34.96.1-.74.4-1.25.73-1.54-2.55-.29-5.24-1.28-5.24-5.69 0-1.26.45-2.29 1.18-3.1-.12-.3-.51-1.5.11-3.12 0 0 .97-.31 3.19 1.18.92-.26 1.9-.39 2.88-.4.98.01 1.96.14 2.88.4 2.22-1.49 3.19-1.18 3.19-1.18.62 1.62.23 2.82.11 3.12.73.81 1.18 1.84 1.18 3.1 0 4.42-2.69 5.4-5.25 5.69.41.35.77 1.05.77 2.12v3.14c0 .31.21.68.8.56C20.21 21.39 23.5 17.07 23.5 12 23.5 5.65 18.35.5 12 .5z"/></svg>
+  </a>
+  <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+    <svg id="theme-icon" width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+  </button>
+</header>
 
-<main>
+<div class="shell">
+
+<aside class="left" id="sidebar">
+  <nav class="toc">
+    <div class="toc-search">
+      <svg class="icon" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd"/></svg>
+      <input id="toc-filter" type="search" placeholder="Filter sections…" autocomplete="off">
+    </div>
+    <div class="group-label">Get started</div>
+    <ol>
+      <li><a href="#what"><span class="toc-num">1</span>What is goon</a></li>
+      <li><a href="#quickstart"><span class="toc-num">2</span>Quick start</a></li>
+      <li><a href="#config"><span class="toc-num">3</span>Configuration</a></li>
+      <li><a href="#commands"><span class="toc-num">4</span>Commands</a></li>
+    </ol>
+    <div class="group-label">Guides</div>
+    <ol>
+      <li><a href="#workflow"><span class="toc-num">5</span>The autonomous workflow</a></li>
+      <li><a href="#approval"><span class="toc-num">6</span>Approval gates</a></li>
+      <li><a href="#memory"><span class="toc-num">7</span>Memory</a></li>
+      <li><a href="#telegram"><span class="toc-num">8</span>Telegram bot</a></li>
+      <li><a href="#customize"><span class="toc-num">9</span>Customize the pipeline</a></li>
+    </ol>
+    <div class="group-label">Reference</div>
+    <ol>
+      <li><a href="#tools"><span class="toc-num">10</span>Tools shipped</a></li>
+      <li><a href="#providers"><span class="toc-num">11</span>LLM providers</a></li>
+      <li><a href="#safety"><span class="toc-num">12</span>Safety model</a></li>
+      <li><a href="#troubleshoot"><span class="toc-num">13</span>Troubleshooting</a></li>
+      <li><a href="#faq"><span class="toc-num">14</span>FAQ</a></li>
+    </ol>
+  </nav>
+</aside>
+
+<main class="content"><!-- gitbook-style: 3-column shell, content max-width comes from .content -->
+
+<div class="crumb"><a href="/">goon</a> / <span>Documentation</span></div>
+<h1 class="page-title">goon documentation</h1>
+<p class="page-blurb">Everything you need to run goon — quick start, configuration knobs, the autonomous workflow, customization, and the safety model. Use the search box (or hit <kbd>/</kbd>) to jump anywhere.</p>
+
 
 <section id="what">
   <h2><span class="num">1</span>What is goon</h2>
@@ -118,7 +270,7 @@
   <p>You can drive it from three places, all backed by the same memory store:</p>
   <ul>
     <li><strong>CLI</strong> — <code>goon "task"</code>, <code>goon start</code>, <code>goon train</code>, etc.</li>
-    <li><strong>Web UI</strong> — this page; the dashboard at <a href="/">/</a> mirrors every CLI command.</li>
+    <li><strong>Web UI</strong> — this page; the dashboard at <a href="/app">/app</a> mirrors every CLI command.</li>
     <li><strong>Telegram bot</strong> — DM your bot to monitor, approve, review PRs, or chat with the model.</li>
   </ul>
   <h3>Why goon is different</h3>
@@ -194,6 +346,7 @@ goon config path         # print the config file path</code></pre>
     <tr><th>Provider</th><th>Switch</th><th>Required env vars</th></tr>
     <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>OPENAI_API_KEY</code></td></tr>
     <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>ANTHROPIC_API_KEY</code></td></tr>
+    <tr><td>Gemini</td><td><code>GOON_LLM_PROVIDER=gemini</code></td><td><code>GEMINI_API_KEY</code> (or <code>GOOGLE_API_KEY</code>)</td></tr>
     <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td>just run <code>ollama serve</code> + <code>ollama pull llama3</code></td></tr>
     <tr><td>Mock (offline)</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td><code>GOON_MOCK_REPLIES</code> (canned JSON)</td></tr>
   </table>
@@ -469,6 +622,7 @@ goon workflow hooks    # list every hook name + env vars</code></pre>
     <tr><th>Provider</th><th>Switch</th><th>Default model</th></tr>
     <tr><td>OpenAI</td><td><code>GOON_LLM_PROVIDER=openai</code></td><td><code>gpt-4o-mini</code></td></tr>
     <tr><td>Anthropic</td><td><code>GOON_LLM_PROVIDER=anthropic</code></td><td><code>claude-sonnet-4-5</code></td></tr>
+    <tr><td>Gemini</td><td><code>GOON_LLM_PROVIDER=gemini</code></td><td><code>gemini-2.5-flash</code></td></tr>
     <tr><td>Ollama (local)</td><td><code>GOON_LLM_PROVIDER=ollama</code></td><td><code>llama3</code></td></tr>
     <tr><td>Mock</td><td><code>GOON_LLM_PROVIDER=mock</code></td><td>(offline fixtures)</td></tr>
   </table>
@@ -578,6 +732,170 @@ goon uninstall --yes --purge   # also removes the binary</code></pre>
 
 </main>
 
-</div>
+<aside class="right">
+  <div class="rail-label">On this page</div>
+  <ol class="rail" id="page-outline"></ol>
+</aside>
+
+</div><!-- /shell -->
+
+<script>
+(function() {
+  // ---------- theme toggle ----------
+  // Saved preference in localStorage; falls back to OS preference.
+  const root = document.documentElement;
+  const applyTheme = (t) => {
+    if (t === 'auto' || !t) { root.removeAttribute('data-theme'); return; }
+    root.setAttribute('data-theme', t);
+  };
+  try { applyTheme(localStorage.getItem('goonDocsTheme')); } catch (_) {}
+  document.getElementById('theme-toggle').addEventListener('click', () => {
+    const current = root.getAttribute('data-theme');
+    // cycle: auto -> light -> dark -> auto
+    const next = !current ? 'light' : (current === 'light' ? 'dark' : 'auto');
+    applyTheme(next);
+    try { localStorage.setItem('goonDocsTheme', next); } catch (_) {}
+  });
+
+  // ---------- mobile sidebar ----------
+  const sidebar = document.getElementById('sidebar');
+  document.getElementById('mobile-toggle').addEventListener('click', () => {
+    sidebar.classList.toggle('open');
+  });
+  // Auto-close on link click (mobile).
+  sidebar.addEventListener('click', (e) => {
+    if (e.target.closest('a')) sidebar.classList.remove('open');
+  });
+
+  // ---------- left TOC filter ----------
+  const filterInput = document.getElementById('toc-filter');
+  filterInput.addEventListener('input', () => {
+    const q = filterInput.value.trim().toLowerCase();
+    sidebar.querySelectorAll('nav.toc li').forEach((li) => {
+      const text = li.textContent.toLowerCase();
+      li.classList.toggle('hidden', q !== '' && !text.includes(q));
+    });
+  });
+
+  // ---------- top search: jumps to first matching section ----------
+  const search = document.getElementById('doc-search');
+  const sections = Array.from(document.querySelectorAll('main.content section'));
+  function findMatch(q) {
+    q = q.trim().toLowerCase();
+    if (!q) return null;
+    // prefer exact h2 match, then h3, then any text.
+    for (const s of sections) {
+      const h2 = s.querySelector('h2');
+      if (h2 && h2.textContent.toLowerCase().includes(q)) return s;
+    }
+    for (const s of sections) {
+      const h3 = s.querySelector('h3');
+      if (h3 && h3.textContent.toLowerCase().includes(q)) return h3.closest('section');
+    }
+    for (const s of sections) {
+      if (s.textContent.toLowerCase().includes(q)) return s;
+    }
+    return null;
+  }
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const hit = findMatch(search.value);
+      if (hit) {
+        history.replaceState(null, '', '#' + hit.id);
+        hit.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    } else if (e.key === 'Escape') {
+      search.value = ''; search.blur();
+    }
+  });
+
+  // '/' focuses search from anywhere.
+  document.addEventListener('keydown', (e) => {
+    const tag = (document.activeElement && document.activeElement.tagName) || '';
+    const inField = tag === 'INPUT' || tag === 'TEXTAREA' || document.activeElement.isContentEditable;
+    if (e.key === '/' && !inField) {
+      e.preventDefault(); search.focus(); search.select();
+    }
+  });
+
+  // ---------- copy buttons on <pre> ----------
+  document.querySelectorAll('main.content pre').forEach((pre) => {
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.className = 'copy-btn'; btn.textContent = 'copy';
+    btn.addEventListener('click', () => {
+      const code = pre.querySelector('code') || pre;
+      const text = code.textContent;
+      try {
+        navigator.clipboard.writeText(text).then(() => {
+          btn.textContent = 'copied'; btn.classList.add('copied');
+          setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1400);
+        });
+      } catch (_) {
+        // Fallback: temporary textarea
+        const ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); btn.textContent = 'copied'; } catch (__) {}
+        document.body.removeChild(ta);
+        setTimeout(() => { btn.textContent = 'copy'; }, 1400);
+      }
+    });
+    pre.appendChild(btn);
+  });
+
+  // ---------- right rail: "On this page" outline + scroll-spy ----------
+  // Auto-generated from the current section's h3s, refreshed on hash change.
+  const outline = document.getElementById('page-outline');
+  function buildOutlineFor(section) {
+    if (!section) { outline.innerHTML = ''; return []; }
+    const h3s = Array.from(section.querySelectorAll('h3'));
+    // Give every h3 a stable id so anchor links work.
+    h3s.forEach((h, i) => { if (!h.id) h.id = section.id + '--' + (i+1); });
+    outline.innerHTML = h3s.map((h) =>
+      `<li><a href="#${h.id}" data-anchor="${h.id}">${h.textContent}</a></li>`
+    ).join('');
+    return h3s;
+  }
+  let trackedH3s = [];
+  function currentSection() {
+    // Pick the section closest to the top of the viewport.
+    let best = sections[0], bestTop = -Infinity;
+    for (const s of sections) {
+      const top = s.getBoundingClientRect().top;
+      if (top <= 120 && top > bestTop) { best = s; bestTop = top; }
+    }
+    return best;
+  }
+  function refreshRail() {
+    const sec = currentSection();
+    if (!sec) { trackedH3s = []; return; }
+    if (outline.dataset.section !== sec.id) {
+      trackedH3s = buildOutlineFor(sec);
+      outline.dataset.section = sec.id;
+    }
+    // active link in left TOC
+    document.querySelectorAll('nav.toc a').forEach((a) => {
+      a.classList.toggle('active', a.getAttribute('href') === '#' + sec.id);
+    });
+    // active anchor in right rail
+    const y = 140;
+    let active = trackedH3s[0];
+    for (const h of trackedH3s) {
+      if (h.getBoundingClientRect().top <= y) active = h;
+    }
+    document.querySelectorAll('aside.right ol.rail a').forEach((a) => {
+      a.classList.toggle('active', active && a.getAttribute('data-anchor') === active.id);
+    });
+  }
+  let rafScheduled = false;
+  window.addEventListener('scroll', () => {
+    if (rafScheduled) return;
+    rafScheduled = true;
+    requestAnimationFrame(() => { refreshRail(); rafScheduled = false; });
+  }, { passive: true });
+  window.addEventListener('hashchange', refreshRail);
+  refreshRail();
+})();
+</script>
+
 </body>
 </html>

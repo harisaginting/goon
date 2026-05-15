@@ -41,6 +41,14 @@ var menuCommands = []struct {
 	{"tickets", "List tickets goon has seen + status"},
 	{"ticket", "Show a ticket: /ticket <id-or-key>"},
 	{"knowledge", "What goon knows — PINNED.md + topic-note index"},
+	{"skills", "Specialist skills: /skills list|read|write|delete"},
+	{"jira", "Jira actions: /jira search|comment|move|edit (no LLM needed)"},
+	{"mine", "Tickets assigned to me (alias for /jira mine)"},
+	{"open", "Every open ticket (alias for /jira open)"},
+	{"reported", "Tickets I reported (alias for /jira reported)"},
+	{"blocked", "Tickets in blocked status (alias for /jira blocked)"},
+	{"repos", "List & pick which repos goon follows (writes GOON_REVIEW_REPOS)"},
+	{"personal", "Read or edit goon's character: /personal | /personal set <body> | /personal reset"},
 	{"refresh", "Pull a fresh ticket snapshot from the board NOW"},
 	{"pause", "Pause the daemon's poll loop"},
 	{"resume", "Resume the daemon's poll loop"},
@@ -89,7 +97,7 @@ func (b *Bot) registerCommands(ctx context.Context) error {
 
 // helpText is what `/help` returns. Kept short so it fits in one Telegram
 // message and reads well on a phone screen.
-const helpText = `goon bot — commands
+const helpText = `👑 goon bot — commands
 
 auth:
   /auth <secret>   one-time login with the shared GOON_TELEGRAM_SECRET
@@ -156,6 +164,14 @@ var builtins = map[string]bool{
 	"knowledge": true,
 	"refresh":   true,
 	"memory":    true,
+	"skills":    true,
+	"jira":      true,
+	"mine":      true,
+	"open":      true,
+	"reported":  true,
+	"blocked":   true,
+	"repos":     true,
+	"personal":  true,
 	"queue":     true,
 	"answer":    true,
 	"prs":       true,
@@ -184,7 +200,9 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 	// as a friendly hello instead, regardless of disallowedCLI.
 	if cmd == "start" {
 		_ = b.Send(ctx, chatID,
-			"👋 you're authenticated. Try /status to see daemon state, /help for the full command list, or send any plain text to chat with the model.")
+			"👑 goon — your autonomous engineer.\n"+
+				"You're authenticated. Try /status to see daemon state, /help for the full command list, "+
+				"or send any plain text to chat with the model.")
 		return
 	}
 	if disallowedCLI[cmd] {
@@ -213,6 +231,24 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 		b.cmdRefresh(ctx, chatID)
 	case "memory":
 		b.cmdMemory(ctx, chatID, args)
+	case "skills":
+		b.cmdSkills(ctx, chatID, args)
+	case "jira":
+		b.cmdJira(ctx, chatID, args)
+	// Top-level shortcuts for the most common queries — saves typing
+	// /jira <sub>. Each just delegates to the /jira router.
+	case "mine":
+		b.cmdJira(ctx, chatID, append([]string{"mine"}, args...))
+	case "open":
+		b.cmdJira(ctx, chatID, append([]string{"open"}, args...))
+	case "reported":
+		b.cmdJira(ctx, chatID, append([]string{"reported"}, args...))
+	case "blocked":
+		b.cmdJira(ctx, chatID, append([]string{"blocked"}, args...))
+	case "repos":
+		b.cmdRepos(ctx, chatID, args)
+	case "personal":
+		b.cmdPersonal(ctx, chatID, args)
 	case "queue":
 		b.cmdQueue(ctx, chatID)
 	case "answer":
@@ -374,8 +410,15 @@ func (b *Bot) cmdAnswer(ctx context.Context, chatID int64, args []string) {
 		return
 	}
 	logx.Info("telegram_bot.answer", "chat", chatID, "qid", qid)
+	// Wake the daemon so the paused workflow resumes immediately
+	// instead of waiting up to PollInterval. Nil-safe: if the bot
+	// was started without a Daemon reference, the workflow still
+	// resumes on the next scheduled tick.
+	if b.opts.Daemon != nil {
+		b.opts.Daemon.Wake()
+	}
 	_ = b.Send(ctx, chatID,
-		"✓ answered "+qid+"\nthe daemon resumes on its next poll tick (≤ "+pollIntervalLabel()+"). Use /status to check.")
+		"✓ answered "+qid+"\n→ daemon resuming now. Use /status to check.")
 }
 
 // pollIntervalLabel returns a human-readable poll interval ("5m", "30s")

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/harisaginting/goon/internal/notes"
+	"github.com/harisaginting/goon/internal/personal"
 	"github.com/harisaginting/goon/internal/tools"
 )
 
@@ -25,6 +26,19 @@ import (
 // is in the model's context on every call.
 func SystemPrompt(reg *tools.Registry) string {
 	manifest := reg.Manifest()
+
+	// Personal block — goon's character / voice / defaults. Auto-
+	// loaded into every prompt so the model speaks consistently.
+	// Sits ABOVE the pinned-knowledge block because personality
+	// shapes how project facts are delivered.
+	personalBlock := ""
+	if body := personal.Read(); body != "" {
+		personalBlock = fmt.Sprintf(`
+CHARACTER (always loaded, from %s):
+%s
+
+`, personal.Path(), body)
+	}
 
 	// Pinned memory block — best-effort. Failures to open the store are
 	// silently swallowed because a missing/unreadable memory dir is the
@@ -70,7 +84,7 @@ TOOLS:
 - For destructive shell actions, prefer the safest variant and rely on the executor's confirmation.
 - After completing the user's task or if blocked, call "finish" with a one-paragraph summary.
 - Maximum %d steps total — choose the highest-leverage step each turn.
-`, pinnedBlock, manifest, memoryHowto, MaxSteps)
+`, personalBlock+pinnedBlock, manifest, memoryHowto, MaxSteps)
 }
 
 // BuildUserContext stitches the user task with the runtime context block.

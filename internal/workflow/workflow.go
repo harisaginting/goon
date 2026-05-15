@@ -30,6 +30,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -72,6 +74,56 @@ func RepoMap() map[string]string {
 		}
 		out[strings.TrimSpace(kv[:eq])] = strings.TrimSpace(kv[eq+1:])
 	}
+	return out
+}
+
+// WorkspaceDir returns the configured GOON_WORKSPACE_DIR — a parent
+// directory that holds multiple git repos as immediate children.
+// When set, the confirm_repo gate enumerates the workspace's repos
+// and presents them as a numbered list instead of asking the user to
+// type a path. Empty when unset.
+func WorkspaceDir() string {
+	return strings.TrimSpace(os.Getenv("GOON_WORKSPACE_DIR"))
+}
+
+// DiscoverWorkspaceRepos returns every immediate subdirectory of
+// GOON_WORKSPACE_DIR that contains a .git entry (file or dir — so
+// both standard checkouts and git worktrees count). The returned
+// paths are absolute. Empty slice when the workspace is unset or
+// unreadable; we never error out — the gate falls back to "type a
+// path" mode in that case.
+//
+// Sorted alphabetically so the numbered list is stable across calls;
+// users build muscle memory for "option 1 is always X".
+func DiscoverWorkspaceRepos() []string {
+	dir := WorkspaceDir()
+	if dir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		// Skip hidden directories (.git, .vscode, etc.) — the workspace
+		// root might itself BE a project containing tools alongside
+		// repos and we don't want to offer ".cache" as a candidate.
+		if strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		full := filepath.Join(dir, e.Name())
+		// Treat a directory as a repo if it has a .git entry — works
+		// for both normal clones (dir) and git-worktree (file).
+		if _, err := os.Stat(filepath.Join(full, ".git")); err != nil {
+			continue
+		}
+		out = append(out, full)
+	}
+	sort.Strings(out)
 	return out
 }
 
@@ -249,7 +301,7 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 			i = indexOfPhase(phases, "triage") - 1 // -1 because the for-loop's i++ runs next
 			continue
 		}
-		hctx := FromTicket(t, wf.Repo, branch, wf.Plan)
+		hctx := FromTicketMulti(t, wf.Repo, wf.Repos, branch, wf.Plan)
 		e.runFailureHook(ctx, hr, cfg, hctx, err)
 		return e.fail(wf, phases[i].name, err)
 	}
@@ -435,8 +487,12 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 		suggested = e.pickRepoForTicket(t)
 		wf.Repo = suggested
 	}
-	q := fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
-		t.Key, t.Title, suggested)
+	// Build the candidate list from BOTH the local workspace and the
+	// configured git host. The user picks one or more by number; the
+	// menu uses stable indexing so "Pick 2" always points at the same
+	// repo within a single question lifetime.
+	candidates := e.buildRepoCandidates(ctx, t)
+	q := buildRepoGateQuestion(t, suggested, candidates)
 	ans, ready, err := e.gate(ctx, wf, t, "confirm_repo", q)
 	if err != nil {
 		return err
@@ -444,16 +500,183 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 	if !ready {
 		return errPaused
 	}
-	if newRepo, ok := parseRepoChange(ans); ok {
-		wf.Repo = newRepo
-	} else if !isYes(ans) {
-		return fmt.Errorf("user rejected repo: %s", ans)
+	switch {
+	case isYes(ans):
+		// accept the suggestion as-is
+	default:
+		// Try multi-pick first ("1,3,5" or "1 3 5"); falls back to
+		// a single number, then change=<path>, then rejection.
+		if picks, ok := pickWorkspaceReposMulti(ans, candidates); ok {
+			if len(picks) > 0 {
+				wf.Repo = picks[0]
+				wf.Repos = picks
+			}
+		} else if newRepo, ok := parseRepoChange(ans); ok {
+			wf.Repo = newRepo
+			wf.Repos = []string{newRepo}
+		} else {
+			return fmt.Errorf("user rejected repo: %s", ans)
+		}
+	}
+	if len(wf.Repos) == 0 && wf.Repo != "" {
+		wf.Repos = []string{wf.Repo}
 	}
 	ensureApproval(wf, "confirm_repo", ans)
+	// Remember the primary pick per project so subsequent tickets
+	// from the same project skip the gate. Multi-repo workflows
+	// still get full visibility via wf.Repos.
 	e.rememberRepo(t.Project, wf.Repo)
 	wf.State = memory.WFPlanning
 	e.save(*wf)
 	return nil
+}
+
+// repoCandidate is one entry in the confirm_repo numbered menu —
+// either a local workspace clone or a remote git-host repo. We carry
+// a flag so the prompt can label it ("/path/to/repo" vs "owner/name
+// (remote)") and so callers know whether to clone before executing.
+type repoCandidate struct {
+	Label    string // human-readable name for the menu
+	Value    string // what gets stored in wf.Repo / wf.Repos
+	IsRemote bool   // false = local workspace clone; true = host slug
+}
+
+// buildRepoCandidates merges the local workspace + the git host's
+// repo list (when reachable) into a single deduped, sorted slice.
+// We swallow host errors (network down, token missing) — the gate
+// stays usable from the workspace alone in that case.
+func (e *Engine) buildRepoCandidates(ctx context.Context, t boards.Ticket) []repoCandidate {
+	out := []repoCandidate{}
+
+	// Local workspace first — they're already on disk, safe to act on.
+	for _, p := range DiscoverWorkspaceRepos() {
+		out = append(out, repoCandidate{
+			Label: filepath.Base(p),
+			Value: p,
+		})
+	}
+
+	// Git host repos — only if the host implements RepoLister.
+	if e.Host != nil {
+		if lister, ok := e.Host.(githost.RepoLister); ok {
+			lsCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if repos, err := lister.ListRepos(lsCtx); err == nil {
+				// De-dupe: if a workspace clone matches a remote
+				// slug by basename, prefer the local entry.
+				localBases := map[string]bool{}
+				for _, c := range out {
+					localBases[strings.ToLower(c.Label)] = true
+				}
+				for _, r := range repos {
+					if r.Slug == "" {
+						continue
+					}
+					base := r.Slug
+					if i := strings.LastIndexByte(base, '/'); i >= 0 {
+						base = base[i+1:]
+					}
+					if localBases[strings.ToLower(base)] {
+						continue
+					}
+					out = append(out, repoCandidate{
+						Label:    r.Slug,
+						Value:    r.Slug,
+						IsRemote: true,
+					})
+				}
+			} else if e.Stderr != nil {
+				fmt.Fprintf(e.Stderr, "[workflow] list repos: %v (continuing with workspace + memory only)\n", err)
+			}
+		}
+	}
+	return out
+}
+
+// buildRepoGateQuestion composes the confirm_repo prompt. When the
+// candidate list is non-empty we render it as a numbered menu so the
+// user can pick by number(s) instead of typing a path. Remote repos
+// are tagged "(remote)" so the user knows they're picking a slug,
+// not a checkout path.
+func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoCandidate) string {
+	if len(candidates) == 0 {
+		return fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
+			t.Key, t.Title, suggested)
+	}
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Confirm repo for %s — %q\nSuggested: %s\n\nAvailable repos:\n",
+		t.Key, t.Title, suggested)
+	for i, c := range candidates {
+		marker := " "
+		if c.Value == suggested {
+			marker = "*"
+		}
+		tag := ""
+		if c.IsRemote {
+			tag = " (remote)"
+		}
+		fmt.Fprintf(&sb, " %s %d. %s%s\n", marker, i+1, c.Label, tag)
+	}
+	sb.WriteString("\nReply: <n> or <n>,<n>,<n> (one or more numbers — first is primary)  |  yes (accept suggested)  |  change=<path>  |  no")
+	return sb.String()
+}
+
+// pickWorkspaceReposMulti parses an answer that contains one or more
+// numbers (separated by comma, space, or "+"). Returns the resolved
+// repo values in the same order the user picked, deduplicated. ok=false
+// when the input isn't numeric-only or every number is out of range —
+// so the caller can fall through to other parsing modes.
+func pickWorkspaceReposMulti(ans string, candidates []repoCandidate) ([]string, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+	// Replace common separators with commas, then split.
+	s := strings.NewReplacer(" ", ",", "\t", ",", "+", ",", ";", ",").Replace(strings.TrimSpace(ans))
+	if s == "" {
+		return nil, false
+	}
+	seen := map[string]bool{}
+	picks := []string{}
+	for _, tok := range strings.Split(s, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			continue
+		}
+		n, err := strconv.Atoi(tok)
+		if err != nil {
+			return nil, false // a non-numeric token disqualifies the whole answer
+		}
+		if n < 1 || n > len(candidates) {
+			return nil, false
+		}
+		v := candidates[n-1].Value
+		if seen[v] {
+			continue
+		}
+		seen[v] = true
+		picks = append(picks, v)
+	}
+	if len(picks) == 0 {
+		return nil, false
+	}
+	return picks, true
+}
+
+// pickWorkspaceRepo is the legacy single-pick form. Kept so existing
+// tests pass; the live confirm_repo gate now uses the multi-pick
+// variant. Returns the first match (or false on no/invalid input).
+func pickWorkspaceRepo(ans string, wsRepos []string) (string, bool) {
+	if len(wsRepos) == 0 {
+		return "", false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(ans))
+	if err != nil {
+		return "", false
+	}
+	if n < 1 || n > len(wsRepos) {
+		return "", false
+	}
+	return wsRepos[n-1], true
 }
 
 // pickRepoForTicket resolves a repo path for the ticket using the
@@ -596,7 +819,7 @@ func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t bo
 }
 
 func (e *Engine) phaseExecute(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
-	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
 	allDone := true
 	anyDone := false
 	for _, s := range wf.Plan {
@@ -640,7 +863,7 @@ func (e *Engine) phaseExecute(ctx context.Context, wf *memory.Workflow, t boards
 }
 
 func (e *Engine) phaseTest(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
-	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
 	wf.State = memory.WFTesting
 	e.save(*wf)
 	if err := p.hr.Run(ctx, HookBeforeTest, p.cfg.Hook(HookBeforeTest), hctx); err != nil {
@@ -661,7 +884,7 @@ func (e *Engine) phaseTest(ctx context.Context, wf *memory.Workflow, t boards.Ti
 }
 
 func (e *Engine) phaseVerify(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
-	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
 	wf.State = memory.WFVerifying
 	if wf.VerifyRuns == 0 {
 		wf.VerifyRuns = e.verifyN(p.cfg)
@@ -726,7 +949,7 @@ func (e *Engine) phaseOpenPR(ctx context.Context, wf *memory.Workflow, t boards.
 	if e.Host == nil {
 		return nil
 	}
-	hctx := FromTicket(t, wf.Repo, p.branch, wf.Plan)
+	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
 	wf.State = memory.WFOpeningPR
 	e.save(*wf)
 	if err := p.hr.Run(ctx, HookBeforePR, p.cfg.Hook(HookBeforePR), hctx); err != nil {
@@ -811,7 +1034,10 @@ func isYes(s string) bool {
 	case "y", "yes", "ok", "approve", "approved", "confirm", "confirmed", "lgtm", "go", "ship":
 		return true
 	}
-	return strings.HasPrefix(low, "auto:")
+	// "yes:edited" / "yes:edited-plan" / etc. — the web plan editor
+	// records these so audit logs distinguish user-edited approvals
+	// from a plain yes. Same downstream behaviour.
+	return strings.HasPrefix(low, "auto:") || strings.HasPrefix(low, "yes:")
 }
 
 // formatPlanForApproval renders a numbered list of plan steps for the user
@@ -840,7 +1066,17 @@ func (e *Engine) runFailureHook(ctx context.Context, hr *HookRunner, cfg Workflo
 	}
 }
 
-// branchName turns "ENG-123" into "goon/eng-123" using the configured prefix.
+// branchName composes the goon-owned branch for a ticket.
+// branchName composes the goon-owned branch name for a ticket. The
+// canonical format is "goon/<TICKET-KEY>" where the key is preserved
+// verbatim except for git-disallowed characters which become dashes.
+//
+// We deliberately do NOT lowercase the key — Jira ticket codes are
+// conventionally uppercase ("EB-4795") and users want to recognize
+// them on the branch list at a glance. Git branch names ARE
+// case-sensitive but most modern hosts (GitHub, GitLab, Bitbucket
+// Cloud) preserve case correctly. If a workflow.json overrides
+// BranchPrefix, the same sanitization applies to whatever they pick.
 func branchName(prefix, key string) string {
 	if prefix == "" {
 		prefix = "goon/"
@@ -848,7 +1084,43 @@ func branchName(prefix, key string) string {
 	if !strings.HasSuffix(prefix, "/") && !strings.HasSuffix(prefix, "-") && !strings.HasSuffix(prefix, "_") {
 		prefix += "/"
 	}
-	return prefix + strings.ToLower(strings.ReplaceAll(key, " ", "-"))
+	return prefix + sanitizeBranchSegment(key)
+}
+
+// sanitizeBranchSegment replaces git-disallowed characters with "-"
+// while preserving case. Allows ASCII letters, digits, "-", "_", "."
+// — every other rune (spaces, "#", "/" inside the segment, unicode
+// punctuation) collapses to a dash. Repeated dashes get squashed and
+// edge dashes/dots/underscores get trimmed.
+//
+// Empty input becomes "unknown" so we never produce a refspec like
+// "goon/" with nothing after it (git rejects that).
+func sanitizeBranchSegment(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z',
+			r >= 'A' && r <= 'Z',
+			r >= '0' && r <= '9',
+			r == '-' || r == '_' || r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := b.String()
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	out = strings.Trim(out, "-_.")
+	if out == "" {
+		return "unknown"
+	}
+	return out
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -915,7 +1187,18 @@ description: %s
 
 	out, err := e.LLM.Generate(ctx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
-	}, llm.Options{Temperature: 0.1, JSONMode: true, MaxTokens: 800})
+	}, llm.Options{
+		Temperature: 0.1,
+		JSONMode:    true,
+		// 4096 (was 800) — Gemini 2.5 spends invisible thinking
+		// tokens before producing the JSON plan; with the lower
+		// cap the plan got truncated mid-string and parseTriage
+		// rejected it as unterminated JSON. The OpenAI/Anthropic
+		// adapters happily ignore the higher cap; only providers
+		// that bill per output token feel it, and a plan rarely
+		// exceeds ~600 tokens of actual JSON.
+		MaxTokens: 4096,
+	})
 	if err != nil {
 		return nil, "", err
 	}

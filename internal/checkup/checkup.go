@@ -182,11 +182,13 @@ func checkLLM(ctx context.Context, env Env) Result {
 		return probeAnthropic(ctx, env)
 	case "ollama":
 		return probeOllama(ctx, env)
+	case "gemini", "google":
+		return probeGemini(ctx, env)
 	case "mock":
 		return Result{Component: "llm", Name: "mock", OK: true, Detail: "mock provider — always succeeds"}
 	default:
 		return Result{Component: "llm", Name: name, OK: false,
-			Detail: fmt.Sprintf("unknown GOON_LLM_PROVIDER %q (want openai|anthropic|ollama|mock)", name)}
+			Detail: fmt.Sprintf("unknown GOON_LLM_PROVIDER %q (want openai|anthropic|gemini|ollama|mock)", name)}
 	}
 }
 
@@ -302,6 +304,49 @@ func probeOllama(ctx context.Context, env Env) Result {
 	r.OK = true
 	r.Detail = fmt.Sprintf("server OK · %d model(s) installed · target=%s",
 		len(parsed.Models), model)
+	return r
+}
+
+// probeGemini sends a 1-token generateContent call to Google's
+// generative-language API. This mirrors probeAnthropic's approach:
+// we want to verify auth + model name in one round-trip, not just
+// "server is up". A successful response returns OK; auth or model
+// failures surface as the response body (truncated).
+func probeGemini(ctx context.Context, env Env) Result {
+	r := Result{Component: "llm", Name: "gemini"}
+	key := env("GEMINI_API_KEY")
+	if key == "" {
+		key = env("GOOGLE_API_KEY")
+	}
+	if key == "" {
+		r.Detail = "GEMINI_API_KEY (or GOOGLE_API_KEY) is not set"
+		return r
+	}
+	base := envOrDefault(env, "GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+	model := envOrDefault(env, "GEMINI_MODEL", "gemini-2.5-flash")
+	url := fmt.Sprintf("%s/models/%s:generateContent?key=%s",
+		strings.TrimRight(base, "/"), model, key)
+	body := []byte(`{"contents":[{"role":"user","parts":[{"text":"ping"}]}],` +
+		`"generationConfig":{"maxOutputTokens":1}}`)
+	req, err := newReq(ctx, http.MethodPost, url, strings.NewReader(string(body)))
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		r.Detail = err.Error()
+		return r
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode/100 != 2 {
+		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 160))
+		return r
+	}
+	r.OK = true
+	r.Detail = fmt.Sprintf("auth OK · model=%s", model)
 	return r
 }
 
@@ -504,41 +549,82 @@ func probeBitbucket(ctx context.Context, env Env) Result {
 		return r
 	}
 	api := envOrDefault(env, "BITBUCKET_API_URL", "https://api.bitbucket.org/2.0")
-	req, err := newReq(ctx, http.MethodGet, strings.TrimRight(api, "/")+"/user", nil)
-	if err != nil {
-		r.Detail = err.Error()
+	base := strings.TrimRight(api, "/")
+	authHeader := ""
+	if tok != "" {
+		authHeader = "Bearer " + tok
+	} else {
+		authHeader = "Basic " +
+			base64.StdEncoding.EncodeToString([]byte(user+":"+pw))
+	}
+	// /user works for App Password + OAuth tokens but ALWAYS 401s for
+	// workspace/repo Access Tokens (ATBB…), because those tokens
+	// authenticate as the token itself, not a user. Try /user first;
+	// if it 401/403s AND we have a token, fall back to a workspace
+	// probe so users with valid access tokens get a green doctor.
+	res := bbProbeCall(ctx, base+"/user", authHeader)
+	if res.ok {
+		var who struct {
+			Username    string `json:"username"`
+			DisplayName string `json:"display_name"`
+		}
+		_ = json.Unmarshal(res.body, &who)
+		name := who.Username
+		if name == "" {
+			name = who.DisplayName
+		}
+		r.OK = true
+		r.Detail = fmt.Sprintf("auth OK as %s", name)
 		return r
 	}
+	// Fallback for access tokens.
+	if tok != "" && (res.status == 401 || res.status == 403) {
+		res2 := bbProbeCall(ctx, base+"/repositories?role=member&pagelen=1", authHeader)
+		if res2.ok {
+			r.OK = true
+			r.Detail = "auth OK (access token — workspace/repo scoped)"
+			return r
+		}
+		// Both endpoints rejected the credential — surface both
+		// codes so the user can tell whether the token is bad vs
+		// over-scoped.
+		r.Detail = fmt.Sprintf("/user http %d, /repositories http %d: %s",
+			res.status, res2.status, util.Truncate(string(res2.body), 120))
+		return r
+	}
+	r.Detail = fmt.Sprintf("http %d: %s", res.status, util.Truncate(string(res.body), 120))
+	return r
+}
+
+// bbProbeCall is a thin GET helper specifically for the Bitbucket
+// probe — keeps the two-step auth check above readable. Returns
+// (status, body, ok) where ok is "status/100 == 2".
+type bbProbeResult struct {
+	status int
+	body   []byte
+	ok     bool
+}
+
+func bbProbeCall(ctx context.Context, url, authHeader string) bbProbeResult {
+	req, err := newReq(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return bbProbeResult{status: 0, body: []byte(err.Error())}
+	}
 	req.Header.Set("Accept", "application/json")
-	if tok != "" {
-		req.Header.Set("Authorization", "Bearer "+tok)
-	} else {
-		req.Header.Set("Authorization", "Basic "+
-			base64.StdEncoding.EncodeToString([]byte(user+":"+pw)))
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		r.Detail = err.Error()
-		return r
+		return bbProbeResult{status: 0, body: []byte(err.Error())}
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode/100 != 2 {
-		r.Detail = fmt.Sprintf("http %d: %s", resp.StatusCode, util.Truncate(string(raw), 120))
-		return r
+	return bbProbeResult{
+		status: resp.StatusCode,
+		body:   raw,
+		ok:     resp.StatusCode/100 == 2,
 	}
-	var who struct {
-		Username    string `json:"username"`
-		DisplayName string `json:"display_name"`
-	}
-	_ = json.Unmarshal(raw, &who)
-	name := who.Username
-	if name == "" {
-		name = who.DisplayName
-	}
-	r.OK = true
-	r.Detail = fmt.Sprintf("auth OK as %s", name)
-	return r
 }
 
 // --- telegram (optional) --------------------------------------------------

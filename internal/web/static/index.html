@@ -4,6 +4,11 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goon — dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<meta name="theme-color" content="#0d1117">
+<meta property="og:title" content="goon — autonomous engineer">
+<meta property="og:image" content="/logo.svg">
+<meta property="og:type" content="website">
 
 <!-- Tailwind via Play CDN. Single-binary "zero deps" applies to the Go
      build; the in-browser stylesheet is cached aggressively and the
@@ -60,6 +65,39 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
 
 <script src="/htmx.min.js"></script>
+<!-- Idiomorph: lets htmx swap content WITHOUT clobbering open <details>,
+     focused inputs, and form state. Without this, an in-place refresh
+     of the workflows list collapses every card the user just opened. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/idiomorph/0.7.3/idiomorph-ext.min.js"></script>
+<script>
+  // ----- SSE → body event bridge ------------------------------------
+  // Bridges the server's Server-Sent Events to native DOM events on
+  // <body>. That lets every existing `hx-trigger="<name> from:body"`
+  // fire when the server says something changed — no client-side
+  // polling needed. EventSource auto-reconnects on drop, so we just
+  // open it once and forget about it.
+  (function() {
+    if (typeof EventSource === 'undefined') return;
+    function bind() {
+      const es = new EventSource('/api/events');
+      ['statusChanged','questionsChanged','workflowsChanged','workflowDetailRefresh',
+       'ticketsChanged','prsChanged','configChanged','memoryChanged','skillsChanged'
+      ].forEach(function(name) {
+        es.addEventListener(name, function() {
+          document.body.dispatchEvent(new Event(name));
+        });
+      });
+      es.onerror = function() {
+        // EventSource reconnects automatically; nothing to do here.
+        // If the browser gives up (readyState=2), reopen after 5s.
+        if (es.readyState === 2) {
+          setTimeout(bind, 5000);
+        }
+      };
+    }
+    bind();
+  })();
+</script>
 <style>
   :root { color-scheme: light dark; }
   body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
@@ -127,41 +165,53 @@
   }
 
   /* Smooth swap of tab content. */
-  #tab-content > * { animation: fadeIn 180ms ease-out both; }
+  /* Page transition — sibling sections fade in on first reveal. */
+  main#main section.page:not(.hidden) > * { animation: fadeIn 180ms ease-out both; }
 
   /* Hide htmx outerHTML target during request to prevent flash. */
   details > summary::-webkit-details-marker { display: none; }
 </style>
 </head>
 
-<body class="h-full bg-white text-gray-900 dark:bg-surface dark:text-gray-100 font-sans selection:bg-accent/30 selection:text-gray-900 dark:selection:text-white">
+<body class="h-full bg-white text-gray-900 dark:bg-surface dark:text-gray-100 font-sans selection:bg-accent/30 selection:text-gray-900 dark:selection:text-white"
+      hx-ext="morph">
 
-<!-- ===== Top header ====================================================== -->
+<!-- ===== Layout ==========================================================
+     Dashboard shell: slim header (brand + global actions) + persistent
+     left sidebar (nav + live status + quick actions + setup gear) +
+     main canvas hosting four sibling <section>s, one per page.
+
+     Tab switching is JS-only (CSS toggle of .hidden) so it never
+     re-fetches and never resets scroll. Each section lazy-loads its
+     content on first reveal via hx-trigger="reveal once".
+============================================================================ -->
+
+<!-- Slim top header — brand + global ⌘K + docs. Persistent across pages. -->
 <header class="sticky top-0 z-30 border-b border-gray-200 dark:border-surface-border bg-white/85 dark:bg-surface-raised/85 backdrop-blur-md">
-  <div class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 flex items-center gap-3 h-14">
-    <!-- Brand -->
-    <a href="/" class="flex items-center gap-2 font-semibold tracking-tight group">
-      <span class="grid place-items-center h-7 w-7 rounded-md bg-gradient-to-br from-accent/30 to-accent/10 text-base group-hover:from-accent/40 transition">🤖</span>
+  <div class="px-4 lg:px-6 flex items-center gap-3 h-14">
+    <!-- Mobile sidebar toggle. Hidden on lg+ where sidebar is always visible. -->
+    <button id="nav-toggle" class="lg:hidden p-1.5 rounded-md text-gray-500 hover:text-accent hover:bg-accent-soft transition" aria-label="Toggle navigation">
+      <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+
+    <a href="/app" class="flex items-center gap-2 font-semibold tracking-tight group" aria-label="goon home">
+      <span class="grid place-items-center h-7 w-7 rounded-md bg-gradient-to-br from-accent/30 to-accent/10 text-accent group-hover:from-accent/40 transition">
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+        </svg>
+      </span>
       <span class="text-[15px]">goon</span>
       <span class="hidden md:inline text-xs font-normal text-gray-500">autonomous engineer</span>
     </a>
 
-    <!-- Daemon status pill: live-updated header chip -->
-    <div hx-get="/fragments/status-pill" hx-trigger="load, every 3s, statusChanged from:body" class="ml-2"></div>
-
-    <!-- Spacer -->
     <div class="flex-1"></div>
 
-    <!-- Command palette trigger (kbd hint) -->
     <button id="cmdk-open" class="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-surface-border bg-white dark:bg-surface hover:border-accent/40 hover:text-accent transition" aria-label="Open command palette">
       <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
       <span>Search</span>
-      <span class="flex items-center gap-0.5 ml-2">
-        <kbd>⌘</kbd><kbd>K</kbd>
-      </span>
+      <span class="flex items-center gap-0.5 ml-2"><kbd>⌘</kbd><kbd>K</kbd></span>
     </button>
 
-    <!-- Docs link -->
     <a href="/docs" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 hover:text-accent hover:bg-accent-soft transition" title="Open docs in new tab">
       <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
       <span class="hidden sm:inline">docs</span>
@@ -169,82 +219,150 @@
   </div>
 </header>
 
-<!-- ===== Setup banner ==================================================== -->
-<div hx-get="/fragments/setup" hx-trigger="load, every 10s, configChanged from:body" hx-swap="innerHTML" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"></div>
+<!-- Setup banner stays at the top — only renders content when goon is
+     mis-configured. Listens for configChanged so it auto-clears after fix. -->
+<div hx-get="/fragments/setup" hx-trigger="load, configChanged from:body" hx-swap="innerHTML" class="px-4 lg:px-6"></div>
 
-<!-- ===== Pending-questions banner ======================================== -->
-<div hx-get="/fragments/questions-banner" hx-trigger="load, every 5s, questionsChanged from:body" hx-swap="innerHTML" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8"></div>
+<!-- Two-column shell: aside + main. On mobile the aside slides over. -->
+<div class="flex min-h-[calc(100vh-3.5rem)]">
 
-<!-- ===== Tabs ============================================================ -->
-<nav class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 mt-4 border-b border-gray-200 dark:border-surface-border overflow-x-auto scrollbar-thin" role="tablist" aria-label="Sections">
-  <div class="flex gap-1 min-w-max">
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" aria-current="page" data-tab="overview" data-shortcut="1"
-            hx-get="/fragments/tab-overview" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Overview <kbd class="hidden sm:inline-flex">1</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" data-tab="tickets" data-shortcut="2"
-            hx-get="/fragments/tab-tickets" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Tickets <kbd class="hidden sm:inline-flex">2</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" data-tab="workflows" data-shortcut="3"
-            hx-get="/fragments/tab-workflows" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Workflows <kbd class="hidden sm:inline-flex">3</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" data-tab="questions" data-shortcut="4"
-            hx-get="/fragments/tab-questions" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Questions <kbd class="hidden sm:inline-flex">4</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" data-tab="chat" data-shortcut="5"
-            hx-get="/fragments/tab-chat" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Chat <kbd class="hidden sm:inline-flex">5</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap"
-            role="tab" data-tab="knowledge" data-shortcut="6"
-            hx-get="/fragments/tab-knowledge" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">Knowledge <kbd class="hidden sm:inline-flex">6</kbd></span>
-    </button>
-    <button class="tab px-4 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-600 dark:text-gray-400 hover:text-accent hover:border-gray-300 dark:hover:border-gray-700 transition-colors whitespace-nowrap ml-auto"
-            role="tab" data-tab="config" data-shortcut="7"
-            hx-get="/fragments/tab-config" hx-target="#tab-content" hx-swap="innerHTML"
-            onclick="setActiveTab(this)">
-      <span class="inline-flex items-center gap-1.5">
-        <svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        Config <kbd class="hidden sm:inline-flex">7</kbd>
-      </span>
-    </button>
-  </div>
-</nav>
+  <!-- ===== Sidebar ========================================================= -->
+  <aside id="sidebar" class="hidden lg:flex flex-col w-60 shrink-0 border-r border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40">
+    <!-- Primary nav. Six items: Questions / Workflows / Tickets / PRs /
+         Chat / Memory. Ordered by attention priority (Questions blocks
+         workflows; Workflows is the live thing goon is doing; Tickets
+         is the board mirror; PRs is the review queue). -->
+    <nav class="px-3 py-4 space-y-0.5" role="tablist" aria-label="Sections">
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="dashboard">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12 L12 4 L21 12"/><path d="M5 10 V20 H10 V14 H14 V20 H19 V10"/></svg>
+        <span class="flex-1">Home</span>
+      </button>
 
-<!-- ===== Tab content ===================================================== -->
-<main id="tab-content" class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6"
-      hx-get="/fragments/tab-overview" hx-trigger="load" hx-swap="innerHTML">
-  <!-- Initial skeleton -->
-  <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-    <div class="lg:col-span-1 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3">
-      <div class="skel h-3 w-24"></div>
-      <div class="skel h-6 w-32"></div>
-      <div class="skel h-3 w-full"></div>
-      <div class="skel h-3 w-3/4"></div>
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Inbox</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" aria-current="page" data-page-target="questions">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        <span class="flex-1">Questions</span>
+        <span data-pending-count class="hidden text-[10px] font-mono rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-400 px-1.5 py-0.5"></span>
+      </button>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="workflows">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        <span class="flex-1">Workflows</span>
+      </button>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="tickets">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+        <span class="flex-1">Tickets</span>
+      </button>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="prs">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
+        <span class="flex-1">Pull requests</span>
+      </button>
+
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Conversation</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="chat">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span class="flex-1">Chat</span>
+      </button>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="memory">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span class="flex-1">Memory</span>
+      </button>
+
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Workspace</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="files">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        <span class="flex-1">Files</span>
+      </button>
+    </nav>
+
+    <!-- Live system status — auto-updates via SSE statusChanged event -->
+    <div class="px-4 py-3 mx-3 my-2 rounded-md bg-white dark:bg-surface-raised border border-gray-200 dark:border-surface-border"
+         hx-get="/fragments/status-pill" hx-trigger="load, statusChanged from:body">
+      <div class="text-xs text-gray-400">Loading status…</div>
     </div>
-    <div class="lg:col-span-2 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-5 space-y-3">
-      <div class="skel h-3 w-32"></div>
-      <div class="skel h-4 w-full"></div>
-      <div class="skel h-4 w-5/6"></div>
-      <div class="skel h-4 w-4/6"></div>
+
+    <!-- Quick actions — one-tap board refresh + pause/resume -->
+    <div class="px-3 pb-3 space-y-1">
+      <button type="button" hx-post="/api/refresh" hx-target="#sidebar-action-result" hx-swap="innerHTML"
+              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition">
+        <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
+        <span>Refresh from board</span>
+      </button>
+      <button type="button" onclick="goonDaemonToggle()"
+              id="sidebar-pause-resume"
+              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition">
+        <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
+        <span>Pause daemon</span>
+      </button>
+      <div id="sidebar-action-result" class="text-[11px] text-gray-500 px-3"></div>
     </div>
-  </div>
-</main>
+
+    <!-- Spacer + Setup gear at the bottom -->
+    <div class="flex-1"></div>
+    <div class="px-3 pb-4 border-t border-gray-200 dark:border-surface-border pt-3">
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+              role="tab" data-page-target="setup">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="flex-1">Setup</span>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Mobile sidebar backdrop. Visible only when #sidebar has .mobile-open. -->
+  <div id="sidebar-backdrop" class="hidden fixed inset-0 z-20 bg-gray-900/40 lg:hidden" onclick="closeMobileSidebar()"></div>
+
+  <!-- ===== Main content =================================================== -->
+  <!--
+    One <section> per page. Sibling, never re-fetched on tab switch.
+    First reveal triggers the hx-get exactly once (hx-trigger="reveal once").
+    Subsequent switches are pure CSS class toggles — instant, no scroll loss.
+  -->
+  <main id="main" class="flex-1 min-w-0 px-4 lg:px-8 py-6">
+    <section data-page="dashboard" class="page" data-loaded="false"
+             hx-get="/fragments/tab-dashboard" hx-trigger="reveal once, questionsChanged from:body, workflowsChanged from:body, ticketsChanged from:body, statusChanged from:body" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading dashboard…</div>
+    </section>
+    <section data-page="questions" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-questions" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading questions…</div>
+    </section>
+    <section data-page="workflows" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-workflows" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading workflows…</div>
+    </section>
+    <section data-page="tickets" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-tickets" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading tickets…</div>
+    </section>
+    <section data-page="prs" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-prs" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading pull requests…</div>
+    </section>
+    <section data-page="chat" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-chat" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading chat…</div>
+    </section>
+    <section data-page="memory" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-memory" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading memory…</div>
+    </section>
+    <section data-page="files" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-files" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading files…</div>
+    </section>
+    <section data-page="setup" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-config" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="text-sm text-gray-500">Loading setup…</div>
+    </section>
+  </main>
+</div>
 
 <!-- ===== Footer ========================================================== -->
 <footer class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 mt-12 text-xs text-gray-500 border-t border-gray-200 dark:border-surface-border">
@@ -286,26 +404,125 @@
 </div>
 
 <script>
-  // -------- Tab activation ------------------------------------------------
-  function setActiveTab(btn) {
-    document.querySelectorAll('button.tab').forEach(b => b.removeAttribute('aria-current'));
-    btn.setAttribute('aria-current', 'page');
+  // -------- Page (tab) switching ----------------------------------------
+  //
+  // showPage(name) — toggles which <section data-page="…"> is visible.
+  // Pure CSS class swap: no fetch, no scroll loss. Sections lazy-load
+  // their content once on first reveal via hx-trigger="reveal once".
+  //
+  // We DON'T programmatically trigger that hx-get here — htmx's reveal
+  // trigger fires when the element scrolls into view OR becomes visible,
+  // and the first un-hidden section on page load satisfies that. For
+  // subsequent first-time reveals (clicking Chat for the first time),
+  // we trigger it manually below.
+  function showPage(name) {
+    document.querySelectorAll('main#main section.page').forEach(s => {
+      s.classList.toggle('hidden', s.dataset.page !== name);
+    });
+    document.querySelectorAll('.page-nav').forEach(b => {
+      const active = b.dataset.pageTarget === name;
+      b.toggleAttribute('aria-current', active);
+      b.classList.toggle('bg-white', active);
+      b.classList.toggle('dark:bg-surface-raised', active);
+      b.classList.toggle('text-accent', active);
+      b.classList.toggle('shadow-sm', active);
+    });
+    // First-time visit to this page: trigger the lazy load. htmx's
+    // "reveal once" doesn't fire reliably on display:none → display:block,
+    // so we nudge it manually here, and the "once" modifier on the
+    // element guarantees it only fetches the first time.
+    const sec = document.querySelector(`main#main section.page[data-page="${name}"]`);
+    if (sec && sec.dataset.loaded === 'false') {
+      sec.dataset.loaded = 'true';
+      // Defer one tick so the section is actually visible before
+      // htmx evaluates triggers.
+      requestAnimationFrame(() => {
+        if (window.htmx) htmx.trigger(sec, 'reveal');
+      });
+    }
+    // Persist last page so reload returns to the same view.
+    try { localStorage.setItem('goon.lastPage', name); } catch (_) {}
+    closeMobileSidebar();
   }
 
+  // Wire every sidebar nav button to showPage.
+  document.querySelectorAll('.page-nav').forEach(btn => {
+    btn.addEventListener('click', () => showPage(btn.dataset.pageTarget));
+  });
+
+  // On first paint, restore the last page (default = dashboard —
+  // the snapshot-of-everything landing surface).
+  document.addEventListener('DOMContentLoaded', () => {
+    let last = 'dashboard';
+    try { last = localStorage.getItem('goon.lastPage') || 'dashboard'; } catch (_) {}
+    if (!document.querySelector(`section.page[data-page="${last}"]`)) last = 'dashboard';
+    showPage(last);
+  });
+
+  // Mobile: hamburger toggles the sidebar overlay.
+  document.getElementById('nav-toggle')?.addEventListener('click', () => {
+    document.getElementById('sidebar').classList.toggle('hidden');
+    document.getElementById('sidebar').classList.add('fixed','inset-y-0','left-0','z-30','flex','top-14');
+    document.getElementById('sidebar-backdrop').classList.toggle('hidden');
+  });
+  function closeMobileSidebar() {
+    if (window.matchMedia('(min-width: 1024px)').matches) return;
+    const sb = document.getElementById('sidebar');
+    if (!sb) return;
+    sb.classList.add('hidden');
+    sb.classList.remove('fixed','inset-y-0','left-0','z-30','flex','top-14');
+    document.getElementById('sidebar-backdrop')?.classList.add('hidden');
+  }
+
+  // -------- Daemon pause/resume toggle (sidebar one-click) -----------------
+  // Reads current paused state from the sidebar status pill so the same
+  // button toggles either way without us tracking state separately.
+  async function goonDaemonToggle() {
+    const pill = document.querySelector('[data-paused]');
+    const paused = pill && pill.dataset.paused === '1';
+    const action = paused ? 'resume' : 'pause';
+    const r = await fetch('/api/daemon/' + action, { method: 'POST' });
+    if (r.ok) toast('daemon ' + action + 'd', 'ok');
+    else toast(action + ' failed', 'err');
+  }
+
+  // Re-label the sidebar pause/resume button whenever the daemon
+  // state changes, including SSE pushes from other tabs.
+  function syncPauseButton() {
+    const pill = document.querySelector('[data-paused]');
+    const btn  = document.getElementById('sidebar-pause-resume');
+    if (!pill || !btn) return;
+    const paused = pill.dataset.paused === '1';
+    btn.querySelector('span').textContent = paused ? 'Resume daemon' : 'Pause daemon';
+    btn.querySelector('svg').innerHTML = paused
+      ? '<polygon points="5 3 19 12 5 21 5 3"/>'           // play
+      : '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>'; // pause
+  }
+  document.body.addEventListener('statusChanged', syncPauseButton);
+  document.body.addEventListener('htmx:afterSwap', syncPauseButton);
+
   // -------- Keyboard shortcuts -------------------------------------------
-  // 1-7: switch tabs. /: focus search (cmdk). ?: open docs in new tab.
+  // ⌘K / / : open command palette (the primary navigation aid now).
+  // ?       : open docs. Esc: close palette.
+  // Page-letter shortcuts (h/q/w/t/p/c/m/f/s) jump directly to the
+  // matching sidebar entry — fast for keyboard users, hidden from
+  // the UI so the sidebar stays clean.
+  const _letterToPage = {
+    h: 'dashboard',
+    q: 'questions', w: 'workflows', t: 'tickets', p: 'prs',
+    c: 'chat',      m: 'memory',    f: 'files',   s: 'setup',
+  };
   document.addEventListener('keydown', (e) => {
-    // Skip when typing in inputs/textareas (so users can type "1" into a search).
     const inField = e.target instanceof HTMLElement &&
       (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable);
-    // Cmd-K / Ctrl-K opens palette regardless.
     if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
       e.preventDefault(); openCmdk(); return;
     }
     if (inField) return;
-    if (e.key >= '1' && e.key <= '7') {
-      const btn = document.querySelector(`button.tab[data-shortcut="${e.key}"]`);
-      if (btn) { btn.click(); e.preventDefault(); }
+    const dest = _letterToPage[e.key.toLowerCase()];
+    if (dest) {
+      e.preventDefault();
+      showPage(dest);
     } else if (e.key === '/') {
       e.preventDefault(); openCmdk();
     } else if (e.key === '?') {
@@ -317,22 +534,23 @@
 
   // -------- Command palette ----------------------------------------------
   const cmdkActions = [
-    { label: 'Overview',      hint: 'Tab 1',     run: () => clickTab('overview') },
-    { label: 'Tickets',       hint: 'Tab 2',     run: () => clickTab('tickets') },
-    { label: 'Workflows',     hint: 'Tab 3',     run: () => clickTab('workflows') },
-    { label: 'Questions',     hint: 'Tab 4',     run: () => clickTab('questions') },
-    { label: 'Chat',          hint: 'Tab 5',     run: () => clickTab('chat') },
-    { label: 'Knowledge',     hint: 'Tab 6',     run: () => clickTab('knowledge') },
-    { label: 'Configuration', hint: 'Tab 7',     run: () => clickTab('config') },
+    { label: 'Home',          hint: 'h',         run: () => navTo('dashboard') },
+    { label: 'Questions',     hint: 'q',         run: () => navTo('questions') },
+    { label: 'Workflows',     hint: 'w',         run: () => navTo('workflows') },
+    { label: 'Tickets',       hint: 't',         run: () => navTo('tickets') },
+    { label: 'Pull requests', hint: 'p',         run: () => navTo('prs') },
+    { label: 'Chat',          hint: 'c',         run: () => navTo('chat') },
+    { label: 'Memory',        hint: 'm',         run: () => navTo('memory') },
+    { label: 'Files',         hint: 'f',         run: () => navTo('files') },
+    { label: 'Setup',         hint: 's',         run: () => navTo('setup') },
     { label: 'Refresh tickets from board', hint: 'POST /api/refresh', run: doRefresh },
     { label: 'Pause daemon',  hint: 'POST /api/daemon/pause',   run: () => doDaemon('pause') },
     { label: 'Resume daemon', hint: 'POST /api/daemon/resume',  run: () => doDaemon('resume') },
     { label: 'Open documentation', hint: 'docs', run: () => window.open('/docs', '_blank') },
   ];
 
-  function clickTab(name) {
-    const btn = document.querySelector(`button.tab[data-tab="${name}"]`);
-    if (btn) btn.click();
+  function navTo(name) {
+    showPage(name);
     closeCmdk();
   }
   async function doRefresh() {
@@ -417,11 +635,26 @@
     }, 3200);
   }
 
-  // -------- HX-Trigger event → toast mapping -----------------------------
-  document.body.addEventListener('statusChanged',     () => toast('daemon state changed',  'info'));
-  document.body.addEventListener('questionsChanged',  () => toast('answer recorded',       'ok'));
-  document.body.addEventListener('configChanged',     () => toast('config saved',          'ok'));
-  document.body.addEventListener('ticketsChanged',    () => toast('ticket snapshot refreshed', 'ok'));
+  // -------- Event → toast mapping ----------------------------------------
+  //
+  // Events arrive from two sources: HX-Trigger response headers (the
+  // originating browser) AND SSE pushes (every connected tab). On the
+  // originating tab they fire back-to-back, so dedupe within 400ms so
+  // the user never sees the same toast twice.
+  const _toastCooldown = new Map();
+  function toastOnce(name, msg, kind) {
+    const now = Date.now();
+    const last = _toastCooldown.get(name) || 0;
+    if (now - last < 400) return;
+    _toastCooldown.set(name, now);
+    toast(msg, kind);
+  }
+  document.body.addEventListener('statusChanged',     () => toastOnce('statusChanged',    'daemon state changed',  'info'));
+  document.body.addEventListener('questionsChanged',  () => toastOnce('questionsChanged', 'approvals updated',     'ok'));
+  document.body.addEventListener('workflowsChanged',  () => toastOnce('workflowsChanged', 'workflow updated',      'ok'));
+  document.body.addEventListener('configChanged',     () => toastOnce('configChanged',    'config saved',          'ok'));
+  document.body.addEventListener('ticketsChanged',    () => toastOnce('ticketsChanged',   'tickets refreshed',     'ok'));
+  document.body.addEventListener('prsChanged',        () => toastOnce('prsChanged',       'pull requests updated', 'ok'));
   document.body.addEventListener('configError',  (e) => toast(e.detail?.message || 'config error', 'err'));
 </script>
 

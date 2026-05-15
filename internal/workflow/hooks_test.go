@@ -38,7 +38,7 @@ func sampleCtx() HookCtx {
 			Key: "ENG-42", Title: "Add login",
 			URL: "https://x/ENG-42", Source: "jira", Project: "ENG",
 		},
-		"/tmp/repo", "goon/eng-42",
+		"/tmp/repo", "goon/ENG-42",
 		[]memory.PlanStep{{Title: "step", Done: true}},
 	)
 }
@@ -109,7 +109,7 @@ func TestHookRunner_ExportsTicketEnv(t *testing.T) {
 		t.Fatalf("run: %v\n%s", err, buf.String())
 	}
 	got, _ := readFile(out)
-	want := "ENG-42|Add login|goon/eng-42|" + dir
+	want := "ENG-42|Add login|goon/ENG-42|" + dir
 	if !strings.Contains(got, want) {
 		t.Errorf("env vars: got %q want substring %q", got, want)
 	}
@@ -121,7 +121,7 @@ func TestSubstitute_TemplateValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != "echo ENG-42: Add login -> goon/eng-42" {
+	if got != "echo ENG-42: Add login -> goon/ENG-42" {
 		t.Errorf("got %q", got)
 	}
 }

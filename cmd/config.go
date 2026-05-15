@@ -39,6 +39,8 @@ var knownConfigKeys = []configKey{
 	{Name: "GOON_LOG_FILE", Default: "$GOON_STORAGE_DIR/logs/goon.log", Group: "daemon"},
 	{Name: "GOON_WORKFLOW_FILE", Default: "./workflow.json", Group: "daemon"},
 
+	{Name: "GOON_WORKSPACE_DIR", Group: "agent"},
+
 	{Name: "OPENAI_API_KEY", Sensitive: true, Group: "openai"},
 	{Name: "OPENAI_MODEL", Default: "gpt-4o-mini", Group: "openai"},
 	{Name: "OPENAI_BASE_URL", Default: "https://api.openai.com/v1", Group: "openai"},
@@ -49,6 +51,10 @@ var knownConfigKeys = []configKey{
 
 	{Name: "OLLAMA_BASE_URL", Default: "http://localhost:11434", Group: "ollama"},
 	{Name: "OLLAMA_MODEL", Default: "llama3", Group: "ollama"},
+
+	{Name: "GEMINI_API_KEY", Sensitive: true, Group: "gemini"},
+	{Name: "GEMINI_MODEL", Default: "gemini-2.5-flash", Group: "gemini"},
+	{Name: "GEMINI_BASE_URL", Default: "https://generativelanguage.googleapis.com/v1beta", Group: "gemini"},
 
 	// Shared Atlassian credentials. Used as fallback by both Jira and
 	// Confluence so a typical Cloud user only fills these three.

@@ -18,6 +18,11 @@ import (
 
 // HookCtx is the data passed to template substitution + exported as env vars
 // when running hook commands.
+//
+// Multi-repo support: Repo is the PRIMARY repo (back-compat with
+// hooks that read $REPO / {{.Repo}}). Repos holds every selected
+// target including the primary. Hooks that want to iterate get
+// {{.Repos}} as a slice and $REPOS as a comma-separated list.
 type HookCtx struct {
 	Key         string
 	Title       string
@@ -27,15 +32,28 @@ type HookCtx struct {
 	Project     string
 	Branch      string
 	Repo        string
+	Repos       []string
 	Plan        []memory.PlanStep
 }
 
 // FromTicket builds a HookCtx from a Ticket + extra runtime fields.
+// repos may be nil; when set, the first entry should equal repo for
+// consistency.
 func FromTicket(t boards.Ticket, repo, branch string, plan []memory.PlanStep) HookCtx {
+	return FromTicketMulti(t, repo, nil, branch, plan)
+}
+
+// FromTicketMulti is the multi-repo aware constructor. Use this in
+// new code paths; FromTicket stays for callers that don't track the
+// multi-repo set.
+func FromTicketMulti(t boards.Ticket, repo string, repos []string, branch string, plan []memory.PlanStep) HookCtx {
+	if len(repos) == 0 && repo != "" {
+		repos = []string{repo}
+	}
 	return HookCtx{
 		Key: t.Key, Title: t.Title, Description: t.Description, URL: t.URL,
 		Source: t.Source, Project: t.Project,
-		Branch: branch, Repo: repo, Plan: plan,
+		Branch: branch, Repo: repo, Repos: repos, Plan: plan,
 	}
 }
 
@@ -51,6 +69,7 @@ func (c HookCtx) envSlice() []string {
 		"TICKET_PROJECT=" + c.Project,
 		"BRANCH=" + c.Branch,
 		"REPO=" + c.Repo,
+		"REPOS=" + strings.Join(c.Repos, ","),
 	}
 }
 

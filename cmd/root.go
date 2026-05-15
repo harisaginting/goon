@@ -24,7 +24,10 @@ import (
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/notes"
+	"github.com/harisaginting/goon/internal/personal"
 	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/skills"
 	"github.com/harisaginting/goon/internal/tools"
 )
 
@@ -48,6 +51,24 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 		logx.SetDefault(lg)
 	}
 	logx.Info("cli.start", "argv", argv)
+
+	// First-run seeds: write defaults for personal.md / PINNED.md /
+	// a few sample skills if they don't already exist. All three
+	// helpers are idempotent — won't clobber user edits — so calling
+	// them on every boot is fine and keeps the first-run experience
+	// "out of the box, has something to read" instead of "empty
+	// folders, what do I do".
+	if err := personal.SeedDefault(); err != nil {
+		logx.Warn("personal.seed_failed", "error", err.Error())
+	}
+	if store, err := notes.New(""); err == nil {
+		if _, err := store.SeedPinnedTemplate(); err != nil {
+			logx.Warn("notes.seed_failed", "error", err.Error())
+		}
+	}
+	if err := skills.SeedDefaults(); err != nil {
+		logx.Warn("skills.seed_failed", "error", err.Error())
+	}
 
 	// Tolerate users typing the program name twice. Common when invoked via
 	// `go run . goon workflow init` — the user's mental model is "I'm typing
@@ -324,11 +345,51 @@ func loadDotEnv(path string) {
 		}
 		k := strings.TrimSpace(line[:eq])
 		v := strings.TrimSpace(line[eq+1:])
+		v = stripInlineComment(v)
 		v = strings.Trim(v, `"'`)
 		if _, exists := os.LookupEnv(k); !exists {
 			_ = os.Setenv(k, v)
 		}
 	}
+}
+
+// stripInlineComment removes a trailing "# comment" from a value
+// unless the # is inside quotes. Without this, a user copying
+//
+//	BITBUCKET_API_URL=                # default https://api.bitbucket.org/2.0
+//
+// verbatim from .env.example ended up with the API URL literally
+// being "# default https://api.bitbucket.org/2.0", which then
+// produced HTTP 400s with cryptic "unsupported protocol scheme ''"
+// errors deep in the host adapter.
+//
+// Rules:
+//   - leading and trailing whitespace already trimmed by the caller
+//   - a quoted value (starts with ' or ") is returned untouched —
+//     we let the caller strip the quotes
+//   - otherwise: the first '#' that is preceded by whitespace OR is
+//     at position 0 marks the start of a comment; everything from
+//     there to the end is dropped, and the surviving prefix is
+//     re-trimmed
+func stripInlineComment(v string) string {
+	if v == "" {
+		return v
+	}
+	// Quoted values: keep as-is.
+	if v[0] == '"' || v[0] == '\'' {
+		return v
+	}
+	// Walk forward looking for a comment marker.
+	for i := 0; i < len(v); i++ {
+		if v[i] != '#' {
+			continue
+		}
+		// Position 0 OR preceded by whitespace counts as a comment.
+		if i == 0 || v[i-1] == ' ' || v[i-1] == '\t' {
+			return strings.TrimRight(v[:i], " \t")
+		}
+	}
+	return v
 }
 
 // onboardingError wraps an llm.NewFromEnv failure with a copy-pasteable

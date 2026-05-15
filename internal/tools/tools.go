@@ -121,6 +121,16 @@ func DefaultRegistry() *Registry {
 	r.Register(&Finish{})
 	r.Register(NewConfluenceFromEnv())
 	r.Register(NewTelegramFromEnv())
+	// Web access — fetch a URL and search the web. Both are stdlib-
+	// only HTTP, no third-party deps. fetch_url is HTTPS-only by
+	// default; web_search uses Google CSE when configured, falls
+	// back to DuckDuckGo HTML.
+	r.Register(FetchURL{})
+	r.Register(WebSearch{})
+	// Local codebase search — ripgrep when available, stdlib fallback
+	// otherwise. Surfaces top-K filename + line matches plus the
+	// extracted symbol index for fast "where is X defined" answers.
+	r.Register(&SearchCode{})
 	RegisterMemoryTools(r)
 	return r
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -87,18 +88,105 @@ func (g *GitHub) OpenPR(ctx context.Context, o CreateOptions) (PR, error) {
 	return PR{Number: pr.Number, URL: pr.HTMLURL, Title: pr.Title, Branch: pr.Head.Ref}, nil
 }
 
+// --- RepoLister implementation ---------------------------------------------
+
+// ListRepos enumerates repositories the authenticated GitHub user can
+// see. Single page of up to 100, sorted by recent activity — for
+// most teams that's more than enough to populate the confirm_repo
+// menu without auto-paginating (which is a quota tax on every gate).
+//
+// Filtering: when GITHUB_REPOS is set (already used by the PR review
+// flow), we restrict the result to that slug list — useful for users
+// who have hundreds of repos and want goon to only consider the
+// project subset they actually work on.
+func (g *GitHub) ListRepos(ctx context.Context) ([]Repo, error) {
+	// Restrict set when configured.
+	allow := map[string]bool{}
+	for _, s := range strings.Split(os.Getenv("GITHUB_REPOS"), ",") {
+		s = strings.TrimSpace(s)
+		if s != "" {
+			allow[s] = true
+		}
+	}
+
+	url := g.APIURL + "/user/repos?per_page=100&sort=updated&affiliation=owner,collaborator,organization_member"
+	body, err := g.do(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("github list repos: %w", err)
+	}
+	var raw []struct {
+		FullName      string `json:"full_name"`
+		Name          string `json:"name"`
+		HTMLURL       string `json:"html_url"`
+		CloneURL      string `json:"clone_url"`
+		DefaultBranch string `json:"default_branch"`
+		Description   string `json:"description"`
+		Private       bool   `json:"private"`
+		Archived      bool   `json:"archived"`
+		Disabled      bool   `json:"disabled"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, fmt.Errorf("github list repos decode: %w", err)
+	}
+	out := make([]Repo, 0, len(raw))
+	for _, r := range raw {
+		if r.Archived || r.Disabled {
+			continue
+		}
+		if len(allow) > 0 && !allow[r.FullName] {
+			continue
+		}
+		clone := r.CloneURL
+		if clone == "" {
+			clone = r.HTMLURL
+		}
+		out = append(out, Repo{
+			Slug:          r.FullName,
+			Name:          r.Name,
+			URL:           clone,
+			DefaultBranch: r.DefaultBranch,
+			Description:   r.Description,
+			Private:       r.Private,
+		})
+	}
+	return out, nil
+}
+
 // --- PRReviewer implementation ---------------------------------------------
 
-// ListPRs returns open PRs across the supplied repos. When repos is empty,
-// falls back to GOON_REVIEW_REPOS (comma-separated "owner/repo,owner/repo").
+// ListPRs returns open PRs across the supplied repos. Fallback chain
+// when repos is empty:
+//
+//  1. GOON_REVIEW_REPOS (comma-separated "owner/repo,owner/repo")
+//  2. GitHub Search API for every open PR the authenticated user is
+//     involved in (author / assignee / reviewer / mentioned). One
+//     network call covers every repo without needing the user to
+//     name them.
+//
+// Pre-(2) the function used to return an empty slice silently when
+// no repos were configured, which made `/prs` feel broken.
 func (g *GitHub) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 	if len(repos) == 0 {
 		for _, r := range strings.Split(os.Getenv("GOON_REVIEW_REPOS"), ",") {
-			r = strings.TrimSpace(r)
+			r = NormalizeRepoSlug(r)
 			if r != "" {
 				repos = append(repos, r)
 			}
 		}
+	} else {
+		// Caller-supplied — normalize too so /prs <url> works.
+		norm := make([]string, 0, len(repos))
+		for _, r := range repos {
+			if s := NormalizeRepoSlug(r); s != "" {
+				norm = append(norm, s)
+			}
+		}
+		repos = norm
+	}
+	if len(repos) == 0 {
+		// Step 2: hit the search API. One call covers every repo
+		// the authenticated user has a stake in.
+		return g.listPRsInvolvingMe(ctx)
 	}
 	out := []PR{}
 	for _, repo := range repos {
@@ -123,6 +211,74 @@ func (g *GitHub) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 				Repo:   repo,
 			})
 		}
+	}
+	return out, nil
+}
+
+// listPRsInvolvingMe calls the GitHub Search API for every open PR
+// the authenticated user is involved in (authored, assigned to,
+// requested as reviewer, or @-mentioned). Used when neither an
+// explicit repo list nor GOON_REVIEW_REPOS is set.
+//
+// One API call returns up to 100 PRs across every repo the token
+// can see — much cheaper than calling /pulls per-repo when the user
+// has many repos. Cost is capped to one page; if a user has >100
+// open PRs they should narrow with GOON_REVIEW_REPOS anyway.
+//
+// The /search/issues response uses a different schema than /pulls —
+// no `head.ref` field, and the repo URL has to be derived from
+// `repository_url`. We extract the slug from that URL so the
+// returned PR.Repo matches what /review and /approve expect.
+func (g *GitHub) listPRsInvolvingMe(ctx context.Context) ([]PR, error) {
+	// is:pr is:open archived:false involves:@me sort:updated-desc
+	q := url.QueryEscape("is:pr is:open archived:false involves:@me")
+	api := fmt.Sprintf("%s/search/issues?q=%s&per_page=100&sort=updated&order=desc", g.APIURL, q)
+	raw, err := g.do(ctx, http.MethodGet, api, nil)
+	if err != nil {
+		return nil, fmt.Errorf("github search prs: %w", err)
+	}
+	var resp struct {
+		TotalCount        int  `json:"total_count"`
+		IncompleteResults bool `json:"incomplete_results"`
+		Items             []struct {
+			Number        int    `json:"number"`
+			HTMLURL       string `json:"html_url"`
+			Title         string `json:"title"`
+			State         string `json:"state"`
+			Body          string `json:"body"`
+			User          struct {
+				Login string `json:"login"`
+			} `json:"user"`
+			RepositoryURL string `json:"repository_url"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("github search prs decode: %w", err)
+	}
+	out := make([]PR, 0, len(resp.Items))
+	for _, it := range resp.Items {
+		// repository_url is shaped like
+		// "https://api.github.com/repos/owner/name" — split off the
+		// last two segments to recover the "owner/name" slug.
+		slug := ""
+		if it.RepositoryURL != "" {
+			parts := strings.Split(it.RepositoryURL, "/")
+			if len(parts) >= 2 {
+				slug = parts[len(parts)-2] + "/" + parts[len(parts)-1]
+			}
+		}
+		out = append(out, PR{
+			Number: it.Number,
+			URL:    it.HTMLURL,
+			Title:  it.Title,
+			Author: it.User.Login,
+			State:  it.State,
+			Body:   it.Body,
+			Repo:   slug,
+			// Branch (head.ref) isn't returned by the search API.
+			// /review fetches full detail via GetPRDetails so the
+			// branch comes back there.
+		})
 	}
 	return out, nil
 }

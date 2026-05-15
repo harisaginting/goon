@@ -89,11 +89,12 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		// can pull fresh tickets on demand. Reconfigure can swap
 		// them later; web handlers read via s.opts.LLM / s.opts.Board
 		// at request time.
-		llmProv, snapBoard, _ := d.Snapshot()
+		llmProv, snapBoard, snapHost := d.Snapshot()
 		srv = web.NewServer(web.Options{
 			Addr: *webAddr, Memory: mem,
 			LLM:    llmProv,
 			Board:  snapBoard,
+			Host:   snapHost,
 			Daemon: d, Stdout: stdout, Stderr: stderr,
 		})
 		go func() {
@@ -180,6 +181,8 @@ func startTelegramBot(parent context.Context, d *daemon.Daemon,
 		Executor: exec,
 		Host:     host,
 		Board:    botBoard,
+		// Daemon — so /answer wakes the poll loop immediately.
+		Daemon:   d,
 		Stdout:   stdout,
 		Stderr:   stderr,
 		Debug:    debug,

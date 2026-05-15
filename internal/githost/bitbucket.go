@@ -170,22 +170,44 @@ func (d bbPRDetail) authorName() string {
 	return d.Author.Nickname
 }
 
-// ListPRs returns open PRs across the supplied repos. When repos is empty,
-// falls back to GOON_REVIEW_REPOS (comma-separated "workspace/slug,...").
+// ListPRs returns open PRs across the supplied repos. Fallback chain
+// when repos is empty:
+//
+//  1. GOON_REVIEW_REPOS (comma-separated "workspace/slug,...")
+//  2. discoverAccessibleRepos: ask Bitbucket for every repo the
+//     authenticated user can see (capped at 20 most-recent so a user
+//     with hundreds of repos doesn't trigger a 100-call fan-out per
+//     /prs invocation).
+//
 // Bitbucket Cloud paginates list endpoints; we fetch the first page (50
 // items) per repo which is plenty for an interactive review queue.
 func (b *Bitbucket) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 	if len(repos) == 0 {
 		for _, r := range strings.Split(os.Getenv("GOON_REVIEW_REPOS"), ",") {
-			r = strings.TrimSpace(r)
+			r = NormalizeRepoSlug(r)
 			if r != "" {
 				repos = append(repos, r)
 			}
 		}
+	} else {
+		norm := make([]string, 0, len(repos))
+		for _, r := range repos {
+			if s := NormalizeRepoSlug(r); s != "" {
+				norm = append(norm, s)
+			}
+		}
+		repos = norm
+	}
+	if len(repos) == 0 {
+		discovered, err := b.discoverAccessibleRepos(ctx, 20)
+		if err != nil {
+			return nil, fmt.Errorf("bitbucket: no repos configured and discovery failed: %w (set GOON_REVIEW_REPOS to skip discovery)", err)
+		}
+		repos = discovered
 	}
 	out := []PR{}
 	for _, repo := range repos {
-		endpoint := fmt.Sprintf("%s/repositories/%s/pullrequests?state=OPEN&pagelen=50", b.APIURL, repo)
+		endpoint := fmt.Sprintf("%s/repositories/%s/pullrequests?state=OPEN&pagelen=20", b.APIURL, repo)
 		raw, err := b.do(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return out, fmt.Errorf("bitbucket list %s: %w", repo, err)
@@ -207,6 +229,164 @@ func (b *Bitbucket) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 				Body:   it.Description,
 				Repo:   repo,
 			})
+		}
+	}
+	return out, nil
+}
+
+// discoverAccessibleRepos asks Bitbucket Cloud for every repository
+// the authenticated user is a member of, sorted by most-recently-
+// updated, and returns up to `limit` slugs in "workspace/slug" form.
+// Internal helper for the /prs fallback — for the rich Repo objects
+// (used by the repo-picker UI), call ListRepos instead.
+func (b *Bitbucket) discoverAccessibleRepos(ctx context.Context, limit int) ([]string, error) {
+	repos, err := b.listAccessibleRepos(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(repos))
+	for _, r := range repos {
+		out = append(out, r.Slug)
+	}
+	return out, nil
+}
+
+// ListRepos satisfies the RepoLister interface. Returns up to 100 of
+// the most-recently-updated repos the authenticated principal can see
+// in "workspace/slug" form, with full Repo metadata (URL, description,
+// default branch, private flag). The picker UI uses this so the user
+// can tick which ones go into GOON_REVIEW_REPOS.
+func (b *Bitbucket) ListRepos(ctx context.Context) ([]Repo, error) {
+	return b.listAccessibleRepos(ctx, 100)
+}
+
+// bbRepoEntry is the subset of fields we read from
+// /repositories/{workspace} response objects. Reused across both the
+// workspace-scoped path and the per-workspace fallback so we only
+// have to maintain one shape.
+type bbRepoEntry struct {
+	FullName    string `json:"full_name"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	IsPrivate   bool   `json:"is_private"`
+	Mainbranch  struct {
+		Name string `json:"name"`
+	} `json:"mainbranch"`
+	Links struct {
+		HTML struct {
+			Href string `json:"href"`
+		} `json:"html"`
+		Clone []struct {
+			Name string `json:"name"`
+			Href string `json:"href"`
+		} `json:"clone"`
+	} `json:"links"`
+}
+
+func (e bbRepoEntry) toRepo() Repo {
+	cloneURL := e.Links.HTML.Href
+	for _, c := range e.Links.Clone {
+		if c.Name == "https" && c.Href != "" {
+			cloneURL = c.Href
+			break
+		}
+	}
+	return Repo{
+		Slug:          e.FullName,
+		Name:          e.Name,
+		URL:           cloneURL,
+		DefaultBranch: e.Mainbranch.Name,
+		Description:   e.Description,
+		Private:       e.IsPrivate,
+	}
+}
+
+// listAccessibleRepos enumerates every repo the authenticated principal
+// can see, capped at `limit`. The global /repositories?role=member
+// endpoint we used to call was deprecated in CHANGE-2770 (HTTP 410), so
+// we now go two-step:
+//
+//   1. GET /workspaces?pagelen=100        → list accessible workspaces
+//      (OR fall back to BITBUCKET_WORKSPACE if /workspaces is 401/403,
+//       which happens for repo-scoped access tokens).
+//   2. For each workspace W:
+//        GET /repositories/{W}?pagelen=100&sort=-updated_on
+//      → list repos. Stop once we hit `limit` total.
+//
+// Sorted by most-recently-updated workspace+repo first, which matches
+// what users expect to see at the top of the picker.
+func (b *Bitbucket) listAccessibleRepos(ctx context.Context, limit int) ([]Repo, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+
+	workspaces, err := b.listWorkspaces(ctx)
+	if err != nil {
+		// Fall back to a single explicit workspace if the user
+		// pre-configured one — covers tokens that can't see /workspaces.
+		if ws := strings.TrimSpace(os.Getenv("BITBUCKET_WORKSPACE")); ws != "" {
+			workspaces = []string{ws}
+		} else {
+			return nil, fmt.Errorf("bitbucket list workspaces: %w (set BITBUCKET_WORKSPACE to a specific workspace slug to bypass workspace discovery)", err)
+		}
+	}
+	if len(workspaces) == 0 {
+		return nil, fmt.Errorf("bitbucket: no workspaces visible to the token (set BITBUCKET_WORKSPACE to a known slug or use a token with workspace access)")
+	}
+
+	out := make([]Repo, 0, limit)
+	for _, ws := range workspaces {
+		if len(out) >= limit {
+			break
+		}
+		endpoint := fmt.Sprintf("%s/repositories/%s?pagelen=100&sort=-updated_on", b.APIURL, ws)
+		raw, err := b.do(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			// Skip workspaces the token can't access (e.g. when
+			// /workspaces returned more than the token's actual scope).
+			continue
+		}
+		var resp struct {
+			Values []bbRepoEntry `json:"values"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			continue
+		}
+		for _, r := range resp.Values {
+			if r.FullName == "" {
+				continue
+			}
+			out = append(out, r.toRepo())
+			if len(out) >= limit {
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// listWorkspaces returns the slugs of every workspace the token can see.
+// Uses /workspaces (the user-context endpoint). For tokens that can't
+// hit this (repo-scoped access tokens), callers should fall back to
+// BITBUCKET_WORKSPACE.
+func (b *Bitbucket) listWorkspaces(ctx context.Context) ([]string, error) {
+	endpoint := fmt.Sprintf("%s/workspaces?pagelen=100", b.APIURL)
+	raw, err := b.do(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp struct {
+		Values []struct {
+			Slug string `json:"slug"`
+		} `json:"values"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return nil, fmt.Errorf("bitbucket workspaces decode: %w", err)
+	}
+	out := make([]string, 0, len(resp.Values))
+	for _, w := range resp.Values {
+		if w.Slug != "" {
+			out = append(out, w.Slug)
 		}
 	}
 	return out, nil
@@ -287,7 +467,7 @@ func (b *Bitbucket) fetchDiff(ctx context.Context, urlStr string) (string, error
 	req.Header.Set("Accept", "text/plain")
 	switch {
 	case b.Token != "":
-		req.Header.Set("Authorization", "Bearer "+b.Token)
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.Token)))
 	case b.Username != "" && b.AppPassword != "":
 		req.Header.Set("Authorization", "Basic "+
 			base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.AppPassword)))
@@ -315,7 +495,7 @@ func (b *Bitbucket) do(ctx context.Context, method, urlStr string, body io.Reade
 	}
 	switch {
 	case b.Token != "":
-		req.Header.Set("Authorization", "Bearer "+b.Token)
+		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.Token)))
 	case b.Username != "" && b.AppPassword != "":
 		req.Header.Set("Authorization", "Basic "+
 			base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.AppPassword)))

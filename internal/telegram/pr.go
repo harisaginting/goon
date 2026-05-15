@@ -32,8 +32,9 @@ func (b *Bot) prReviewer() (githost.PRReviewer, string) {
 	return r, ""
 }
 
-// cmdListPRs handles `/prs [repo]`. Without a repo arg it asks the host's
-// ListPRs to fall back to GOON_REVIEW_REPOS (host-specific behaviour).
+// cmdListPRs handles `/prs [repo]`. With no repo arg the host's
+// ListPRs fallback chain takes over: GOON_REVIEW_REPOS → discovery
+// (search API on GitHub, repos?role=member on Bitbucket).
 func (b *Bot) cmdListPRs(ctx context.Context, chatID int64, args []string) {
 	r, reason := b.prReviewer()
 	if r == nil {
@@ -50,7 +51,7 @@ func (b *Bot) cmdListPRs(ctx context.Context, chatID int64, args []string) {
 		return
 	}
 	if len(prs) == 0 {
-		_ = b.Send(ctx, chatID, "no open PRs found (set GOON_REVIEW_REPOS or pass `/prs <repo>`)")
+		_ = b.Send(ctx, chatID, "no open PRs found across every repo you can see. Narrow the search with `/prs <owner/repo>`.")
 		return
 	}
 	var sb strings.Builder
@@ -124,7 +125,7 @@ DIFF (unified):
 	defer cancel2()
 	out, err := b.opts.LLM.Generate(revCtx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
-	}, llm.Options{Temperature: 0.2, MaxTokens: 1000})
+	}, llm.Options{Temperature: 0.2, MaxTokens: 4096})
 	if err != nil {
 		_ = b.Send(ctx, chatID, "✗ llm review failed: "+err.Error())
 		return

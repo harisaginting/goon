@@ -256,11 +256,21 @@ func TestSaveDefault_WritesEducationalStarter(t *testing.T) {
 
 func TestBranchName(t *testing.T) {
 	cases := []struct{ prefix, key, want string }{
-		{"", "ENG-1", "goon/eng-1"},
-		{"goon/", "ENG-1", "goon/eng-1"},
-		{"feature/", "ENG-1", "feature/eng-1"},
-		{"goon-", "ENG-1", "goon-eng-1"},
-		{"bot_", "X-9", "bot_x-9"},
+		// Preserves case — the canonical Jira-style key passes
+		// through verbatim. Lowercasing was removed because users
+		// expect "EB-4795" on the branch list, not "eb-4795".
+		{"", "ENG-1", "goon/ENG-1"},
+		{"goon/", "ENG-1", "goon/ENG-1"},
+		{"feature/", "ENG-1", "feature/ENG-1"},
+		{"goon-", "ENG-1", "goon-ENG-1"},
+		{"bot_", "X-9", "bot_X-9"},
+		// Real-world Jira project + ticket id stays readable.
+		{"", "EB-4795", "goon/EB-4795"},
+		// Disallowed characters collapse to dashes; consecutive
+		// dashes squash; edge dashes get trimmed.
+		{"", "EB 4795", "goon/EB-4795"},
+		{"", "GH-#42", "goon/GH-42"},
+		{"", "  ENG-1  ", "goon/ENG-1"},
 	}
 	for _, c := range cases {
 		got := branchName(c.prefix, c.key)

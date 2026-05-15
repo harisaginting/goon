@@ -155,12 +155,17 @@ func TestNewFragmentRoutesRespond200(t *testing.T) {
 	mux := s.mux()
 	for _, path := range []string{
 		"/fragments/status-pill",
-		"/fragments/questions-banner",
-		"/fragments/tab-overview",
-		"/fragments/tab-tickets",
-		"/fragments/tab-workflows",
-		"/fragments/tab-questions",
+		// Legacy + current tab composers — all must still resolve.
+		"/fragments/tab-work",
+		"/fragments/tab-overview", // legacy alias → work
+		"/fragments/tab-tickets",  // legacy alias → work
+		"/fragments/tab-workflows", // legacy alias → work
+		"/fragments/tab-questions", // legacy alias → work
+		"/fragments/tab-memory",
+		"/fragments/tab-knowledge", // legacy alias → memory
+		"/fragments/tab-skills",    // legacy alias → memory
 		"/fragments/tab-config",
+		"/fragments/tab-chat",
 	} {
 		rr := httptest.NewRecorder()
 		mux.ServeHTTP(rr, httptest.NewRequest("GET", path, nil))

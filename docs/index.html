@@ -1,0 +1,1301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>goon — your autonomous engineer</title>
+<link rel="icon" type="image/svg+xml" href="./logo.svg">
+<meta name="theme-color" content="#0d1117">
+<meta property="og:title" content="goon — your autonomous engineer">
+<meta property="og:description" content="An autonomous AI engineer in a single Go binary. Triages tickets, asks before changing anything, codes it, tests, opens a PR.">
+<meta property="og:image" content="./logo.svg">
+<style>
+  /* ============================================================
+     design tokens
+     ============================================================ */
+  :root {
+    --bg: #07090d;
+    --bg-soft: #0d1117;
+    --bg-elev: #11161e;
+    --bg-glass: rgba(13, 17, 23, 0.6);
+    --fg: #e6edf3;
+    --fg-soft: #9aa4b2;
+    --fg-mute: #6b7280;
+    --accent: #7c8cff;
+    --accent-2: #c084fc;
+    --accent-3: #22d3ee;
+    --accent-warm: #fb923c;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --border: #1f2937;
+    --border-soft: rgba(31, 41, 55, 0.6);
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
+    --shadow:    0 16px 40px -20px rgba(124, 140, 255, 0.30);
+    --shadow-lg: 0 30px 80px -30px rgba(124, 140, 255, 0.40);
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #fafbfc;
+      --bg-soft: #ffffff;
+      --bg-elev: #ffffff;
+      --bg-glass: rgba(255, 255, 255, 0.7);
+      --fg: #0c0e12;
+      --fg-soft: #4b5563;
+      --fg-mute: #9ca3af;
+      --accent: #5b6cff;
+      --accent-2: #a855f7;
+      --accent-3: #06b6d4;
+      --accent-warm: #f97316;
+      --ok: #16a34a;
+      --warn: #d97706;
+      --err: #dc2626;
+      --border: #e5e7eb;
+      --border-soft: rgba(229, 231, 235, 0.7);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    min-height: 100%;
+    overflow-x: hidden;
+  }
+  a { color: inherit; text-decoration: none; }
+  ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+
+  /* ============================================================
+     background mesh
+     ============================================================ */
+  .bg-fx {
+    position: fixed; inset: 0; z-index: -1; pointer-events: none;
+    overflow: hidden;
+    background:
+      radial-gradient(60% 40% at 80% 10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%),
+      radial-gradient(50% 40% at 5% 60%, color-mix(in srgb, var(--accent-2) 20%, transparent), transparent 60%),
+      radial-gradient(40% 30% at 95% 80%, color-mix(in srgb, var(--accent-3) 14%, transparent), transparent 60%);
+  }
+  .bg-fx::after {
+    content: ''; position: absolute; inset: 0;
+    background-image:
+      linear-gradient(color-mix(in srgb, var(--fg) 6%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in srgb, var(--fg) 6%, transparent) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse 70% 80% at 50% 25%, #000 25%, transparent 75%);
+    -webkit-mask-image: radial-gradient(ellipse 70% 80% at 50% 25%, #000 25%, transparent 75%);
+    opacity: 0.55;
+  }
+
+  /* ============================================================
+     top nav
+     ============================================================ */
+  nav.top {
+    position: sticky; top: 0; z-index: 30;
+    height: 64px;
+    backdrop-filter: saturate(140%) blur(16px);
+    -webkit-backdrop-filter: saturate(140%) blur(16px);
+    background: color-mix(in srgb, var(--bg) 70%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    display: flex; align-items: center; padding: 0 28px;
+  }
+  nav.top .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.01em; font-size: 16px; }
+  nav.top .brand .logo { color: var(--accent); }
+  nav.top .spacer { flex: 1; }
+  nav.top a.link { color: var(--fg-soft); margin: 0 14px; font-size: 14px; transition: color 120ms; }
+  nav.top a.link:hover { color: var(--fg); }
+  nav.top a.cta {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 8px 14px; border-radius: 8px;
+    background: var(--fg); color: var(--bg);
+    font-weight: 600; font-size: 13.5px;
+    transition: transform 120ms, opacity 120ms;
+  }
+  nav.top a.cta:hover { transform: translateY(-1px); opacity: 0.92; }
+  @media (max-width: 720px) {
+    nav.top { padding: 0 16px; }
+    nav.top a.link.hide-sm { display: none; }
+  }
+
+  /* ============================================================
+     shared section primitives
+     ============================================================ */
+  main { padding: 0 24px; }
+  .container { max-width: 1080px; margin: 0 auto; }
+  .section { padding: 90px 0; }
+  .section-eyebrow {
+    display: inline-block;
+    padding: 4px 12px; border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+    font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    margin-bottom: 14px;
+  }
+  .section-title {
+    font-size: clamp(30px, 4.5vw, 46px);
+    line-height: 1.1;
+    letter-spacing: -0.025em;
+    margin: 0 0 14px;
+    font-weight: 700;
+  }
+  .section-lede {
+    color: var(--fg-soft);
+    max-width: 620px;
+    font-size: 17px;
+    margin: 0 auto 48px;
+  }
+  .section-head { text-align: center; }
+  .grad-text {
+    background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* ============================================================
+     hero
+     ============================================================ */
+  .hero {
+    max-width: 1080px; margin: 0 auto;
+    padding: 88px 16px 40px;
+    text-align: center;
+    position: relative;
+  }
+  .hero .badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 5px 12px; border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--fg); font-size: 12.5px; font-weight: 500;
+    letter-spacing: 0.01em;
+    margin-bottom: 28px;
+    animation: fadeUp 600ms 80ms both;
+  }
+  .hero .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); animation: pulseDot 2s ease-in-out infinite; }
+
+  .hero .logo-stage {
+    width: 96px; height: 96px;
+    margin: 0 auto 18px;
+    display: grid; place-items: center;
+    color: var(--fg);
+    position: relative;
+    animation: fadeUp 700ms 60ms both;
+  }
+  .hero .logo-stage::before {
+    content: ''; position: absolute; inset: -32px; z-index: -1;
+    background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 40%, transparent), transparent 70%);
+    filter: blur(12px);
+    animation: glowPulse 4s ease-in-out infinite;
+  }
+  .hero .logo-stage svg { width: 100%; height: 100%; }
+
+  /* ---------- big GOON wordmark (extra specificity to override .hero h1) ---------- */
+  .hero .wordmark {
+    font-size: clamp(82px, 17vw, 184px);
+    line-height: 0.9;
+    letter-spacing: -0.055em;
+    margin: 0 auto 10px;
+    font-weight: 900;
+    text-align: center;
+    background: linear-gradient(180deg, var(--fg) 30%, color-mix(in srgb, var(--accent) 55%, var(--fg)) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    position: relative;
+    text-transform: lowercase;
+    animation: fadeUp 700ms 100ms both;
+    /* allow descender (g) to render */
+    padding-bottom: 0.06em;
+  }
+  .hero .wordmark .ascii-crown {
+    display: inline-block;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .hero .wordmark::after {
+    /* subtle drop-shadow under the wordmark */
+    content: '';
+    position: absolute; left: 50%; bottom: -10px;
+    transform: translateX(-50%);
+    width: 60%; height: 30px;
+    background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 30%, transparent), transparent 70%);
+    filter: blur(14px);
+    z-index: -1;
+    pointer-events: none;
+  }
+  .wordmark-meta {
+    display: flex; gap: 14px; justify-content: center; align-items: center;
+    font-family: var(--mono); font-size: 13px; color: var(--fg-soft);
+    margin-bottom: 28px;
+    animation: fadeUp 700ms 180ms both;
+  }
+  .wordmark-meta .go-on {
+    padding: 3px 10px; border-radius: 999px;
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--fg);
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    font-family: var(--sans);
+  }
+  .wordmark-meta .go-on .on { color: var(--accent); }
+  .wordmark-meta .sep { color: var(--fg-mute); }
+  @media (max-width: 520px) {
+    .wordmark-meta { flex-direction: column; gap: 6px; }
+    .wordmark-meta .sep { display: none; }
+  }
+
+  .hero h1 {
+    font-size: clamp(44px, 8vw, 92px);
+    line-height: 1.04;
+    letter-spacing: -0.035em;
+    margin: 0 0 18px;
+    font-weight: 800;
+    background: linear-gradient(180deg, var(--fg) 50%, color-mix(in srgb, var(--fg) 60%, transparent));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: fadeUp 700ms 120ms both;
+  }
+  .hero .tagline {
+    max-width: 700px; margin: 0 auto 12px;
+    font-size: clamp(17px, 2.2vw, 22px);
+    color: var(--fg);
+    font-weight: 500;
+    animation: fadeUp 700ms 200ms both;
+  }
+  .hero .subtag {
+    max-width: 620px; margin: 0 auto 36px;
+    font-size: 15.5px;
+    color: var(--fg-soft);
+    animation: fadeUp 700ms 280ms both;
+  }
+
+  .cta-row {
+    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
+    animation: fadeUp 700ms 360ms both;
+  }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    padding: 14px 22px; border-radius: 10px;
+    font-size: 15px; font-weight: 600;
+    transition: transform 140ms, box-shadow 140ms, background 140ms, color 140ms, border-color 140ms;
+    border: 1px solid transparent;
+    cursor: pointer; font-family: var(--sans);
+    min-width: 178px;
+  }
+  .btn.primary {
+    background: var(--fg);
+    color: var(--bg);
+    box-shadow: 0 10px 30px -10px color-mix(in srgb, var(--fg) 60%, transparent);
+  }
+  .btn.primary:hover { transform: translateY(-2px); box-shadow: 0 14px 36px -12px color-mix(in srgb, var(--fg) 60%, transparent); }
+  .btn.secondary {
+    background: color-mix(in srgb, var(--bg-elev) 80%, transparent);
+    color: var(--fg);
+    border-color: var(--border);
+    backdrop-filter: blur(8px);
+  }
+  .btn.secondary:hover { transform: translateY(-2px); background: var(--bg-elev); border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
+  .btn svg { width: 16px; height: 16px; }
+
+  /* ---------- stats strip ---------- */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 14px;
+    max-width: 720px; margin: 56px auto 0;
+    animation: fadeUp 800ms 440ms both;
+  }
+  .stat {
+    text-align: center;
+    padding: 18px 14px;
+    border: 1px solid var(--border-soft);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .stat .num {
+    font-size: clamp(22px, 3vw, 28px);
+    font-weight: 700;
+    background: linear-gradient(180deg, var(--fg), color-mix(in srgb, var(--accent) 60%, var(--fg)));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+    line-height: 1;
+    letter-spacing: -0.02em;
+  }
+  .stat .label { font-size: 11.5px; color: var(--fg-soft); margin-top: 6px; letter-spacing: 0.04em; text-transform: uppercase; }
+  @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+
+  /* ============================================================
+     terminal mockup
+     ============================================================ */
+  .terminal {
+    max-width: 760px; margin: 60px auto 0;
+    border-radius: 12px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    overflow: hidden;
+    box-shadow: var(--shadow-lg);
+  }
+  .terminal .head {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-soft) 50%, var(--bg));
+  }
+  .terminal .head .dots { display: flex; gap: 6px; }
+  .terminal .head .dots span { width: 11px; height: 11px; border-radius: 50%; background: var(--fg-mute); opacity: 0.5; }
+  .terminal .head .title { font-family: var(--mono); font-size: 12px; color: var(--fg-mute); margin: 0 auto; }
+  .terminal .tabs { display: flex; gap: 4px; padding: 8px 12px 0; background: var(--bg-soft); border-bottom: 1px solid var(--border); }
+  .terminal .tab {
+    padding: 7px 14px; font-size: 12px; font-family: var(--mono); color: var(--fg-soft);
+    border: 1px solid transparent; border-radius: 6px 6px 0 0; cursor: pointer;
+    transition: color 120ms, background 120ms;
+    background: none;
+  }
+  .terminal .tab:hover { color: var(--fg); background: color-mix(in srgb, var(--bg-elev) 50%, transparent); }
+  .terminal .tab.active { color: var(--fg); background: var(--bg-soft); border-color: var(--border); border-bottom-color: var(--bg-soft); margin-bottom: -1px; }
+  .terminal pre {
+    margin: 0; padding: 18px 22px;
+    background: transparent;
+    color: var(--fg);
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.75;
+    overflow-x: auto;
+    text-align: left;
+    min-height: 240px;
+  }
+  .terminal .panel { display: none; }
+  .terminal .panel.active { display: block; }
+  .terminal .prompt { color: var(--accent); }
+  .terminal .arg    { color: var(--accent-2); }
+  .terminal .out    { color: var(--fg-soft); }
+  .terminal .ok     { color: var(--ok); }
+  .terminal .warn   { color: var(--warn); }
+  .terminal .label  { color: var(--accent-3); }
+
+  /* ============================================================
+     "how it works" — 4 step journey
+     ============================================================ */
+  .journey {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
+    position: relative;
+  }
+  .journey::before {
+    content: ''; position: absolute;
+    top: 36px; left: 6%; right: 6%; height: 2px;
+    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 60%, transparent) 15%, color-mix(in srgb, var(--accent-2) 60%, transparent) 50%, color-mix(in srgb, var(--accent-3) 60%, transparent) 85%, transparent);
+    z-index: 0;
+  }
+  .step {
+    position: relative; z-index: 1;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
+    backdrop-filter: blur(8px);
+    border-radius: 14px;
+    padding: 22px 20px 20px;
+    text-align: left;
+    transition: transform 200ms, border-color 200ms;
+  }
+  .step:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
+  .step .num {
+    width: 36px; height: 36px;
+    border-radius: 10px;
+    display: grid; place-items: center;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 25%, transparent), color-mix(in srgb, var(--accent-2) 20%, transparent));
+    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    color: var(--accent);
+    font-family: var(--mono); font-size: 14px; font-weight: 700;
+    margin-bottom: 14px;
+  }
+  .step h3 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; letter-spacing: -0.005em; }
+  .step p { margin: 0; color: var(--fg-soft); font-size: 14px; line-height: 1.55; }
+  .step .hint { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 3px 8px; border-radius: 6px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-family: var(--mono); font-size: 11px; }
+  @media (max-width: 900px) {
+    .journey { grid-template-columns: 1fr 1fr; }
+    .journey::before { display: none; }
+  }
+  @media (max-width: 580px) {
+    .journey { grid-template-columns: 1fr; }
+  }
+
+  /* ============================================================
+     state-machine flow strip
+     ============================================================ */
+  .flow-pipe {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
+    font-family: var(--mono); font-size: 13px;
+  }
+  .flow-pipe .pill {
+    padding: 8px 14px; border-radius: 999px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
+    color: var(--fg-soft);
+  }
+  .flow-pipe .pill.gate {
+    color: var(--warn);
+    border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
+    background: color-mix(in srgb, var(--warn) 12%, transparent);
+  }
+  .flow-pipe .pill.done {
+    color: var(--ok);
+    border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+    background: color-mix(in srgb, var(--ok) 10%, transparent);
+  }
+  .flow-pipe .arrow { color: var(--fg-mute); align-self: center; }
+
+  /* ============================================================
+     three-layer memory diagram
+     ============================================================ */
+  .layers {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  }
+  .layer {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 26px 22px;
+    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
+    position: relative; overflow: hidden;
+    transition: transform 200ms;
+  }
+  .layer:hover { transform: translateY(-3px); }
+  .layer::before {
+    content: ''; position: absolute; inset: -1px -1px auto -1px; height: 3px;
+  }
+  .layer.personal::before  { background: linear-gradient(90deg, var(--accent-warm), var(--accent-2)); }
+  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-3)); }
+  .layer.skills::before    { background: linear-gradient(90deg, var(--accent-3), var(--ok)); }
+  .layer .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .layer .badge {
+    font-family: var(--mono); font-size: 11px;
+    padding: 3px 8px; border-radius: 6px;
+    background: color-mix(in srgb, var(--bg) 50%, transparent);
+    border: 1px solid var(--border-soft);
+    color: var(--fg-soft);
+  }
+  .layer h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.005em; }
+  .layer p { color: var(--fg-soft); font-size: 14px; margin: 0 0 12px; line-height: 1.55; }
+  .layer .file { font-family: var(--mono); font-size: 11.5px; color: var(--fg-mute); }
+  @media (max-width: 900px) { .layers { grid-template-columns: 1fr; } }
+
+  /* ============================================================
+     pluggable matrix
+     ============================================================ */
+  .matrix {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px;
+  }
+  .matrix-col {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 22px 20px;
+    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
+  }
+  .matrix-col .col-label {
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--fg-mute); margin-bottom: 14px;
+  }
+  .matrix-col ul { list-style: none; padding: 0; margin: 0; }
+  .matrix-col li {
+    display: flex; align-items: center; gap: 8px;
+    padding: 7px 0; font-size: 14px; color: var(--fg);
+    border-bottom: 1px solid var(--border-soft);
+  }
+  .matrix-col li:last-child { border-bottom: none; }
+  .matrix-col li .check {
+    width: 14px; height: 14px; flex-shrink: 0;
+    color: var(--ok);
+  }
+  .matrix-col li .check svg { width: 100%; height: 100%; }
+  @media (max-width: 900px) { .matrix { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 520px) { .matrix { grid-template-columns: 1fr; } }
+
+  /* ============================================================
+     features grid (existing)
+     ============================================================ */
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 18px;
+  }
+  @media (max-width: 900px) { .feature-grid { grid-template-columns: 1fr; } }
+  .feature {
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
+    backdrop-filter: blur(8px);
+    border-radius: 14px;
+    padding: 26px 24px;
+    transition: border-color 200ms, transform 200ms;
+  }
+  .feature:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); transform: translateY(-3px); }
+  .feature .icon {
+    width: 38px; height: 38px;
+    border-radius: 10px;
+    display: grid; place-items: center;
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--accent);
+    margin-bottom: 16px;
+  }
+  .feature .icon svg { width: 19px; height: 19px; }
+  .feature h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; letter-spacing: -0.005em; }
+  .feature p { margin: 0; color: var(--fg-soft); font-size: 14.5px; line-height: 1.55; }
+
+  /* ============================================================
+     three surfaces
+     ============================================================ */
+  .surfaces {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
+  }
+  .surface {
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
+    overflow: hidden;
+    transition: transform 200ms, border-color 200ms;
+  }
+  .surface:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
+  .surface .mock {
+    height: 170px;
+    background: linear-gradient(135deg, color-mix(in srgb, var(--bg) 80%, transparent), var(--bg-soft));
+    border-bottom: 1px solid var(--border-soft);
+    padding: 12px;
+    overflow: hidden;
+    position: relative;
+    font-family: var(--mono); font-size: 11px; line-height: 1.6;
+    color: var(--fg-soft);
+  }
+  .surface .mock .cli-line { color: var(--fg); }
+  .surface .mock .cli-line .pf { color: var(--accent); }
+  .surface .mock .cli-line .ok { color: var(--ok); }
+  .surface .mock-web {
+    display: grid; grid-template-columns: 60px 1fr; gap: 4px; height: 100%;
+  }
+  .surface .mock-web .sb { background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 4px; padding: 6px 4px; }
+  .surface .mock-web .sb div { height: 6px; background: color-mix(in srgb, var(--accent) 30%, transparent); border-radius: 2px; margin-bottom: 5px; }
+  .surface .mock-web .sb div:nth-child(2) { background: color-mix(in srgb, var(--accent) 50%, transparent); }
+  .surface .mock-web .panes { display: flex; flex-direction: column; gap: 4px; }
+  .surface .mock-web .panes div { background: color-mix(in srgb, var(--bg-elev) 90%, transparent); border-radius: 4px; flex: 1; padding: 6px; font-size: 10px; }
+  .surface .mock-tg .bubble {
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    border-radius: 10px 10px 10px 2px;
+    padding: 7px 10px; margin: 4px 0;
+    font-family: var(--sans); font-size: 11.5px; max-width: 80%;
+  }
+  .surface .mock-tg .bubble.me {
+    background: color-mix(in srgb, var(--ok) 18%, transparent);
+    border-radius: 10px 10px 2px 10px;
+    margin-left: auto;
+  }
+  .surface .body { padding: 18px 20px 22px; }
+  .surface h3 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; }
+  .surface p { color: var(--fg-soft); font-size: 13.5px; margin: 0 0 10px; line-height: 1.55; }
+  .surface .tag-row { display: flex; flex-wrap: wrap; gap: 4px; }
+  .surface .tag {
+    font-family: var(--mono); font-size: 10.5px;
+    padding: 2px 7px; border-radius: 6px;
+    background: color-mix(in srgb, var(--bg) 50%, transparent);
+    border: 1px solid var(--border-soft);
+    color: var(--fg-soft);
+  }
+  @media (max-width: 900px) { .surfaces { grid-template-columns: 1fr; } }
+
+  /* ============================================================
+     safety section — two-column
+     ============================================================ */
+  .safety {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: center;
+  }
+  .safety .copy h2 { font-size: clamp(28px, 4vw, 38px); margin: 0 0 14px; letter-spacing: -0.02em; font-weight: 700; }
+  .safety .copy > p { color: var(--fg-soft); font-size: 16px; margin: 0 0 18px; }
+  .safety .copy ul { padding-left: 0; list-style: none; margin: 0; }
+  .safety .copy li {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 0; border-bottom: 1px solid var(--border-soft);
+  }
+  .safety .copy li:last-child { border-bottom: none; }
+  .safety .copy li .checkmark {
+    width: 20px; height: 20px; flex-shrink: 0; margin-top: 1px;
+    border-radius: 6px;
+    background: color-mix(in srgb, var(--ok) 22%, transparent);
+    color: var(--ok);
+    display: grid; place-items: center;
+  }
+  .safety .copy li .checkmark svg { width: 12px; height: 12px; }
+  .safety .copy li strong { display: block; font-weight: 600; }
+  .safety .copy li .det { color: var(--fg-soft); font-size: 14px; }
+  .safety .visual {
+    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 14%, transparent), color-mix(in srgb, var(--accent-2) 10%, transparent));
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    box-shadow: var(--shadow);
+  }
+  .safety .visual .gate {
+    border: 1px solid var(--border-soft);
+    background: var(--bg-soft);
+    border-radius: 10px;
+    padding: 14px 16px;
+    margin-bottom: 10px;
+  }
+  .safety .visual .gate .lbl { font-family: var(--mono); font-size: 11px; color: var(--warn); margin-bottom: 4px; }
+  .safety .visual .gate .q { font-size: 14px; margin: 0 0 10px; color: var(--fg); }
+  .safety .visual .gate .opts { display: flex; gap: 6px; flex-wrap: wrap; }
+  .safety .visual .gate .opt {
+    padding: 5px 11px; border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg-elev);
+    font-size: 12px; color: var(--fg-soft);
+  }
+  .safety .visual .gate .opt.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  .safety .visual .gate .opt.danger  { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }
+  @media (max-width: 900px) { .safety { grid-template-columns: 1fr; } }
+
+  /* ============================================================
+     bottom CTA
+     ============================================================ */
+  section.bottom-cta {
+    max-width: 880px; margin: 100px auto 80px;
+    padding: 60px 36px;
+    border-radius: 24px;
+    text-align: center;
+    background:
+      linear-gradient(135deg, color-mix(in srgb, var(--accent) 20%, transparent), color-mix(in srgb, var(--accent-2) 16%, transparent));
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+    position: relative;
+    overflow: hidden;
+  }
+  section.bottom-cta::before {
+    content: ''; position: absolute; inset: 0; z-index: 0;
+    background: radial-gradient(closest-side at 30% 100%, color-mix(in srgb, var(--accent-3) 30%, transparent), transparent 60%);
+    pointer-events: none;
+  }
+  section.bottom-cta h2 {
+    font-size: clamp(26px, 3.8vw, 38px);
+    letter-spacing: -0.02em;
+    margin: 0 0 14px;
+    font-weight: 700;
+    position: relative;
+  }
+  section.bottom-cta p {
+    color: var(--fg-soft);
+    max-width: 480px; margin: 0 auto 28px;
+    font-size: 16px;
+    position: relative;
+  }
+  section.bottom-cta .cta-row { position: relative; }
+
+  /* ============================================================
+     footer
+     ============================================================ */
+  footer {
+    max-width: 1080px; margin: 0 auto;
+    padding: 32px 24px 56px;
+    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
+    display: flex; justify-content: space-between; align-items: center;
+    color: var(--fg-mute); font-size: 13px;
+    flex-wrap: wrap; gap: 12px;
+  }
+  footer .links a { color: var(--fg-soft); margin-left: 16px; transition: color 120ms; }
+  footer .links a:hover { color: var(--fg); }
+  footer .brand-foot { display: inline-flex; align-items: center; gap: 8px; }
+  footer .brand-foot svg { color: var(--accent); }
+
+  /* ============================================================
+     animations + reveals
+     ============================================================ */
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes glowPulse {
+    0%, 100% { opacity: 0.55; transform: scale(1); }
+    50%      { opacity: 0.95; transform: scale(1.08); }
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50%      { opacity: 0.4; transform: scale(0.85); }
+  }
+  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 700ms ease-out, transform 700ms cubic-bezier(0.16, 1, 0.3, 1); }
+  .reveal.in { opacity: 1; transform: none; }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .reveal { opacity: 1; transform: none; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bg-fx" aria-hidden="true"></div>
+
+<nav class="top">
+  <a href="/" class="brand">
+    <svg class="logo" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+    </svg>
+    <span>goon</span>
+  </a>
+  <div class="spacer"></div>
+  <a class="link hide-sm" href="#how">How it works</a>
+  <a class="link hide-sm" href="#features">Features</a>
+  <a class="link hide-sm" href="./docs/">Docs</a>
+  <a class="link hide-sm" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
+  <a class="cta" href="#install">
+    Get started
+    <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
+  </a>
+</nav>
+
+<main>
+
+  <!-- =========================================================
+       HERO
+       ========================================================= -->
+  <section class="hero">
+    <span class="badge"><span class="dot"></span> autonomous · open source · zero deps</span>
+
+    <div class="logo-stage" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">
+        <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+      </svg>
+    </div>
+
+    <h1 class="wordmark" aria-label="goon">g<span class="ascii-crown">oo</span>n</h1>
+    <div class="wordmark-meta">
+      <span class="go-on">Go <span class="on">ON</span></span>
+      <span class="sep">·</span>
+      <span>pronounced "goon" · written in Go · always on</span>
+    </div>
+
+    <h2 style="font-size: clamp(28px, 4.5vw, 44px); line-height: 1.1; letter-spacing: -0.02em; margin: 0 0 18px; font-weight: 700;" class="reveal in">Your autonomous <span class="grad-text">engineer</span>.</h2>
+
+    <p class="tagline">An AI engineer that lives in a single Go binary. It picks up tickets, asks before changing anything, codes it, tests it, opens the PR.</p>
+    <p class="subtag">Pluggable LLM, board, git host. Drive it from the CLI, web UI, or Telegram. Same memory, same brain, three surfaces.</p>
+
+    <div class="cta-row">
+      <a class="btn primary" href="#install">
+        Get started
+        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
+      </a>
+      <a class="btn secondary" href="./docs/">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
+        Documentation
+      </a>
+    </div>
+
+    <div class="stats">
+      <div class="stat"><div class="num">0</div><div class="label">third-party deps</div></div>
+      <div class="stat"><div class="num">5</div><div class="label">LLM providers</div></div>
+      <div class="stat"><div class="num">3</div><div class="label">surfaces</div></div>
+      <div class="stat"><div class="num">9</div><div class="label">indexed langs</div></div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       TERMINAL DEMO — 3 tabs
+       ========================================================= -->
+  <div class="container reveal" id="demo">
+    <div class="terminal" aria-label="example session">
+      <div class="head">
+        <div class="dots"><span></span><span></span><span></span></div>
+        <div class="title">~/projects/myapp · goon</div>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab active" role="tab" data-tab="t1">one-shot</button>
+        <button class="tab"        role="tab" data-tab="t2">daemon</button>
+        <button class="tab"        role="tab" data-tab="t3">telegram</button>
+      </div>
+
+      <div class="panel active" data-panel="t1">
+        <pre><span class="prompt">$</span> goon <span class="arg">"fix the failing auth test in user-service"</span>
+<span class="label">→ triage</span>     read 4 files · 1 stale import found
+<span class="label">→ plan</span>       regenerate mocks · update import path · rerun tests
+<span class="label">→ approve plan?</span> <span class="ok">yes</span>
+<span class="label">→ execute</span>    7 lines changed across 2 files
+<span class="label">→ test</span>       go test ./internal/user/... <span class="ok">PASS</span>
+<span class="label">→ verify</span>     diff applied, no orphan imports
+<span class="ok">✓ PR opened: github.com/you/repo/pull/482</span></pre>
+      </div>
+
+      <div class="panel" data-panel="t2">
+        <pre><span class="prompt">$</span> goon start
+<span class="out">  workflow: default · polling jira every 5m</span>
+<span class="out">  bot:      enabled · 1 chat authorized</span>
+<span class="out">  web:      http://localhost:8080</span>
+
+<span class="label">[15:02:11]</span> picked PROJ-482 · "fix flaky auth test"
+<span class="label">[15:02:14]</span> triage complete · awaiting <span class="warn">confirm_repo</span>
+<span class="label">[15:04:33]</span> answer: repo = harisaginting/user-service
+<span class="label">[15:04:34]</span> plan ready · awaiting <span class="warn">approve_plan</span>
+<span class="label">[15:06:01]</span> answer: yes
+<span class="label">[15:06:02]</span> executing... test... verify...
+<span class="ok">✓ [15:07:48] PR opened · notified via telegram</span></pre>
+      </div>
+
+      <div class="panel" data-panel="t3">
+        <pre><span class="prompt">you</span>   /mine
+<span class="label">goon</span>  Tickets assigned to you:
+        <span class="ok">PROJ-482</span> fix flaky auth test         · in progress
+        <span class="ok">PROJ-501</span> upgrade pg driver to v5      · todo
+        <span class="ok">PROJ-509</span> rename "tenant" → "workspace" · todo
+
+<span class="prompt">you</span>   /ticket PROJ-501 comment "I'll take this after 482 lands"
+<span class="label">goon</span>  <span class="ok">✓ comment posted on PROJ-501</span>
+
+<span class="prompt">you</span>   /prs
+<span class="label">goon</span>  Open PRs in followed repos:
+        #482 fix flaky auth test  (you · awaiting review)</pre>
+      </div>
+    </div>
+  </div>
+
+  <!-- =========================================================
+       HOW IT WORKS — 4 step journey
+       ========================================================= -->
+  <section class="section container reveal" id="how">
+    <div class="section-head">
+      <span class="section-eyebrow">how it works</span>
+      <h2 class="section-title">A real engineer's loop, automated.</h2>
+      <p class="section-lede">Goon doesn't just generate code — it follows the same loop a senior would. Read, plan, ask, execute, verify, ship. You stay in the loop at the moments that matter.</p>
+    </div>
+
+    <div class="journey">
+      <div class="step">
+        <div class="num">1</div>
+        <h3>It picks up a ticket</h3>
+        <p>Polls Jira or GitHub Issues every few minutes. Picks one ticket per tick, learns repo mappings as you confirm them — next time it auto-skips that question.</p>
+        <span class="hint">poll · triage</span>
+      </div>
+      <div class="step">
+        <div class="num">2</div>
+        <h3>It asks before touching code</h3>
+        <p>Two gates: <em>which repo?</em> and <em>is this plan right?</em> Approve, reject, or edit the plan inline. Rejected plans re-plan with your feedback (up to 3 attempts).</p>
+        <span class="hint">approval gates</span>
+      </div>
+      <div class="step">
+        <div class="num">3</div>
+        <h3>It actually ships the work</h3>
+        <p>Edits files, runs tests, verifies the diff, updates its own markdown notes about what it learned. Every shell command goes through the safety validator.</p>
+        <span class="hint">execute · test · verify</span>
+      </div>
+      <div class="step">
+        <div class="num">4</div>
+        <h3>You get a PR</h3>
+        <p>Real PR on GitHub / GitLab / Bitbucket. Review from the web UI or Telegram — approve, comment, request changes. Goon learns from the review for next time.</p>
+        <span class="hint">open PR · notify</span>
+      </div>
+    </div>
+
+    <div style="margin-top: 48px;">
+      <p style="text-align:center; color:var(--fg-soft); margin-bottom: 18px; font-size: 14px;">Under the hood it's an explicit state machine — every stage is observable, hookable, and resumable.</p>
+      <div class="flow-pipe">
+        <span class="pill">poll board</span>
+        <span class="arrow">→</span>
+        <span class="pill">triage</span>
+        <span class="arrow">→</span>
+        <span class="pill gate">confirm repo</span>
+        <span class="arrow">→</span>
+        <span class="pill gate">approve plan</span>
+        <span class="arrow">→</span>
+        <span class="pill">execute</span>
+        <span class="arrow">→</span>
+        <span class="pill">test</span>
+        <span class="arrow">→</span>
+        <span class="pill">verify</span>
+        <span class="arrow">→</span>
+        <span class="pill">update memory</span>
+        <span class="arrow">→</span>
+        <span class="pill done">open PR</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       SAFETY / APPROVAL GATES
+       ========================================================= -->
+  <section class="section container reveal">
+    <div class="safety">
+      <div class="copy">
+        <span class="section-eyebrow">safe by default</span>
+        <h2>You stay in control. Always.</h2>
+        <p>Autonomy without surprise. Goon pauses on the decisions that matter — and gives you everything you need to say yes.</p>
+        <ul>
+          <li>
+            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
+            <span><strong>Edit-the-plan approval</strong><span class="det">Reject and rewrite — goon re-plans with your feedback, not just a "no."</span></span>
+          </li>
+          <li>
+            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
+            <span><strong>Shell-command blocklist</strong><span class="det">Regex validator catches <code>rm&nbsp;-rf</code>, <code>sudo</code>, history rewrites — hooks are checked too.</span></span>
+          </li>
+          <li>
+            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
+            <span><strong>Strict-JSON tool contract</strong><span class="det">No prompt-injection foot-guns. Every tool call is validated against a schema before it runs.</span></span>
+          </li>
+          <li>
+            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
+            <span><strong>Dry-run mode</strong><span class="det">Set the executor to dry-run; goon plans normally but no mutation runs. Read-only tools still execute.</span></span>
+          </li>
+          <li>
+            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
+            <span><strong>Pause / resume anywhere</strong><span class="det">CLI, web, or Telegram. Daemon parks; in-flight work keeps its state.</span></span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="visual">
+        <div class="gate">
+          <div class="lbl">confirm_repo · PROJ-482</div>
+          <p class="q">Which repo should I work in?</p>
+          <div class="opts">
+            <span class="opt primary">harisaginting/user-service</span>
+            <span class="opt">harisaginting/auth-lib</span>
+            <span class="opt">other…</span>
+          </div>
+        </div>
+        <div class="gate">
+          <div class="lbl">approve_plan · attempt 1</div>
+          <p class="q">3 steps — regenerate mocks, update import path, rerun tests. OK to proceed?</p>
+          <div class="opts">
+            <span class="opt primary">yes</span>
+            <span class="opt">edit plan</span>
+            <span class="opt danger">no, re-plan</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       THREE-LAYER MEMORY
+       ========================================================= -->
+  <section class="section container reveal">
+    <div class="section-head">
+      <span class="section-eyebrow">memory</span>
+      <h2 class="section-title">A brain in three layers.</h2>
+      <p class="section-lede">Goon isn't a stateless chatbot. It keeps three persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
+    </div>
+
+    <div class="layers">
+      <div class="layer personal">
+        <div class="head">
+          <h3>Personal</h3>
+          <span class="badge">soul · always loaded</span>
+        </div>
+        <p>Goon's character. Voice, tone, defaults. The "who am I" file. One per project, you edit it freely.</p>
+        <div class="file">./storage/personal.md</div>
+      </div>
+      <div class="layer knowledge">
+        <div class="head">
+          <h3>Knowledge</h3>
+          <span class="badge">history · auto-pinned</span>
+        </div>
+        <p>What goon has learned. PINNED.md auto-injects on every run; topic notes are looked up on demand. Grows as it works.</p>
+        <div class="file">./storage/memory/*.md</div>
+      </div>
+      <div class="layer skills">
+        <div class="head">
+          <h3>Skills</h3>
+          <span class="badge">specialties · on-demand</span>
+        </div>
+        <p>Specialized playbooks: "how we deploy", "how migrations work here". Loaded only when relevant — keeps tokens lean.</p>
+        <div class="file">./storage/skills/*.md</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       PLUGGABLE MATRIX
+       ========================================================= -->
+  <section class="section container reveal">
+    <div class="section-head">
+      <span class="section-eyebrow">pluggable everything</span>
+      <h2 class="section-title">Use what you already use.</h2>
+      <p class="section-lede">Swap any layer with one env var. No code change, no adapter to write, no vendor lock. The same binary works on your laptop and your CI.</p>
+    </div>
+
+    <div class="matrix">
+      <div class="matrix-col">
+        <div class="col-label">LLM provider</div>
+        <ul>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> OpenAI</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Anthropic</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Gemini</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Ollama (local)</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> mock (for CI)</li>
+        </ul>
+      </div>
+      <div class="matrix-col">
+        <div class="col-label">Ticket board</div>
+        <ul>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Jira (Cloud + DC)</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitHub Issues</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Confluence read</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Mock (tests)</li>
+          <li style="opacity:0.5;"><span class="check" style="color:var(--fg-mute)"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/></svg></span> Linear · soon</li>
+        </ul>
+      </div>
+      <div class="matrix-col">
+        <div class="col-label">Git host</div>
+        <ul>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitHub</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitLab</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Bitbucket</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> PR review on each</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Auto-learned mapping</li>
+        </ul>
+      </div>
+      <div class="matrix-col">
+        <div class="col-label">Notification</div>
+        <ul>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Telegram bot</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Web UI dashboard</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> SSE live events</li>
+          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Custom hooks</li>
+          <li style="opacity:0.5;"><span class="check" style="color:var(--fg-mute)"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/></svg></span> Slack · soon</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       THREE SURFACES
+       ========================================================= -->
+  <section class="section container reveal">
+    <div class="section-head">
+      <span class="section-eyebrow">three surfaces</span>
+      <h2 class="section-title">Wherever you live, goon lives there too.</h2>
+      <p class="section-lede">CLI for quick hits at your desk. Web for review and visibility. Telegram for when you're on the train. Same memory backend, same state, no sync layer to worry about.</p>
+    </div>
+
+    <div class="surfaces">
+      <div class="surface">
+        <div class="mock">
+          <div class="cli-line"><span class="pf">$</span> goon "summarize the .go files in cmd/"</div>
+          <div class="cli-line">→ read 7 files</div>
+          <div class="cli-line">→ cmd/root.go: subcommand dispatch</div>
+          <div class="cli-line">→ cmd/start.go: daemon launcher</div>
+          <div class="cli-line">→ cmd/memory.go: memory subcommands</div>
+          <div class="cli-line"><span class="ok">✓ done</span></div>
+        </div>
+        <div class="body">
+          <h3>CLI</h3>
+          <p>One-shot agent or background daemon. Pipeline configurable in <code>workflow.json</code>. Perfect for scripts and CI.</p>
+          <div class="tag-row">
+            <span class="tag">goon "&lt;task&gt;"</span>
+            <span class="tag">goon start</span>
+            <span class="tag">workflow.json</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <div class="mock">
+          <div class="mock-web">
+            <div class="sb"><div></div><div></div><div></div><div></div></div>
+            <div class="panes">
+              <div>Live workflow · PROJ-482</div>
+              <div>2 pending questions · 5 tickets</div>
+              <div style="background:color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent);">approve plan?</div>
+            </div>
+          </div>
+        </div>
+        <div class="body">
+          <h3>Web UI</h3>
+          <p>htmx + Tailwind dashboard. Browse files, edit plans inline, chat with the agent, manage memory layers. Live via SSE.</p>
+          <div class="tag-row">
+            <span class="tag">/app</span>
+            <span class="tag">⌘K palette</span>
+            <span class="tag">file editor</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="surface">
+        <div class="mock mock-tg">
+          <div class="bubble">👑 goon: PROJ-482 awaiting approve_plan</div>
+          <div class="bubble me">/answer yes</div>
+          <div class="bubble">✓ resumed · executing now</div>
+          <div class="bubble me">/prs</div>
+        </div>
+        <div class="body">
+          <h3>Telegram</h3>
+          <p>Full CLI parity in chat. <code>/tickets</code>, <code>/mine</code>, <code>/prs</code>, <code>/review</code>. Plain text talks to the model with tool use.</p>
+          <div class="tag-row">
+            <span class="tag">/auth</span>
+            <span class="tag">/answer</span>
+            <span class="tag">/review</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       FEATURES GRID
+       ========================================================= -->
+  <section class="section container reveal" id="features">
+    <div class="section-head">
+      <span class="section-eyebrow">why goon</span>
+      <h2 class="section-title">Built to actually ship code.</h2>
+      <p class="section-lede">Not a chatbot, not a copilot — an engineer that takes a ticket and brings back a PR. Six things make it different.</p>
+    </div>
+
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg></div>
+        <h3>Resumable state machine</h3>
+        <p>The workflow is an explicit state machine. Paused gates persist to disk; restart the daemon and it picks up exactly where it left off.</p>
+      </div>
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
+        <h3>Codebase indexing</h3>
+        <p>Symbol index + content search across 9 languages. Built lazily on first <code>search_code</code> call, cached per-process. Uses ripgrep when available.</p>
+      </div>
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M2 12h20M12 2a14 14 0 0 1 0 20M12 2a14 14 0 0 0 0 20"/></svg></div>
+        <h3>Browser tools</h3>
+        <p><code>fetch_url</code> + <code>web_search</code> let the agent read docs and error messages autonomously instead of guessing from training data.</p>
+      </div>
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
+        <h3>Single binary, zero deps</h3>
+        <p>Pure Go stdlib. No Python, no Node, no Docker, no Tree-sitter. Drop the binary on any machine — Linux, macOS, Windows — and run.</p>
+      </div>
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
+        <h3>Auto-recovery</h3>
+        <p>Rejected plans don't fail — they re-plan with your feedback. Capped at 3 attempts so it never spins forever.</p>
+      </div>
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
+        <h3>Secrets stay local</h3>
+        <p>Subprocess env is scrubbed of every <code>*_TOKEN / *_API_KEY / *_SECRET</code> before passthrough. Telegram chats can't accidentally leak credentials.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       INSTALL (GitHub Pages only)
+       ========================================================= -->
+  <section class="section container reveal" id="install">
+    <div class="section-head">
+      <span class="section-eyebrow">install</span>
+      <h2 class="section-title">Up and running in under a minute.</h2>
+      <p class="section-lede">Pure Go binary, no runtime, no daemon-of-daemons. Three flavours: go install, build from source, or grab a release.</p>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px;">
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></div>
+        <h3>go install</h3>
+        <p>If you have Go 1.21+ on PATH:</p>
+        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">go install github.com/harisaginting/goon@latest</pre>
+      </div>
+
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
+        <h3>build from source</h3>
+        <p>Clone the repo and build:</p>
+        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">git clone https://github.com/harisaginting/goon
+cd goon &amp;&amp; go build ./...</pre>
+      </div>
+
+      <div class="feature">
+        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></div>
+        <h3>prebuilt binary</h3>
+        <p>Grab a tagged release from GitHub:</p>
+        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">curl -sSL bit.ly/goon-cli | sh
+# or download from /releases</pre>
+      </div>
+    </div>
+
+    <div style="max-width:760px;margin:32px auto 0;">
+      <p style="text-align:center; color:var(--fg-soft); font-size:14px; margin:0 0 10px;">Then point goon at any task:</p>
+      <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:10px; padding:16px 20px; font-family:var(--mono); font-size:13.5px; color:var(--fg); overflow-x:auto; line-height:1.7;"><span style="color:var(--accent);">$</span> goon <span style="color:var(--accent-2);">"summarize the go files in cmd/"</span>
+<span style="color:var(--accent);">$</span> goon start <span style="color:var(--fg-soft);"># long-running daemon</span>
+<span style="color:var(--accent);">$</span> goon doctor <span style="color:var(--fg-soft);"># probe every configured provider</span></pre>
+      <p style="text-align:center; margin: 18px 0 0;">
+        <a href="./docs/" style="color:var(--accent); font-size:14px;">Read the full configuration guide →</a>
+      </p>
+    </div>
+
+    <style>
+      @media (max-width: 900px) { #install > div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; } }
+    </style>
+  </section>
+
+  <!-- =========================================================
+       BOTTOM CTA
+       ========================================================= -->
+  <section class="bottom-cta reveal">
+    <h2>Let <span class="grad-text">goon</span> handle the ticket.</h2>
+    <p>Install the binary, point it at your board, and watch it pick up its first ticket. Go ON — stop reading, start shipping.</p>
+    <div class="cta-row">
+      <a class="btn primary" href="#install">
+        Get started
+        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
+      </a>
+      <a class="btn secondary" href="./docs/">
+        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
+        Documentation
+      </a>
+    </div>
+  </section>
+
+</main>
+
+<footer>
+  <div class="brand-foot">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
+    </svg>
+    <span>goon · single binary, zero dependencies</span>
+  </div>
+  <div class="links">
+    <a href="#install">Install</a>
+    <a href="./docs/">Docs</a>
+    <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
+  </div>
+</footer>
+
+<script>
+(function() {
+  // ---- terminal tabs ----
+  const tabs = document.querySelectorAll('.terminal .tab');
+  tabs.forEach((t) => {
+    t.addEventListener('click', () => {
+      const target = t.getAttribute('data-tab');
+      document.querySelectorAll('.terminal .tab').forEach((x) => x.classList.toggle('active', x === t));
+      document.querySelectorAll('.terminal .panel').forEach((p) => p.classList.toggle('active', p.getAttribute('data-panel') === target));
+    });
+  });
+
+  // ---- scroll reveal ----
+  if (!('IntersectionObserver' in window)) {
+    document.querySelectorAll('.reveal').forEach((el) => el.classList.add('in'));
+    return;
+  }
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach((e) => {
+      if (e.isIntersecting) {
+        e.target.classList.add('in');
+        io.unobserve(e.target);
+      }
+    });
+  }, { rootMargin: '0px 0px -10% 0px', threshold: 0.08 });
+  document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+})();
+</script>
+
+</body>
+</html>

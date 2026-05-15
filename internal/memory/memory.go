@@ -41,6 +41,22 @@ type Question struct {
 // Pending reports whether the question is still awaiting an answer.
 func (q Question) Pending() bool { return q.Answer == "" }
 
+// AllRepos returns every repo associated with the workflow as a
+// single slice, preferring the multi-pick Repos field when present
+// and falling back to the legacy single Repo otherwise. Returns nil
+// when neither is set.
+func (w Workflow) AllRepos() []string {
+	if len(w.Repos) > 0 {
+		out := make([]string, len(w.Repos))
+		copy(out, w.Repos)
+		return out
+	}
+	if w.Repo != "" {
+		return []string{w.Repo}
+	}
+	return nil
+}
+
 // PlanStep is one item inside a Workflow's plan.
 type PlanStep struct {
 	Index int    `json:"index"`
@@ -86,6 +102,13 @@ type Workflow struct {
 	PendingQuestionID string            `json:"pending_question_id,omitempty"`
 	Approvals         map[string]string `json:"approvals,omitempty"`
 	Repo              string            `json:"repo,omitempty"`
+	// Repos is the full set of target repos for a workflow, including
+	// the primary Repo above as the first element. Populated when the
+	// confirm_repo gate runs in multi-pick mode (workspace dir or git
+	// host list). For backward compatibility every existing workflow
+	// keeps Repo populated; new ones set both. AllRepos() returns the
+	// canonical list across either field.
+	Repos             []string          `json:"repos,omitempty"`
 	Branch            string            `json:"branch,omitempty"`
 	Plan              []PlanStep        `json:"plan,omitempty"`
 	PRURL             string            `json:"pr_url,omitempty"`
@@ -490,6 +513,52 @@ func (m *Memory) ListWorkflows(n int) []Workflow {
 		all = all[:n]
 	}
 	return all
+}
+
+// HistoryWorkflowsFor returns every workflow record for a ticket, newest
+// first. The web UI's detail view uses this so users can see the full
+// history of attempts (failed triage, replans, re-runs) for one ticket.
+func (m *Memory) HistoryWorkflowsFor(ticketID string) []Workflow {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []Workflow
+	for _, w := range m.store.Workflows {
+		if w.TicketID == ticketID {
+			out = append(out, w)
+		}
+	}
+	// Sort newest first by UpdatedAt with a stable fallback to StartedAt.
+	for i := 1; i < len(out); i++ {
+		for j := i; j > 0; j-- {
+			a, b := out[j-1], out[j]
+			if a.UpdatedAt.After(b.UpdatedAt) ||
+				(a.UpdatedAt.Equal(b.UpdatedAt) && a.StartedAt.After(b.StartedAt)) {
+				break
+			}
+			out[j-1], out[j] = b, a
+		}
+	}
+	return out
+}
+
+// GetQuestion looks up a Question by id. Returns ok=false when absent.
+// Used by the workflow-detail view to render the pending question
+// inline (with an answer form) so users don't have to flip tabs.
+func (m *Memory) GetQuestion(id string) (Question, bool) {
+	if m == nil {
+		return Question{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, q := range m.store.Questions {
+		if q.ID == id {
+			return q, true
+		}
+	}
+	return Question{}, false
 }
 
 // OpenWorkflowFor returns the active (non-terminal) workflow for a ticket,

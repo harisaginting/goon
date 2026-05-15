@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="logo.png" alt="goon" width="180">
+</p>
+
+<p align="center">
+  <a href="https://harisaginting.github.io/goon/">Website</a> ·
+  <a href="https://harisaginting.github.io/goon/docs/">Docs</a> ·
+  <a href="https://github.com/harisaginting/goon">GitHub</a>
+</p>
+
 # goon — Go ON
 
 **Autonomous AI engineer in a single Go binary.** Polls your ticket board
@@ -221,7 +231,7 @@ daemon.
 
 | variable | purpose |
 |---|---|
-| `GOON_LLM_PROVIDER` | `openai` \| `anthropic` \| `ollama` \| `mock` |
+| `GOON_LLM_PROVIDER` | `openai` \| `anthropic` \| `gemini` \| `ollama` \| `mock` |
 | `GOON_BOARD`        | `jira` \| `github` |
 | `GOON_GIT_HOST`     | `github` \| `gitlab` \| `bitbucket` *(optional — skip PR creation if unset)* |
 
@@ -235,6 +245,10 @@ OPENAI_MODEL=gpt-4o-mini                # default
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-...
 ANTHROPIC_MODEL=claude-sonnet-4-5       # default
+
+# Google Gemini (or GOOGLE_API_KEY)
+GEMINI_API_KEY=...
+GEMINI_MODEL=gemini-2.5-flash           # default
 
 # Ollama (local)
 OLLAMA_BASE_URL=http://localhost:11434  # default
@@ -572,6 +586,7 @@ fetch them on demand.
 |---|---|---|
 | OpenAI    | `GOON_LLM_PROVIDER=openai`    | `gpt-4o-mini` |
 | Anthropic | `GOON_LLM_PROVIDER=anthropic` | `claude-sonnet-4-5` |
+| Gemini    | `GOON_LLM_PROVIDER=gemini`    | `gemini-2.5-flash` |
 | Ollama    | `GOON_LLM_PROVIDER=ollama`    | `llama3` |
 | Mock      | `GOON_LLM_PROVIDER=mock`      | offline fixtures |
 
@@ -667,7 +682,7 @@ goon/
 │   ├── daemon/                poll loop + resume detection
 │   ├── executor/              {dry-run | run | auto | explain} modes
 │   ├── githost/               PR adapters (github, gitlab, bitbucket) + PRReviewer
-│   ├── llm/                   provider adapters (openai, anthropic, ollama, mock)
+│   ├── llm/                   provider adapters (openai, anthropic, gemini, ollama, mock)
 │   ├── logx/                  slog wrapper, log rotation, HTTP transport
 │   ├── memory/                passive runtime store (memory.json)
 │   ├── notes/                 active markdown notes (./storage/memory/)
