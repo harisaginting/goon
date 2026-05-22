@@ -259,8 +259,9 @@ func TestBot_PRCommandsRefuseWhenNoHost(t *testing.T) {
 }
 
 // hostWithoutReview is a Host that intentionally does NOT implement
-// PRReviewer — it simulates an old gitlab/bitbucket adapter. Used to
-// verify the bot's "not yet implemented" branch fires with a clear name.
+// PRReviewer — github, gitlab and bitbucket all do now, so this is a
+// synthetic adapter. Used to verify the bot's "not yet implemented"
+// branch fires with a clear name for any host that lacks review support.
 type hostWithoutReview struct{}
 
 func (hostWithoutReview) Name() string { return "fake-no-review" }
@@ -720,7 +721,7 @@ func TestBot_ChatNoMemoryDoesntPanic(t *testing.T) {
 }
 
 // TestBot_ChatInjectsActiveKnowledge covers the cycle-7 follow-up: the
-// chat handler must also surface the ACTIVE markdown notes (PINNED.md
+// chat handler must also surface the ACTIVE markdown notes (SOUL.md
 // and the topic-note index) — that's goon's persistent knowledge
 // layer. Without it the LLM can answer "what tickets exist" but not
 // "what do you know about our auth flow."
@@ -733,9 +734,9 @@ func TestBot_ChatInjectsActiveKnowledge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("notes.New: %v", err)
 	}
-	if err := store.Write(notes.PinnedFilename,
+	if err := store.Write(notes.SoulFilename,
 		"# Conventions\n- branch prefix is goon/\n- always run goimports before PR"); err != nil {
-		t.Fatalf("write pinned: %v", err)
+		t.Fatalf("write soul: %v", err)
 	}
 	if err := store.Write("learnings/oauth-flow.md",
 		"# OAuth flow\nThe service uses PKCE + state cookie."); err != nil {
@@ -751,8 +752,8 @@ func TestBot_ChatInjectsActiveKnowledge(t *testing.T) {
 		combined += m.Content + "\n"
 	}
 	for _, want := range []string{
-		"PINNED.md",
-		"branch prefix is goon/",       // body content from pinned
+		"SOUL.md",
+		"branch prefix is goon/",       // body content from soul
 		"learnings/oauth-flow.md",      // topic note name
 		"OAuth flow",                   // headline of topic note
 		"/memory read",                 // command pointer

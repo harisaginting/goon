@@ -6,7 +6,7 @@
 //	Execute        — run the agent loop on each plan step
 //	Test           — run the repo's test command (best-effort)
 //	Verify         — re-run the agent N times to double-check the work
-//	UpdateMemory   — distil learnings into the markdown notes store (PINNED.md / topic notes)
+//	UpdateMemory   — distil learnings into the markdown notes store (SOUL.md / topic notes) + append a HISTORY.md entry
 //	OpenPR         — push the branch and create a PR / MR
 //	Notify         — Telegram message with a link to the PR
 //
@@ -40,9 +40,11 @@ import (
 	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/executor"
 	"github.com/harisaginting/goon/internal/githost"
+	"github.com/harisaginting/goon/internal/learnings"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/repository"
 	"github.com/harisaginting/goon/internal/safety"
 	"github.com/harisaginting/goon/internal/tools"
 )
@@ -194,8 +196,9 @@ type phaseCtx struct {
 // in memory, set wf.State=WFAwaitingApproval, and return — the daemon picks
 // the workflow up again on a later tick once the user replies). update_memory
 // runs an agent task that distils what the workflow learned into the markdown
-// notes store (PINNED.md / topic notes). Set cfg.AutoApprove or env var
-// GOON_AUTO_APPROVE=1 to skip the gates entirely for unattended runs.
+// notes store (SOUL.md / topic notes) + appends a HISTORY.md line. Set
+// cfg.AutoApprove or env var GOON_AUTO_APPROVE=1 to skip the gates
+// entirely for unattended runs.
 //
 // Hooks fire at the same boundaries as before so existing workflow.json
 // configs keep working unchanged.
@@ -311,7 +314,17 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 	wf.PendingQuestionID = ""
 	e.save(wf)
 	if e.Board != nil {
-		_ = e.Board.Comment(ctx, t.ID, fmt.Sprintf("✓ goon completed this ticket. PR: %s", wf.PRURL))
+		// Two finish messages: one for code tickets (link the PR),
+		// one for non-code (just confirm the work). Avoids the
+		// awkward "PR: " with an empty URL when triage classified
+		// the ticket as not needing a repo.
+		msg := "✓ goon completed this ticket."
+		if wf.PRURL != "" {
+			msg += " PR: " + wf.PRURL
+		} else if !memory.WorkflowNeedsRepo(wf) {
+			msg += " (no code changes — see goon's memory notes for the outcome)"
+		}
+		_ = e.Board.Comment(ctx, t.ID, msg)
 		_ = e.Board.Transition(ctx, t.ID, boards.StatusInReview)
 	}
 	return wf, nil
@@ -437,13 +450,30 @@ func (e *Engine) phaseTriage(ctx context.Context, wf *memory.Workflow, t boards.
 	if wf.Approvals != nil {
 		feedback = wf.Approvals["replan_feedback"]
 	}
-	plan, repo, err := e.triageWithFeedback(ctx, t, feedback)
+	tr, err := e.triageWithFeedback(ctx, t, feedback)
 	if err != nil {
 		return err
 	}
-	wf.Plan = plan
-	wf.Repo = repo
+	wf.Plan = tr.Plan
+	wf.Repo = tr.Repo
+	wf.Repos = tr.Repos
+	// Persist the classification — pointer-to-bool so a resume
+	// distinguishes "legacy workflow, behave as needs_repo=true"
+	// from "explicitly classified as not needing a repo."
+	needs := tr.NeedsRepo
+	wf.NeedsRepo = &needs
 	wf.State = memory.WFPlanning
+	// Surface the classification in logs + on stdout so users see
+	// goon's reasoning. Helps debug "why didn't the gate fire?"
+	// without spelunking memory.json.
+	logx.Info("triage.classified",
+		"ticket", t.Key, "needs_repo", needs,
+		"primary_repo", tr.Repo, "repo_count", len(tr.Repos))
+	if e.Stdout != nil && !needs {
+		fmt.Fprintf(e.Stdout,
+			"[workflow] %s classified as non-code work — skipping confirm_repo / test / open_pr phases\n",
+			t.Key)
+	}
 	// Clear feedback so the gate's "approval already recorded" check
 	// for approve_plan doesn't get poisoned. We keep replan_count.
 	if wf.Approvals != nil {
@@ -458,28 +488,31 @@ func (e *Engine) phaseTriage(ctx context.Context, wf *memory.Workflow, t boards.
 }
 
 func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
-	// Auto-approve still records the resolved repo so the choice
-	// persists into Memory.RepoChoices for future tickets.
+	// Triage classified this as non-code work (research, docs, comms,
+	// ops). Skip the gate entirely — there's nothing to pick. Mark
+	// confirm_repo auto-approved so resume logic doesn't re-fire it.
+	if !memory.WorkflowNeedsRepo(*wf) {
+		ensureApproval(wf, "confirm_repo", "auto:no-repo-needed")
+		wf.Repo = ""
+		wf.Repos = nil
+		wf.State = memory.WFPlanning
+		e.save(*wf)
+		return nil
+	}
+
+	// Auto-approve = trust triage's repo picks wholesale (cfg or
+	// GOON_AUTO_APPROVE=1, used for unattended runs). The gate fires
+	// for every other ticket — we no longer auto-skip based on a
+	// project-level learned mapping, because each ticket can
+	// legitimately need a different repo (or set of repos).
+	// ENG-1 might touch only repoA, ENG-2 might touch repoA+repoB —
+	// the prior "first confirm wins for the whole project" model
+	// silently forced both into the same single choice.
 	if p.autoApprove {
 		ensureApproval(wf, "confirm_repo", "auto:approved")
-		e.rememberRepo(t.Project, wf.Repo)
 		return nil
 	}
 	if existing := approvalAnswer(wf, "confirm_repo"); existing != "" {
-		return nil
-	}
-	// If we already learned a repo for this project, skip the gate
-	// entirely. Gives the user the satisfaction of "I confirmed this
-	// once, don't ask me again." They can break the cache via
-	// `goon repo forget <project>` (see cmd/repo.go).
-	if learned, ok := e.lookupLearnedRepo(t.Project); ok {
-		wf.Repo = learned
-		ensureApproval(wf, "confirm_repo", "auto:remembered")
-		wf.State = memory.WFPlanning
-		e.save(*wf)
-		if e.Stdout != nil {
-			fmt.Fprintf(e.Stdout, "[workflow] using remembered repo %q for project %q\n", learned, t.Project)
-		}
 		return nil
 	}
 	suggested := wf.Repo
@@ -487,12 +520,13 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 		suggested = e.pickRepoForTicket(t)
 		wf.Repo = suggested
 	}
-	// Build the candidate list from BOTH the local workspace and the
-	// configured git host. The user picks one or more by number; the
-	// menu uses stable indexing so "Pick 2" always points at the same
-	// repo within a single question lifetime.
+	// Build the candidate list — REPOSITORY.md takes precedence, then
+	// the local workspace, then the configured git host. The user
+	// picks one or more by number; the menu uses stable indexing so
+	// "Pick 2" always points at the same repo within a single
+	// question lifetime.
 	candidates := e.buildRepoCandidates(ctx, t)
-	q := buildRepoGateQuestion(t, suggested, candidates)
+	q := buildRepoGateQuestion(t, suggested, candidates, wf.Repos)
 	ans, ready, err := e.gate(ctx, wf, t, "confirm_repo", q)
 	if err != nil {
 		return err
@@ -502,7 +536,14 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 	}
 	switch {
 	case isYes(ans):
-		// accept the suggestion as-is
+		// "yes" with no further input: if triage gave us multiple
+		// repo suggestions, use the whole list. Otherwise fall
+		// through to the single-pick suggested default.
+		if len(wf.Repos) > 1 {
+			// already set
+		} else if wf.Repo != "" {
+			wf.Repos = []string{wf.Repo}
+		}
 	default:
 		// Try multi-pick first ("1,3,5" or "1 3 5"); falls back to
 		// a single number, then change=<path>, then rejection.
@@ -522,10 +563,11 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 		wf.Repos = []string{wf.Repo}
 	}
 	ensureApproval(wf, "confirm_repo", ans)
-	// Remember the primary pick per project so subsequent tickets
-	// from the same project skip the gate. Multi-repo workflows
-	// still get full visibility via wf.Repos.
-	e.rememberRepo(t.Project, wf.Repo)
+	// Deliberately do NOT cache project→repo. Every ticket gets
+	// classified + asked independently because two tickets in the
+	// same project can legitimately need different repos (or sets).
+	// Triage + REPOSITORY.md is the single source of truth for "what
+	// does THIS ticket need."
 	wf.State = memory.WFPlanning
 	e.save(*wf)
 	return nil
@@ -541,33 +583,66 @@ type repoCandidate struct {
 	IsRemote bool   // false = local workspace clone; true = host slug
 }
 
-// buildRepoCandidates merges the local workspace + the git host's
-// repo list (when reachable) into a single deduped, sorted slice.
-// We swallow host errors (network down, token missing) — the gate
-// stays usable from the workspace alone in that case.
+// buildRepoCandidates merges three sources into a single deduped,
+// stable-sorted slice that powers the confirm_repo gate's menu:
+//
+//   1. REPOSITORY.md  (highest priority — the user's hand-maintained
+//                      list; if it's set the user already told us
+//                      these are the repos that matter)
+//   2. local workspace (any .git folder under GOON_WORKSPACE_DIR
+//                       that isn't already in REPOSITORY.md)
+//   3. git-host RepoLister (only when the host implements it; remote
+//                           repos the user hasn't checked out yet)
+//
+// We swallow host errors (network down, token missing) so the gate
+// stays usable from REPOSITORY.md + workspace alone.
 func (e *Engine) buildRepoCandidates(ctx context.Context, t boards.Ticket) []repoCandidate {
 	out := []repoCandidate{}
+	seenValue := map[string]bool{}
+	seenLabel := map[string]bool{}
+	add := func(c repoCandidate) {
+		if c.Value == "" || seenValue[strings.ToLower(c.Value)] {
+			return
+		}
+		seenValue[strings.ToLower(c.Value)] = true
+		seenLabel[strings.ToLower(c.Label)] = true
+		out = append(out, c)
+	}
 
-	// Local workspace first — they're already on disk, safe to act on.
+	// 1. REPOSITORY.md — the canonical user list.
+	for _, e := range mustReadRepository() {
+		local := e.Resolve()
+		value := local
+		isRemote := false
+		if value == "" {
+			// No local path in the row — surface it as a remote
+			// candidate so the gate can still show it.
+			value = e.Remote
+			isRemote = true
+		}
+		add(repoCandidate{
+			Label:    e.Name(),
+			Value:    value,
+			IsRemote: isRemote,
+		})
+	}
+
+	// 2. Local workspace — any clone the user hasn't bothered to add
+	// to REPOSITORY.md yet. We still expose it so first-time users
+	// get a working gate without having to seed the registry.
 	for _, p := range DiscoverWorkspaceRepos() {
-		out = append(out, repoCandidate{
+		add(repoCandidate{
 			Label: filepath.Base(p),
 			Value: p,
 		})
 	}
 
-	// Git host repos — only if the host implements RepoLister.
+	// 3. Git host repos.
 	if e.Host != nil {
 		if lister, ok := e.Host.(githost.RepoLister); ok {
 			lsCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			if repos, err := lister.ListRepos(lsCtx); err == nil {
-				// De-dupe: if a workspace clone matches a remote
-				// slug by basename, prefer the local entry.
-				localBases := map[string]bool{}
-				for _, c := range out {
-					localBases[strings.ToLower(c.Label)] = true
-				}
 				for _, r := range repos {
 					if r.Slug == "" {
 						continue
@@ -576,10 +651,10 @@ func (e *Engine) buildRepoCandidates(ctx context.Context, t boards.Ticket) []rep
 					if i := strings.LastIndexByte(base, '/'); i >= 0 {
 						base = base[i+1:]
 					}
-					if localBases[strings.ToLower(base)] {
-						continue
+					if seenLabel[strings.ToLower(base)] {
+						continue // dedupe by short name
 					}
-					out = append(out, repoCandidate{
+					add(repoCandidate{
 						Label:    r.Slug,
 						Value:    r.Slug,
 						IsRemote: true,
@@ -593,23 +668,57 @@ func (e *Engine) buildRepoCandidates(ctx context.Context, t boards.Ticket) []rep
 	return out
 }
 
-// buildRepoGateQuestion composes the confirm_repo prompt. When the
-// candidate list is non-empty we render it as a numbered menu so the
-// user can pick by number(s) instead of typing a path. Remote repos
-// are tagged "(remote)" so the user knows they're picking a slug,
-// not a checkout path.
-func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoCandidate) string {
+// mustReadRepository returns REPOSITORY.md entries or an empty slice
+// on any failure. Failures are silent because the gate degrades
+// gracefully — falling back to workspace + git host.
+func mustReadRepository() []repository.Entry {
+	entries, _ := repository.Read()
+	return entries
+}
+
+// buildRepoGateQuestion composes the confirm_repo prompt. The menu
+// is a numbered list of every candidate so the user can pick by
+// number(s) instead of typing paths.
+//
+// Markers:
+//   `→`  → suggested by triage (the LLM picked these from
+//          REPOSITORY.md based on the ticket text)
+//   `*`  → the primary suggestion (also `→`, but underlined to
+//          signal "use this one first")
+//   `(remote)` → tagged candidates the user hasn't cloned locally
+//
+// preselected carries triage's repo picks so "yes" with no number
+// list means "accept these picks." When preselected is empty the
+// menu still works — user just types numbers.
+func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoCandidate, preselected []string) string {
 	if len(candidates) == 0 {
 		return fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
 			t.Key, t.Title, suggested)
 	}
+	// Build a quick lookup for "did triage suggest this one?"
+	pre := map[string]bool{}
+	for _, p := range preselected {
+		pre[strings.ToLower(p)] = true
+	}
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Confirm repo for %s — %q\nSuggested: %s\n\nAvailable repos:\n",
-		t.Key, t.Title, suggested)
+	fmt.Fprintf(&sb, "Confirm repo for %s — %q\n", t.Key, t.Title)
+	if len(preselected) > 1 {
+		// Multi-repo ticket — show the picks goon wants up front so
+		// the user knows what "yes" means before scanning the menu.
+		fmt.Fprintf(&sb, "Triage suggests %d repos (reply `yes` to accept all): %s\n\n",
+			len(preselected), strings.Join(preselected, ", "))
+	} else {
+		fmt.Fprintf(&sb, "Suggested: %s\n\n", suggested)
+	}
+	sb.WriteString("Available repos:\n")
 	for i, c := range candidates {
 		marker := " "
-		if c.Value == suggested {
-			marker = "*"
+		isSuggested := pre[strings.ToLower(c.Value)]
+		switch {
+		case c.Value == suggested:
+			marker = "*" // primary
+		case isSuggested:
+			marker = "→" // also picked by triage
 		}
 		tag := ""
 		if c.IsRemote {
@@ -617,7 +726,7 @@ func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoC
 		}
 		fmt.Fprintf(&sb, " %s %d. %s%s\n", marker, i+1, c.Label, tag)
 	}
-	sb.WriteString("\nReply: <n> or <n>,<n>,<n> (one or more numbers — first is primary)  |  yes (accept suggested)  |  change=<path>  |  no")
+	sb.WriteString("\nReply: <n> or <n>,<n>,<n> (one or more numbers — first becomes primary)  |  yes (accept the suggested picks)  |  change=<path>  |  no")
 	return sb.String()
 }
 
@@ -679,57 +788,33 @@ func pickWorkspaceRepo(ans string, wsRepos []string) (string, bool) {
 	return wsRepos[n-1], true
 }
 
-// pickRepoForTicket resolves a repo path for the ticket using the
-// priority ladder:
+// pickRepoForTicket returns a soft hint for the triage prompt's
+// "Suggested default" field. It's NOT a determiner — the LLM is
+// expected to read REPOSITORY.md and pick the right repo(s) per
+// ticket, and the user always sees the gate (unless triage said
+// needs_repo=false or autoApprove is on).
+//
+// Priority for the hint:
 //
 //  1. GOON_REPO_MAP exact match on project key (operator-explicit)
-//  2. Memory.RepoChoices learned mapping (user-confirmed once before)
-//  3. GOON_REPO_MAP "*" wildcard fallback
-//  4. ticket.Project as a literal (last resort — usually not a real path)
+//  2. GOON_REPO_MAP "*" wildcard fallback
+//  3. ticket.Project as a literal (last resort)
 //
-// Operator-explicit env wins over learned because admins set env for
-// security; learned wins over the wildcard so a single confirmation
-// overrides a vague catch-all.
+// We deliberately do NOT consult Memory.RepoChoices anymore — that
+// per-project cache turned "one confirmation" into "every ticket in
+// this project forever uses the same repo," which is the wrong model
+// when tickets in the same project can need different repos (or
+// sets of repos). Repository selection is now strictly per-ticket
+// via triage + REPOSITORY.md.
 func (e *Engine) pickRepoForTicket(t boards.Ticket) string {
 	rm := RepoMap()
 	if v, ok := rm[t.Project]; ok && v != "" {
 		return v
 	}
-	if e.Memory != nil {
-		if v, ok := e.Memory.LookupRepoChoice(t.Project); ok && v != "" {
-			return v
-		}
-	}
 	if v, ok := rm["*"]; ok && v != "" {
 		return v
 	}
 	return t.Project
-}
-
-// lookupLearnedRepo returns the persisted choice without consulting
-// env. Used by phaseConfirmRepo to short-circuit the gate when we've
-// already had this conversation. Separate from pickRepoForTicket so
-// the env-override path stays explicit.
-func (e *Engine) lookupLearnedRepo(project string) (string, bool) {
-	if e.Memory == nil {
-		return "", false
-	}
-	// Env-explicit mapping always wins, even over memory — admins
-	// expect their env to be authoritative.
-	if v, ok := RepoMap()[project]; ok && v != "" {
-		return v, true
-	}
-	return e.Memory.LookupRepoChoice(project)
-}
-
-// rememberRepo persists project→repo to Memory.RepoChoices when both
-// values are concrete. Best-effort: silently no-ops on missing memory
-// or empty inputs.
-func (e *Engine) rememberRepo(project, repo string) {
-	if e.Memory == nil {
-		return
-	}
-	e.Memory.RecordRepoChoice(project, repo)
 }
 
 func (e *Engine) phaseApprovePlan(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
@@ -863,6 +948,19 @@ func (e *Engine) phaseExecute(ctx context.Context, wf *memory.Workflow, t boards
 }
 
 func (e *Engine) phaseTest(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
+	// Non-code tickets have nothing to test. Skip the phase outright
+	// (still fire the hook so users with custom test commands like
+	// `make smoke` can opt back in if relevant — but only when the
+	// hook is explicitly configured).
+	if !memory.WorkflowNeedsRepo(*wf) {
+		hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
+		if cmds := p.cfg.Hook(HookBeforeTest); len(cmds) > 0 {
+			if err := p.hr.Run(ctx, HookBeforeTest, cmds, hctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
 	wf.State = memory.WFTesting
 	e.save(*wf)
@@ -909,44 +1007,49 @@ func (e *Engine) phaseVerify(ctx context.Context, wf *memory.Workflow, t boards.
 	return nil
 }
 
-// phaseUpdateMemory runs a focused agent task that asks the LLM to distil
-// what it learned during execution into persistent markdown notes. This is
-// where goon's "active memory" gets steady-state updates: conventions
-// discovered, file layouts learned, names that matter, gotchas to avoid.
+// phaseUpdateMemory delegates to internal/learnings.Capture so the
+// daemon workflow and the one-shot CLI path share one rule for
+// "what's worth remembering after a run":
 //
-// Failures here are non-fatal — the workflow continues to PR even if the
-// memory update misbehaves, because losing a learning is preferable to
-// blocking a finished ticket.
+//   - Append a single line to HISTORY.md (timestamp · task · outcome)
+//   - Fire a short distillation pass that lets the LLM write durable
+//     knowledge to SOUL.md / topic notes via the memory_* tools
+//
+// Failures are non-fatal: a missed learning is preferable to blocking
+// a finished ticket from getting its PR.
+//
+// Task description includes the ticket key + title so the HISTORY.md
+// line is searchable ("did goon ever touch ENG-4795?") without
+// pulling the full memory.json.
 func (e *Engine) phaseUpdateMemory(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
 	_ = p
 	wf.State = memory.WFUpdatingMemory
 	e.save(*wf)
-	if e.LLM == nil || e.Tools == nil || e.Executor == nil {
-		// No agent runtime — silently skip.
-		return nil
-	}
-	a := agent.New(agent.Options{
-		LLM: e.LLM, Tools: e.Tools, Executor: e.Executor, Memory: e.Memory,
-		Stdout: e.Stdout, Stderr: e.Stderr, Debug: e.Debug,
+	_ = learnings.Capture(ctx, learnings.Options{
+		Task:     fmt.Sprintf("[%s] %s", t.Key, t.Title),
+		Outcome:  "ok",
+		LLM:      e.LLM,
+		Tools:    e.Tools,
+		Executor: e.Executor,
+		Memory:   e.Memory,
+		Stdout:   e.Stdout,
+		Stderr:   e.Stderr,
+		Debug:    e.Debug,
 	})
-	task := fmt.Sprintf(`Reflect on what you just learned implementing %s — %q.
-Use memory_append (preferred) or memory_write to capture durable knowledge:
-- conventions discovered
-- file layouts and names that matter
-- bugs avoided / gotchas
-- API/CLI quirks worth remembering
-One topic per .md file (kebab-case names). Anything broadly invariant goes in PINNED.md.
-Skip notes that are trivial or only apply to this single ticket. Call finish when done.`, t.Key, t.Title)
-	if err := a.Run(ctx, task); err != nil {
-		if e.Stderr != nil {
-			fmt.Fprintf(e.Stderr, "memory update failed (non-fatal): %v\n", err)
-		}
-	}
 	return nil
 }
 
 func (e *Engine) phaseOpenPR(ctx context.Context, wf *memory.Workflow, t boards.Ticket, p *phaseCtx) error {
 	if e.Host == nil {
+		return nil
+	}
+	// Non-code tickets produce no diff to push. Skip the phase
+	// (no PR, no branch). Notify still fires next, so the user
+	// gets a Telegram confirmation that work happened.
+	if !memory.WorkflowNeedsRepo(*wf) || strings.TrimSpace(wf.Repo) == "" {
+		if e.Stdout != nil {
+			fmt.Fprintf(e.Stdout, "[workflow] %s — no repo, skipping open_pr\n", t.Key)
+		}
 		return nil
 	}
 	hctx := FromTicketMulti(t, wf.Repo, wf.Repos, p.branch, wf.Plan)
@@ -1151,21 +1254,30 @@ func (e *Engine) verifyN(cfg WorkflowConfig) int {
 // triage is the legacy zero-feedback entry point — kept so older callers
 // keep compiling. New code should call triageWithFeedback so the user's
 // previous-rejection feedback (if any) is woven into the prompt.
-func (e *Engine) triage(ctx context.Context, t boards.Ticket) ([]memory.PlanStep, string, error) {
+func (e *Engine) triage(ctx context.Context, t boards.Ticket) (TriageResult, error) {
 	return e.triageWithFeedback(ctx, t, "")
 }
 
-// triageWithFeedback asks the LLM to produce a structured plan. When
-// feedback is non-empty it's woven into the prompt under a REJECTED:
-// section so the model knows what the previous plan got wrong and can
-// produce a different one.
-func (e *Engine) triageWithFeedback(ctx context.Context, t boards.Ticket, feedback string) ([]memory.PlanStep, string, error) {
+// triageWithFeedback asks the LLM to produce a structured plan + the
+// "does this ticket need a repo at all" classification + a list of
+// suggested repos drawn from REPOSITORY.md.
+//
+// When feedback is non-empty it's woven in under a REJECTED block so
+// the model knows what the previous plan got wrong and can produce a
+// different one.
+//
+// REPOSITORY.md content (when present) is included verbatim so the
+// model can suggest repos by name from the user's actual registry
+// instead of guessing project keys. This is what makes triage able to
+// classify needs_repo correctly — without the registry it can't tell
+// whether "publish a blog post" should touch the docs repo or no repo.
+func (e *Engine) triageWithFeedback(ctx context.Context, t boards.Ticket, feedback string) (TriageResult, error) {
 	if e.LLM == nil {
-		return nil, "", errors.New("triage: no LLM provider configured")
+		return TriageResult{}, errors.New("triage: no LLM provider configured")
 	}
 	// Use the memory-aware picker so the LLM sees a sensible default
 	// in the prompt (env > learned > wildcard > project literal).
-	repo := e.pickRepoForTicket(t)
+	suggestedRepo := e.pickRepoForTicket(t)
 	feedbackBlock := ""
 	if strings.TrimSpace(feedback) != "" {
 		feedbackBlock = fmt.Sprintf(`
@@ -1174,16 +1286,51 @@ PREVIOUS PLAN WAS REJECTED. The user said:
 Produce a different plan that addresses the feedback.
 `, feedback)
 	}
-	prompt := fmt.Sprintf(`You are GOON's planner. The user wants you to break this ticket into 3-7 ordered, atomic engineering steps that an autonomous agent can execute one-by-one. Each step MUST be small enough to finish in <= 5 tool calls.
+
+	// REPOSITORY.md content — the canonical list of known repos. When
+	// absent we just tell the model the registry is empty so it
+	// doesn't try to invent names.
+	registryBlock := repository.RawBody()
+	if registryBlock == "" {
+		registryBlock = "(REPOSITORY.md is empty — the user hasn't registered any repos yet.)"
+	}
+
+	prompt := fmt.Sprintf(`You are GOON's planner. Break this ticket into 3-7 ordered, atomic engineering steps that an autonomous agent can execute one-by-one. Each step MUST be small enough to finish in <= 5 tool calls.
 %s
-Reply with EXACTLY ONE JSON object: {"steps":[{"title":"..."}, ...], "repo":"%s"}.
+ALSO decide:
+
+1. needs_repo (true|false): does executing this ticket require touching a git
+   repository? Set false for tickets that are pure research, docs hosted
+   outside git, comms (Slack/Telegram/email drafts), board comments,
+   investigations whose only artifact is a memory note, or ops tasks that
+   don't change tracked files. Set true for any ticket that requires
+   editing/creating/inspecting committed source code.
+
+2. repos (array of names): when needs_repo is true, pick ONE OR MORE repos
+   from the REPOSITORY.md registry below. Use the short last-segment name
+   (e.g. "backend-api" not "github.com/myorg/backend-api"). When a ticket
+   spans multiple repos, list them all — the user can multi-select.
+   When needs_repo is false, return an empty array.
+
+KNOWN REPOSITORIES (REPOSITORY.md):
+
+%s
+
+Suggested default (from prior learning, may be wrong — feel free to
+override): %q
+
+Reply with EXACTLY ONE JSON object:
+  {"steps":[{"title":"..."}, ...],
+   "needs_repo": true|false,
+   "repos": ["name", ...],
+   "repo": "primary-name"}
 No prose, no fences, no comments.
 
 TICKET:
 key: %s
 title: %s
 description: %s
-`, feedbackBlock, repo, t.Key, t.Title, snippet(t.Description, 1500))
+`, feedbackBlock, registryBlock, suggestedRepo, t.Key, t.Title, snippet(t.Description, 1500))
 
 	out, err := e.LLM.Generate(ctx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
@@ -1200,17 +1347,58 @@ description: %s
 		MaxTokens: 4096,
 	})
 	if err != nil {
-		return nil, "", err
+		return TriageResult{}, err
 	}
 
-	plan, repoOut, err := parseTriage(out)
+	tr, err := parseTriage(out)
 	if err != nil {
-		return nil, "", fmt.Errorf("triage parse: %w (raw=%q)", err, snippet(out, 200))
+		return TriageResult{}, fmt.Errorf("triage parse: %w (raw=%q)", err, snippet(out, 200))
 	}
-	if repoOut != "" {
-		repo = repoOut
+	// Resolve LLM-named repos back to concrete local paths via
+	// REPOSITORY.md. The model may have returned "backend-api"; we
+	// turn that into "/Users/me/code/backend-api" so the rest of the
+	// pipeline (execute, test, openPR) can use it as-is.
+	tr.Repos = resolveRepoNames(tr.Repos)
+	if tr.Repo != "" {
+		if resolved := resolveRepoName(tr.Repo); resolved != "" {
+			tr.Repo = resolved
+		}
 	}
-	return plan, repo, nil
+	// When the LLM didn't propose a primary but the env-pick gave
+	// us a non-trivial default, fall back to that — only when the
+	// ticket needs a repo. needs_repo=false stays empty.
+	if tr.NeedsRepo && tr.Repo == "" && suggestedRepo != "" && suggestedRepo != t.Project {
+		tr.Repo = suggestedRepo
+	}
+	return tr, nil
+}
+
+// resolveRepoName turns an LLM-supplied repo identifier (short name,
+// remote slug, or local path) into the canonical local path from
+// REPOSITORY.md when a match exists. Falls back to the original
+// string when no match — callers still need a sensible value.
+func resolveRepoName(name string) string {
+	if e, ok := repository.Lookup(name); ok {
+		if p := e.Resolve(); p != "" {
+			return p
+		}
+		// REPOSITORY.md row had no local path — return the remote
+		// slug as-is so the gate prompt can show it tagged "(remote)".
+		return e.Remote
+	}
+	return name
+}
+
+// resolveRepoNames applies resolveRepoName to every element,
+// preserving order and dropping empties.
+func resolveRepoNames(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if r := resolveRepoName(s); r != "" {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // pickRepo chooses a target repo based on RepoMap or the ticket's project.
@@ -1326,8 +1514,13 @@ func (e *Engine) notify(ctx context.Context, t boards.Ticket, wf memory.Workflow
 		return
 	}
 	msg := fmt.Sprintf("✅ goon finished %s: %s", t.Key, t.Title)
-	if wf.PRURL != "" {
+	switch {
+	case wf.PRURL != "":
 		msg += "\nPR: " + wf.PRURL
+	case !memory.WorkflowNeedsRepo(wf):
+		// Non-code ticket — make it explicit that no PR exists, so
+		// the user doesn't go hunting for one.
+		msg += "\n(non-code work — no PR; outcome captured in HISTORY.md)"
 	}
 	_, _ = tool.Run(ctx, map[string]string{"text": msg})
 }

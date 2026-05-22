@@ -2,8 +2,9 @@
 // internal/notes (which holds knowledge/memory). The split is
 // intentional and user-facing:
 //
-//   - memory  → facts, observations, project context (PINNED.md is
-//     auto-injected into every LLM run)
+//   - memory  → facts, observations, project context (SOUL.md is
+//     auto-injected into every LLM run; HISTORY.md holds the running
+//     log of past tasks)
 //   - skills  → specialist procedures, role definitions, how-tos
 //     (NOT auto-injected; activated on-demand by the user or agent)
 //
@@ -39,7 +40,7 @@ import (
 // Returns *notes.Store so callers can use the full notes API
 // (List/Read/Write/Append/Delete/Search) uniformly — the only
 // difference from a memory store is the on-disk location and the
-// fact that we don't call .Pinned() on the result. Skills are
+// fact that we don't call .Soul() on the result. Skills are
 // activated on-demand, not auto-loaded.
 func New(dir string) (*notes.Store, error) {
 	resolved := strings.TrimSpace(dir)

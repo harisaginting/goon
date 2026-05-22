@@ -26,7 +26,7 @@ func (b *Bot) prReviewer() (githost.PRReviewer, string) {
 	if !ok {
 		return nil, fmt.Sprintf(
 			"PR review not yet implemented for the %q git host adapter.\n"+
-				"Currently supported: github, bitbucket. (gitlab is read-only — opens MRs but doesn't review.)",
+				"Currently supported: github, gitlab, bitbucket.",
 			b.opts.Host.Name())
 	}
 	return r, ""

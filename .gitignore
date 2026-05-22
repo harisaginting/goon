@@ -61,3 +61,4 @@ storage/
 *.out
 coverage.txt
 profile.cov
+run

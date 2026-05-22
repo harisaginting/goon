@@ -5,56 +5,47 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goon — your autonomous engineer</title>
 <link rel="icon" type="image/svg+xml" href="./logo.svg">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#09090B">
 <meta property="og:title" content="goon — your autonomous engineer">
 <meta property="og:description" content="An autonomous AI engineer in a single Go binary. Triages tickets, asks before changing anything, codes it, tests, opens a PR.">
 <meta property="og:image" content="./logo.svg">
 <style>
   /* ============================================================
-     design tokens
+     design tokens — dark-only by design
+     ------------------------------------------------------------
+     primary / accent  → Neon Purple  #A855F7  (brand, links, CTAs)
+     highlight         → Vibrant Amber #F59E0B  (warm pop, used sparingly)
+     background        → Obsidian Black #09090B family
+     muted             → Cool Grey #94A3B8
+     text              → Pure White #FFFFFF
+     The marketing page intentionally mirrors the dashboard palette so
+     visitors who arrive from goon.app/docs land in a familiar visual
+     system the moment they sign in.
      ============================================================ */
   :root {
-    --bg: #07090d;
-    --bg-soft: #0d1117;
-    --bg-elev: #11161e;
-    --bg-glass: rgba(13, 17, 23, 0.6);
-    --fg: #e6edf3;
-    --fg-soft: #9aa4b2;
-    --fg-mute: #6b7280;
-    --accent: #7c8cff;
-    --accent-2: #c084fc;
-    --accent-3: #22d3ee;
-    --accent-warm: #fb923c;
-    --ok: #34d399;
-    --warn: #fbbf24;
-    --err: #f87171;
-    --border: #1f2937;
-    --border-soft: rgba(31, 41, 55, 0.6);
+    --bg: #09090B;                 /* Obsidian — page background */
+    --bg-soft: #131318;            /* one step up — cards, callouts */
+    --bg-elev: #1A1A21;            /* two steps up — hovered cards */
+    --bg-glass: rgba(19, 19, 24, 0.65);
+    --fg: #FFFFFF;
+    --fg-soft: #94A3B8;            /* Cool Grey */
+    --fg-mute: #64748B;            /* slightly cooler than --fg-soft */
+    --accent: #A855F7;             /* Neon Purple — the brand */
+    --accent-2: #C084FC;            /* lifted purple for gradients */
+    --accent-3: #F59E0B;            /* Vibrant Amber — the warm pop */
+    --accent-warm: #F59E0B;
+    --ok: #34D399;
+    --warn: #F59E0B;
+    --err: #F87171;
+    --border: #27272D;
+    --border-soft: rgba(39, 39, 45, 0.7);
     --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
-    --shadow:    0 16px 40px -20px rgba(124, 140, 255, 0.30);
-    --shadow-lg: 0 30px 80px -30px rgba(124, 140, 255, 0.40);
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #fafbfc;
-      --bg-soft: #ffffff;
-      --bg-elev: #ffffff;
-      --bg-glass: rgba(255, 255, 255, 0.7);
-      --fg: #0c0e12;
-      --fg-soft: #4b5563;
-      --fg-mute: #9ca3af;
-      --accent: #5b6cff;
-      --accent-2: #a855f7;
-      --accent-3: #06b6d4;
-      --accent-warm: #f97316;
-      --ok: #16a34a;
-      --warn: #d97706;
-      --err: #dc2626;
-      --border: #e5e7eb;
-      --border-soft: rgba(229, 231, 235, 0.7);
-    }
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
+    --shadow:    0 18px 40px -18px rgba(168, 85, 247, 0.35);
+    --shadow-lg: 0 32px 80px -28px rgba(168, 85, 247, 0.50);
+    --shadow-amber: 0 24px 60px -24px rgba(245, 158, 11, 0.45);
+    color-scheme: dark;
   }
 
   * { box-sizing: border-box; }
@@ -472,8 +463,7 @@
   .layer::before {
     content: ''; position: absolute; inset: -1px -1px auto -1px; height: 3px;
   }
-  .layer.personal::before  { background: linear-gradient(90deg, var(--accent-warm), var(--accent-2)); }
-  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-3)); }
+  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
   .layer.skills::before    { background: linear-gradient(90deg, var(--accent-3), var(--ok)); }
   .layer .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .layer .badge {
@@ -747,10 +737,10 @@
   <div class="spacer"></div>
   <a class="link hide-sm" href="#how">How it works</a>
   <a class="link hide-sm" href="#features">Features</a>
-  <a class="link hide-sm" href="./docs/">Docs</a>
+  <a class="link hide-sm" href="/docs">Docs</a>
   <a class="link hide-sm" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
-  <a class="cta" href="#install">
-    Get started
+  <a class="cta" href="/app">
+    Go to app
     <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
   </a>
 </nav>
@@ -782,11 +772,11 @@
     <p class="subtag">Pluggable LLM, board, git host. Drive it from the CLI, web UI, or Telegram. Same memory, same brain, three surfaces.</p>
 
     <div class="cta-row">
-      <a class="btn primary" href="#install">
-        Get started
+      <a class="btn primary" href="/app">
+        Go to app
         <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
       </a>
-      <a class="btn secondary" href="./docs/">
+      <a class="btn secondary" href="/docs">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
         Documentation
       </a>
@@ -981,25 +971,17 @@
   <section class="section container reveal">
     <div class="section-head">
       <span class="section-eyebrow">memory</span>
-      <h2 class="section-title">A brain in three layers.</h2>
-      <p class="section-lede">Goon isn't a stateless chatbot. It keeps three persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
+      <h2 class="section-title">A brain in two layers.</h2>
+      <p class="section-lede">Goon isn't a stateless chatbot. It keeps two persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
     </div>
 
     <div class="layers">
-      <div class="layer personal">
-        <div class="head">
-          <h3>Personal</h3>
-          <span class="badge">soul · always loaded</span>
-        </div>
-        <p>Goon's character. Voice, tone, defaults. The "who am I" file. One per project, you edit it freely.</p>
-        <div class="file">./storage/personal.md</div>
-      </div>
       <div class="layer knowledge">
         <div class="head">
           <h3>Knowledge</h3>
-          <span class="badge">history · auto-pinned</span>
+          <span class="badge">soul · always loaded</span>
         </div>
-        <p>What goon has learned. PINNED.md auto-injects on every run; topic notes are looked up on demand. Grows as it works.</p>
+        <p>What goon should always remember. SOUL.md holds character and project facts together; HISTORY.md is the running log of past runs; topic notes are looked up on demand. Grows as it works.</p>
         <div class="file">./storage/memory/*.md</div>
       </div>
       <div class="layer skills">
@@ -1185,67 +1167,17 @@
   </section>
 
   <!-- =========================================================
-       INSTALL (GitHub Pages only)
-       ========================================================= -->
-  <section class="section container reveal" id="install">
-    <div class="section-head">
-      <span class="section-eyebrow">install</span>
-      <h2 class="section-title">Up and running in under a minute.</h2>
-      <p class="section-lede">Pure Go binary, no runtime, no daemon-of-daemons. Three flavours: go install, build from source, or grab a release.</p>
-    </div>
-
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:18px;">
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg></div>
-        <h3>go install</h3>
-        <p>If you have Go 1.21+ on PATH:</p>
-        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">go install github.com/harisaginting/goon@latest</pre>
-      </div>
-
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
-        <h3>build from source</h3>
-        <p>Clone the repo and build:</p>
-        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">git clone https://github.com/harisaginting/goon
-cd goon &amp;&amp; go build ./...</pre>
-      </div>
-
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg></div>
-        <h3>prebuilt binary</h3>
-        <p>Grab a tagged release from GitHub:</p>
-        <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:8px; padding:12px 14px; font-family:var(--mono); font-size:12.5px; color:var(--fg); overflow-x:auto; margin:0;">curl -sSL bit.ly/goon-cli | sh
-# or download from /releases</pre>
-      </div>
-    </div>
-
-    <div style="max-width:760px;margin:32px auto 0;">
-      <p style="text-align:center; color:var(--fg-soft); font-size:14px; margin:0 0 10px;">Then point goon at any task:</p>
-      <pre style="background:var(--bg-soft); border:1px solid var(--border); border-radius:10px; padding:16px 20px; font-family:var(--mono); font-size:13.5px; color:var(--fg); overflow-x:auto; line-height:1.7;"><span style="color:var(--accent);">$</span> goon <span style="color:var(--accent-2);">"summarize the go files in cmd/"</span>
-<span style="color:var(--accent);">$</span> goon start <span style="color:var(--fg-soft);"># long-running daemon</span>
-<span style="color:var(--accent);">$</span> goon doctor <span style="color:var(--fg-soft);"># probe every configured provider</span></pre>
-      <p style="text-align:center; margin: 18px 0 0;">
-        <a href="./docs/" style="color:var(--accent); font-size:14px;">Read the full configuration guide →</a>
-      </p>
-    </div>
-
-    <style>
-      @media (max-width: 900px) { #install > div[style*="grid-template-columns"] { grid-template-columns: 1fr !important; } }
-    </style>
-  </section>
-
-  <!-- =========================================================
        BOTTOM CTA
        ========================================================= -->
   <section class="bottom-cta reveal">
     <h2>Let <span class="grad-text">goon</span> handle the ticket.</h2>
-    <p>Install the binary, point it at your board, and watch it pick up its first ticket. Go ON — stop reading, start shipping.</p>
+    <p>Open the dashboard, point it at your board, and watch it pick up its first one. Go ON — stop reading, start shipping.</p>
     <div class="cta-row">
-      <a class="btn primary" href="#install">
-        Get started
+      <a class="btn primary" href="/app">
+        Go to app
         <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
       </a>
-      <a class="btn secondary" href="./docs/">
+      <a class="btn secondary" href="/docs">
         <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
         Documentation
       </a>
@@ -1262,8 +1194,8 @@ cd goon &amp;&amp; go build ./...</pre>
     <span>goon · single binary, zero dependencies</span>
   </div>
   <div class="links">
-    <a href="#install">Install</a>
-    <a href="./docs/">Docs</a>
+    <a href="/app">Dashboard</a>
+    <a href="/docs">Docs</a>
     <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
   </div>
 </footer>

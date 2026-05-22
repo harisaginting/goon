@@ -142,6 +142,9 @@ func (b *Bot) Start(ctx context.Context) error {
 	if err := b.registerCommands(ctx); err != nil {
 		logx.Warn("telegram_bot.register_commands_failed", "error", err.Error())
 	}
+	// Background loop for proactive PR review + notification forwarding.
+	// No-op unless GOON_AUTO_REVIEW / GOON_AUTO_NOTIFY is set.
+	go b.autoLoop(ctx)
 	var offset int64
 	backoff := time.Second
 	for {

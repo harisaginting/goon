@@ -109,12 +109,32 @@ type Workflow struct {
 	// keeps Repo populated; new ones set both. AllRepos() returns the
 	// canonical list across either field.
 	Repos             []string          `json:"repos,omitempty"`
+	// NeedsRepo is the triage classification: nil = legacy workflow
+	// (pre-feature, treated as needs_repo=true); pointer-to-true =
+	// classified as code work; pointer-to-false = pure research /
+	// docs / comms ticket — skip the confirm_repo gate, skip the
+	// test + open_pr phases. Plan still runs via the agent loop but
+	// without any git operations. Persisted in memory.json so a
+	// paused workflow resumes with the same classification.
+	NeedsRepo         *bool             `json:"needs_repo,omitempty"`
 	Branch            string            `json:"branch,omitempty"`
 	Plan              []PlanStep        `json:"plan,omitempty"`
 	PRURL             string            `json:"pr_url,omitempty"`
 	VerifyRuns        int               `json:"verify_runs"`
 	Note              string            `json:"note,omitempty"`
 	Error             string            `json:"error,omitempty"`
+}
+
+// WorkflowNeedsRepo reports whether a workflow requires a git repo to
+// execute. Returns true for legacy workflows (NeedsRepo == nil) so
+// pre-feature records keep behaving like before — when the field is
+// absent we assume "yes, this is code work." Centralised so phase
+// implementations don't each re-derive the nil-vs-false semantics.
+func WorkflowNeedsRepo(w Workflow) bool {
+	if w.NeedsRepo == nil {
+		return true
+	}
+	return *w.NeedsRepo
 }
 
 // TicketSnapshot is what we last saw for a ticket — used to dedupe polls and
@@ -131,6 +151,14 @@ type TicketSnapshot struct {
 	Project   string    `json:"project,omitempty"`
 	UpdatedAt time.Time `json:"updated_at,omitempty"`
 	LastSeen  time.Time `json:"last_seen"`
+}
+
+// ReviewMark records the state of the last PR review goon drafted.
+// DiffHash is a fingerprint of the diff that was reviewed, so a PR is
+// re-reviewed only when its diff actually changes.
+type ReviewMark struct {
+	DiffHash string    `json:"diff_hash"`
+	When     time.Time `json:"when"`
 }
 
 // ChatAuth records a Telegram chat that has authenticated against the bot
@@ -194,6 +222,15 @@ type storeFile struct {
 	// fallback so a single explicit confirmation overrides a vague
 	// default.
 	RepoChoices map[string]string `json:"repo_choices,omitempty"`
+
+	// ReviewSeen / NotifSeen back the PR-review and notification dedup
+	// used by `goon review-prs` / `goon notifications` and the Telegram
+	// bot's auto loop. ReviewSeen is keyed "host:repo#number" and stores
+	// a hash of the diff last drafted, so a PR is re-reviewed only when
+	// its diff changes. NotifSeen is keyed "host:id" and just records
+	// which inbox items have already been forwarded.
+	ReviewSeen map[string]ReviewMark `json:"review_seen,omitempty"`
+	NotifSeen  map[string]time.Time  `json:"notif_seen,omitempty"`
 }
 
 // New opens (or creates) the memory file. If path is empty it defaults to
@@ -230,6 +267,8 @@ func New(path string) (*Memory, error) {
 		Counts:      map[string]int{},
 		Tickets:     map[string]TicketSnapshot{},
 		RepoChoices: map[string]string{},
+		ReviewSeen:  map[string]ReviewMark{},
+		NotifSeen:   map[string]time.Time{},
 	}}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &m.store)
@@ -241,6 +280,12 @@ func New(path string) (*Memory, error) {
 		}
 		if m.store.RepoChoices == nil {
 			m.store.RepoChoices = map[string]string{}
+		}
+		if m.store.ReviewSeen == nil {
+			m.store.ReviewSeen = map[string]ReviewMark{}
+		}
+		if m.store.NotifSeen == nil {
+			m.store.NotifSeen = map[string]time.Time{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("memory: read %s: %w", path, err)
@@ -788,6 +833,123 @@ func (m *Memory) WorkflowsForTicket(ticketID string) []Workflow {
 	return out
 }
 
+// --- PR review / notification dedup API ------------------------------------
+
+// maxReviewMarks / maxNotifSeen cap the dedup maps so memory.json stays
+// bounded across months of uptime.
+const (
+	maxReviewMarks = 500
+	maxNotifSeen   = 2000
+)
+
+// ReviewMarkFor returns the recorded review state for a PR key
+// ("host:repo#number"). ok is false when goon has never drafted a
+// review for that PR.
+func (m *Memory) ReviewMarkFor(key string) (ReviewMark, bool) {
+	if m == nil {
+		return ReviewMark{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.store.ReviewSeen[key]
+	return r, ok
+}
+
+// RecordReview stores the diff hash goon last drafted a review from, so
+// the next pass skips the PR until its diff changes.
+func (m *Memory) RecordReview(key, diffHash string) {
+	if m == nil || key == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.ReviewSeen == nil {
+		m.store.ReviewSeen = map[string]ReviewMark{}
+	}
+	m.store.ReviewSeen[key] = ReviewMark{DiffHash: diffHash, When: time.Now()}
+	if len(m.store.ReviewSeen) > maxReviewMarks {
+		pruneOldestReviewMarks(m.store.ReviewSeen, maxReviewMarks)
+	}
+	m.flush()
+}
+
+// NotificationSeen reports whether a notification key ("host:id") has
+// already been forwarded.
+func (m *Memory) NotificationSeen(key string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.store.NotifSeen[key]
+	return ok
+}
+
+// MarkNotificationSeen records that a notification has been forwarded.
+func (m *Memory) MarkNotificationSeen(key string) {
+	if m == nil || key == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.NotifSeen == nil {
+		m.store.NotifSeen = map[string]time.Time{}
+	}
+	m.store.NotifSeen[key] = time.Now()
+	if len(m.store.NotifSeen) > maxNotifSeen {
+		pruneOldestNotifSeen(m.store.NotifSeen, maxNotifSeen)
+	}
+	m.flush()
+}
+
+// pruneOldestReviewMarks evicts the oldest entries (by When) until the
+// map size is at most cap.
+func pruneOldestReviewMarks(mp map[string]ReviewMark, cap int) {
+	if len(mp) <= cap {
+		return
+	}
+	type kv struct {
+		k string
+		t time.Time
+	}
+	all := make([]kv, 0, len(mp))
+	for k, v := range mp {
+		all = append(all, kv{k, v.When})
+	}
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].t.Before(all[j-1].t); j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	for i := 0; i < len(all)-cap; i++ {
+		delete(mp, all[i].k)
+	}
+}
+
+// pruneOldestNotifSeen evicts the oldest entries until the map size is
+// at most cap.
+func pruneOldestNotifSeen(mp map[string]time.Time, cap int) {
+	if len(mp) <= cap {
+		return
+	}
+	type kv struct {
+		k string
+		t time.Time
+	}
+	all := make([]kv, 0, len(mp))
+	for k, v := range mp {
+		all = append(all, kv{k, v})
+	}
+	for i := 1; i < len(all); i++ {
+		for j := i; j > 0 && all[j].t.Before(all[j-1].t); j-- {
+			all[j], all[j-1] = all[j-1], all[j]
+		}
+	}
+	for i := 0; i < len(all)-cap; i++ {
+		delete(mp, all[i].k)
+	}
+}
+
 // --- Telegram chat auth API ------------------------------------------------
 
 // maxTelegramAuth caps the number of authorized Telegram chats kept in
@@ -1112,6 +1274,12 @@ func (m *Memory) flush() {
 	if len(m.store.TelegramAuth) > maxTelegramAuth {
 		m.store.TelegramAuth = pruneOldestAuth(m.store.TelegramAuth, maxTelegramAuth)
 	}
+	if len(m.store.ReviewSeen) > maxReviewMarks {
+		pruneOldestReviewMarks(m.store.ReviewSeen, maxReviewMarks)
+	}
+	if len(m.store.NotifSeen) > maxNotifSeen {
+		pruneOldestNotifSeen(m.store.NotifSeen, maxNotifSeen)
+	}
 	data, err := json.MarshalIndent(m.store, "", "  ")
 	if err != nil {
 		return
@@ -1223,6 +1391,31 @@ func mergeStores(disk, mem storeFile) storeFile {
 			mt, ok := out.Tickets[id]
 			if !ok || dt.LastSeen.After(mt.LastSeen) {
 				out.Tickets[id] = dt
+			}
+		}
+	}
+
+	// ReviewSeen / NotifSeen: union, prefer the newer timestamp. Both
+	// the daemon's bot loop and a standalone `goon review-prs` /
+	// `goon notifications` write these, so neither side may clobber the
+	// other's additions.
+	if len(disk.ReviewSeen) > 0 {
+		if out.ReviewSeen == nil {
+			out.ReviewSeen = map[string]ReviewMark{}
+		}
+		for k, dv := range disk.ReviewSeen {
+			if mv, ok := out.ReviewSeen[k]; !ok || dv.When.After(mv.When) {
+				out.ReviewSeen[k] = dv
+			}
+		}
+	}
+	if len(disk.NotifSeen) > 0 {
+		if out.NotifSeen == nil {
+			out.NotifSeen = map[string]time.Time{}
+		}
+		for k, dt := range disk.NotifSeen {
+			if mt, ok := out.NotifSeen[k]; !ok || dt.After(mt) {
+				out.NotifSeen[k] = dt
 			}
 		}
 	}

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -510,4 +511,84 @@ func (b *Bitbucket) do(ctx context.Context, method, urlStr string, body io.Reade
 		return nil, fmt.Errorf("bitbucket http %d: %s", resp.StatusCode, util.Truncate(string(raw), 400))
 	}
 	return raw, nil
+}
+
+// --- ReviewRequester implementation ----------------------------------------
+
+// currentUserUUID returns the authenticated account's UUID, used to
+// filter pull requests by reviewer.
+func (b *Bitbucket) currentUserUUID(ctx context.Context) (string, error) {
+	raw, err := b.do(ctx, http.MethodGet, b.APIURL+"/user", nil)
+	if err != nil {
+		return "", fmt.Errorf("bitbucket current user: %w", err)
+	}
+	var u struct {
+		UUID string `json:"uuid"`
+	}
+	if err := json.Unmarshal(raw, &u); err != nil {
+		return "", fmt.Errorf("bitbucket current user decode: %w", err)
+	}
+	if u.UUID == "" {
+		return "", errors.New("bitbucket: /user returned an empty uuid " +
+			"(a repo-scoped token can't see /user — use a workspace token to detect review requests)")
+	}
+	return u.UUID, nil
+}
+
+// ReviewRequestedPRs implements ReviewRequester. Bitbucket Cloud has no
+// cross-repo "PRs awaiting my review" endpoint, so we resolve the repo
+// set (GOON_REVIEW_REPOS, else workspace discovery) and query each repo
+// for open PRs that list the current user as a reviewer. A repo whose
+// query fails (token can't read it, or the host rejects the reviewers
+// filter) is skipped rather than failing the whole batch.
+func (b *Bitbucket) ReviewRequestedPRs(ctx context.Context) ([]PR, error) {
+	uuid, err := b.currentUserUUID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var repos []string
+	for _, r := range strings.Split(os.Getenv("GOON_REVIEW_REPOS"), ",") {
+		if r = NormalizeRepoSlug(r); r != "" {
+			repos = append(repos, r)
+		}
+	}
+	if len(repos) == 0 {
+		discovered, derr := b.discoverAccessibleRepos(ctx, 20)
+		if derr != nil {
+			return nil, fmt.Errorf("bitbucket: no repos configured and discovery failed: %w "+
+				"(set GOON_REVIEW_REPOS to skip discovery)", derr)
+		}
+		repos = discovered
+	}
+	out := []PR{}
+	for _, repo := range repos {
+		q := fmt.Sprintf(`state="OPEN" AND reviewers.uuid="%s"`, uuid)
+		endpoint := fmt.Sprintf("%s/repositories/%s/pullrequests?pagelen=50&q=%s",
+			b.APIURL, repo, url.QueryEscape(q))
+		raw, err := b.do(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			logx.Warn("bitbucket.review_requested_skip", "repo", repo, "error", err.Error())
+			continue
+		}
+		var resp struct {
+			Values []bbPRDetail `json:"values"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			logx.Warn("bitbucket.review_requested_decode", "repo", repo, "error", err.Error())
+			continue
+		}
+		for _, it := range resp.Values {
+			out = append(out, PR{
+				Number: it.ID,
+				URL:    it.Links.HTML.Href,
+				Title:  it.Title,
+				Branch: it.Source.Branch.Name,
+				Author: it.authorName(),
+				State:  strings.ToLower(it.State),
+				Body:   it.Description,
+				Repo:   repo,
+			})
+		}
+	}
+	return out, nil
 }

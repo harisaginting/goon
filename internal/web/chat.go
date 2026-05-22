@@ -2,7 +2,6 @@ package web
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"github.com/harisaginting/goon/internal/agentctx"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/notes"
-	"github.com/harisaginting/goon/internal/personal"
 )
 
 // chatSystemPrompt mirrors the Telegram bot's chat persona. Both
@@ -154,7 +152,7 @@ func (s *Server) handleChatReset(w http.ResponseWriter, r *http.Request) {
 // example prompts that auto-fill the composer.
 const chatTranscriptEmpty = `<div id="chat-transcript" class="flex flex-col gap-4 min-h-[280px] max-h-[60vh] overflow-y-auto scrollbar-thin pr-2 py-1">
 	<div class="mx-auto max-w-md text-center py-6">
-		<div class="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-accent to-violet-500 text-white flex items-center justify-center text-base font-bold shadow-lift">GO</div>
+		<div class="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-base font-bold shadow-lift">GO</div>
 		<div class="text-sm font-medium text-gray-700 dark:text-gray-300">Ask goon anything</div>
 		<div class="mt-1 text-xs text-gray-500 dark:text-gray-500">
 			Grounded on your live tickets, workflows, pending questions, and knowledge notes.
@@ -170,7 +168,7 @@ const chatTranscriptEmpty = `<div id="chat-transcript" class="flex flex-col gap-
 			</button>
 			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="what do you know about this project?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
 				<div class="font-medium">→ what do you know about this project?</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">recall from PINNED.md + notes</div>
+				<div class="mt-0.5 text-[11px] text-gray-500">recall from SOUL.md + notes</div>
 			</button>
 			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="summarize the most recent workflow run" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
 				<div class="font-medium">→ summarize recent runs</div>
@@ -200,7 +198,7 @@ func writeChatBubble(w io.Writer, role, body string) {
 	case "assistant":
 		wrap = "flex flex-row gap-2 chat-bubble animate-fade-in"
 		bubble = `max-w-[85%] rounded-2xl rounded-tl-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised text-gray-800 dark:text-gray-200 px-3.5 py-2 text-sm shadow-sm`
-		avatar = `<div class="shrink-0 h-7 w-7 rounded-full bg-gradient-to-br from-accent to-violet-500 text-white flex items-center justify-center text-[10px] font-bold tracking-tight">GO</div>`
+		avatar = `<div class="shrink-0 h-7 w-7 rounded-full bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-[10px] font-bold tracking-tight">GO</div>`
 		label = "goon"
 	case "error":
 		wrap = "flex flex-row gap-2 chat-bubble animate-fade-in"
@@ -334,35 +332,31 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 	</section>`)
 }
 
-// fragTabMemory is the consolidated tab merging Knowledge + Skills +
-// Personal. Three segmented buttons toggle between three pre-rendered
-// bodies WITHOUT a network round-trip — same pattern as the previous
-// two-segment version, just one more option.
+// fragTabMemory is the consolidated tab covering Knowledge + Skills.
+// Two segmented buttons toggle between two pre-rendered bodies
+// WITHOUT a network round-trip — pure CSS class flip via the
+// goonSwitchStore helper at the bottom.
 //
-// Personal sits last because it's the rarest-edited of the three,
-// but it ships with default content out of the box so the user has
-// something to read+tweak on day one.
+// The old Personal segment is gone — character / voice content was
+// folded into SOUL.md (Knowledge tab). One always-loaded file is
+// less confusing than two.
 func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
 		<div>
 			<h2 class="text-xl font-semibold tracking-tight">Memory</h2>
-			<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-				What goon remembers. <strong>Personal</strong> shapes its voice. <strong>Knowledge</strong> is auto-loaded facts (PINNED.md + topic notes). <strong>Skills</strong> are specialist procedures activated on demand.
+			<p class="mt-0.5 text-sm text-muted max-w-2xl">
+				What goon remembers. <strong>Knowledge</strong> is the auto-loaded SOUL.md (character + project facts in one place), plus on-demand topic notes and HISTORY.md. <strong>Skills</strong> are specialist procedures activated on demand.
 			</p>
 		</div>
-		<div class="inline-flex rounded-lg border border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface-sunken p-0.5 text-xs font-medium" role="tablist">
+		<div class="inline-flex rounded-lg border border-surface-border bg-surface-sunken p-0.5 text-xs font-medium" role="tablist">
 			<button type="button" data-store-switch="knowledge" onclick="goonSwitchStore('knowledge')"
-				class="px-3 py-1.5 rounded-md transition bg-white dark:bg-surface-raised text-accent shadow-sm" aria-current="page">
+				class="px-3 py-1.5 rounded-md transition bg-surface-raised text-accent shadow-card" aria-current="page">
 				Knowledge
 			</button>
 			<button type="button" data-store-switch="skills" onclick="goonSwitchStore('skills')"
-				class="px-3 py-1.5 rounded-md transition text-gray-600 dark:text-gray-400 hover:text-accent">
+				class="px-3 py-1.5 rounded-md transition text-muted hover:text-accent">
 				Skills
-			</button>
-			<button type="button" data-store-switch="personal" onclick="goonSwitchStore('personal')"
-				class="px-3 py-1.5 rounded-md transition text-gray-600 dark:text-gray-400 hover:text-accent">
-				Personal
 			</button>
 		</div>
 	</div>
@@ -372,9 +366,6 @@ func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `</div>
 	<div data-store="skills" class="hidden">`)
 	s.renderSkillsBody(w)
-	fmt.Fprint(w, `</div>
-	<div data-store="personal" class="hidden">`)
-	s.renderPersonalBody(w)
 	fmt.Fprint(w, `</div>
 
 	<script>
@@ -387,12 +378,12 @@ func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 			});
 			document.querySelectorAll('[data-store-switch]').forEach(function(btn) {
 				var active = btn.dataset.storeSwitch === target;
-				btn.classList.toggle('bg-white', active);
-				btn.classList.toggle('dark:bg-surface-raised', active);
+				// Dark-only now: the active pill sits on surface-raised
+				// with the brand-purple accent. Inactive rows fade to muted.
+				btn.classList.toggle('bg-surface-raised', active);
 				btn.classList.toggle('text-accent', active);
-				btn.classList.toggle('shadow-sm', active);
-				btn.classList.toggle('text-gray-600', !active);
-				btn.classList.toggle('dark:text-gray-400', !active);
+				btn.classList.toggle('shadow-card', active);
+				btn.classList.toggle('text-muted', !active);
 				if (active) btn.setAttribute('aria-current', 'page');
 				else btn.removeAttribute('aria-current');
 			});
@@ -401,51 +392,8 @@ func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 	</script>`)
 }
 
-// renderPersonalBody renders the personality editor — single
-// textarea with the current personal.md contents, plus save and
-// reset-to-default buttons. No list; this is one file by intent.
-func (s *Server) renderPersonalBody(w http.ResponseWriter) {
-	body := personal.Read()
-	if body == "" {
-		body = personal.Default
-	}
-	fmt.Fprintf(w, `<p class="mb-4 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-		goon's <strong>character</strong> file — the voice and decision style
-		auto-injected into every agent run and chat turn. Stored at
-		<code class="font-mono text-xs">%s</code>. Keep it short and
-		opinionated; the agent reads this on every call.
-	</p>
-
-	<form hx-post="/api/personal/save" hx-target="#personal-save-result" hx-swap="innerHTML" class="space-y-3">
-		<textarea name="body" rows="22" required
-			class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">%s</textarea>
-		<div class="flex items-center justify-between gap-2 flex-wrap">
-			<button type="button"
-				onclick="if(confirm('Reset to the default character? Your current personal.md will be replaced.')){this.closest('form').querySelector('textarea').value=%s;}"
-				class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1.5 text-gray-600 dark:text-gray-400 hover:border-accent hover:text-accent transition">reset to default</button>
-			<div class="flex items-center gap-2">
-				<div id="personal-save-result" class="text-xs"></div>
-				<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1.5 font-semibold hover:brightness-110 transition">save personal.md</button>
-			</div>
-		</div>
-	</form>`,
-		html.EscapeString(personal.Path()),
-		html.EscapeString(body),
-		jsonStringLiteral(personal.Default),
-	)
-}
-
-// jsonStringLiteral turns a Go string into a JSON-encoded literal
-// safe to drop into an inline JavaScript expression. Used by the
-// "reset to default" button so the default content is embedded
-// once at render time, no extra fetch needed.
-func jsonStringLiteral(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
-}
-
 // renderKnowledgeBody renders the original Knowledge UI inside the
-// shared Memory tab shell. PINNED.md card + topic notes index.
+// shared Memory tab shell. SOUL.md card + topic notes index.
 // Caller (fragTabMemory) has already emitted the section opener and
 // segmented header.
 func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
@@ -455,7 +403,7 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 				create or replace a note
 			</summary>
 			<form hx-post="/api/memory/write" hx-target="#memory-save-result" hx-swap="innerHTML" hx-on::after-request="if (event.detail.successful) this.reset()" class="px-4 pb-4 space-y-3">
-				<input type="text" name="name" required placeholder="PINNED.md, kebab-case-name.md, …"
+				<input type="text" name="name" required placeholder="SOUL.md, kebab-case-name.md, …"
 					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
 				<textarea name="body" rows="6" required placeholder="# Project context&#10;- API base URL is …&#10;- always run `+"make verify"+` before pushing"
 					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"></textarea>
@@ -466,15 +414,15 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 			</form>
 		</details>`)
 
-	pinned := agentctx.Pinned("")
-	if strings.TrimSpace(pinned) == "" {
-		fmt.Fprint(w, `<div class="mb-6 rounded-xl border border-dashed border-gray-300 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40 p-6 text-center">
-			<div class="mx-auto h-10 w-10 rounded-xl bg-gray-100 dark:bg-surface-raised text-gray-400 flex items-center justify-center mb-2">
+	soul := agentctx.Soul("")
+	if strings.TrimSpace(soul) == "" {
+		fmt.Fprint(w, `<div class="mb-6 rounded-xl border border-dashed border-accent/30 bg-surface-raised/60 p-6 text-center">
+			<div class="mx-auto h-10 w-10 rounded-xl bg-accent-soft text-accent flex items-center justify-center mb-2">
 				<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
 			</div>
-			<div class="text-sm font-medium text-gray-700 dark:text-gray-300">PINNED.md is empty</div>
-			<div class="mt-1 text-xs text-gray-500 max-w-md mx-auto">
-				Seed it with <code class="font-mono">goon memory init</code> — facts in here are visible to the agent on every run.
+			<div class="text-sm font-medium text-white">SOUL.md is empty</div>
+			<div class="mt-1 text-xs text-muted max-w-md mx-auto">
+				Seed it with <code class="font-mono text-accent">goon memory init</code> — facts in here are visible to the agent on every run.
 			</div>
 		</div>`)
 	} else {
@@ -483,11 +431,11 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 			<div class="px-5 py-4">
 				<div class="flex items-center gap-2 mb-3">
 					<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3 6 6 .9-4.5 4.4 1 6.7L12 17l-5.5 3 1-6.7L3 8.9 9 8z"/></svg>
-					<span class="text-[11px] font-semibold uppercase tracking-wider text-accent">PINNED.md</span>
+					<span class="text-[11px] font-semibold uppercase tracking-wider text-accent">SOUL.md</span>
 					<span class="text-[11px] text-gray-500 font-mono">always-loaded</span>
 				</div>
 				<pre class="whitespace-pre-wrap text-sm font-mono text-gray-800 dark:text-gray-200 leading-relaxed">`)
-		fmt.Fprint(w, html.EscapeString(strings.TrimSpace(pinned)))
+		fmt.Fprint(w, html.EscapeString(strings.TrimSpace(soul)))
 		fmt.Fprint(w, `</pre>
 			</div>
 		</div>`)
@@ -495,14 +443,14 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 
 	idx := agentctx.KnowledgeIndex("")
 	if len(idx) == 0 {
-		fmt.Fprint(w, `<div class="rounded-xl border border-dashed border-gray-300 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40 p-6 text-center">
-			<div class="mx-auto h-10 w-10 rounded-xl bg-gray-100 dark:bg-surface-raised text-gray-400 flex items-center justify-center mb-2">
+		fmt.Fprint(w, `<div class="rounded-xl border border-dashed border-surface-border bg-surface-raised/40 p-6 text-center">
+			<div class="mx-auto h-10 w-10 rounded-xl bg-surface-sunken text-muted flex items-center justify-center mb-2">
 				<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
 			</div>
-			<div class="text-sm font-medium text-gray-700 dark:text-gray-300">No topic notes yet</div>
-			<div class="mt-1 text-xs text-gray-500 max-w-md mx-auto">
+			<div class="text-sm font-medium text-white">No topic notes yet</div>
+			<div class="mt-1 text-xs text-muted max-w-md mx-auto">
 				Workflows write here as they learn. You can also create them manually with
-				<code class="font-mono text-xs">goon memory write &lt;name&gt; &lt;body&gt;</code>.
+				<code class="font-mono text-xs text-accent">goon memory write &lt;name&gt; &lt;body&gt;</code>.
 			</div>
 		</div>`)
 		return
@@ -610,7 +558,7 @@ func (s *Server) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 // Keep notes import alive for tests/future references even if every
 // caller goes through agentctx today.
-var _ = notes.PinnedFilename
+var _ = notes.SoulFilename
 
 // --- Memory + Skills CRUD --------------------------------------------------
 //
@@ -639,33 +587,6 @@ func (s *Server) handleSkillWrite(w http.ResponseWriter, r *http.Request) {
 // handleSkillDelete — same as memory but for the skills store.
 func (s *Server) handleSkillDelete(w http.ResponseWriter, r *http.Request) {
 	s.handleStoreDelete(w, r, "skills", agentctx.DeleteSkill)
-}
-
-// handlePersonalSave persists the character file. Single field (body)
-// — personal.md is one file, not a collection. Empty body resets to
-// the seeded default rather than wiping the personality entirely.
-func (s *Server) handlePersonalSave(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "POST only", http.StatusMethodNotAllowed)
-		return
-	}
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	body := strings.TrimSpace(r.FormValue("body"))
-	if body == "" {
-		body = personal.Default
-	}
-	if err := personal.Write(body); err != nil {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprintf(w, `<span class="text-rose-700 dark:text-rose-400">✗ save failed: %s</span>`, html.EscapeString(err.Error()))
-		return
-	}
-	w.Header().Set("HX-Trigger", "personalChanged")
-	s.events.Publish("personalChanged")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<span class="text-emerald-700 dark:text-emerald-400">✓ saved</span>`)
 }
 
 // handleSkillNote returns one skill's body — analogue of

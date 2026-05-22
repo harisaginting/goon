@@ -4,7 +4,7 @@
 //
 //   1. Live runtime state from internal/memory — tickets, workflows,
 //      pending questions, daemon status, learned project→repo cache.
-//   2. Durable knowledge from internal/notes — PINNED.md body inline,
+//   2. Durable knowledge from internal/notes — SOUL.md body inline,
 //      plus an index of every topic note with its first-line headline.
 //
 // Keeping this in its own package avoids forcing telegram and web to
@@ -21,24 +21,23 @@ import (
 
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/notes"
-	"github.com/harisaginting/goon/internal/personal"
 	"github.com/harisaginting/goon/internal/skills"
 )
 
-// Build returns the full context — state + knowledge — concatenated.
-// Safe to call with a nil/Disabled Memory; the function degrades to
-// "operating without context" rather than panicking. notesDir
-// overrides the default discovery (mostly useful in tests); when
-// empty, notes.New("") falls back to $GOON_MEMORY_DIR / storage.
+// Build returns the full context — state + knowledge + skills —
+// concatenated. Safe to call with a nil/Disabled Memory; the
+// function degrades to "operating without context" rather than
+// panicking. notesDir overrides the default discovery (mostly
+// useful in tests); when empty, notes.New("") falls back to
+// $GOON_MEMORY_DIR / storage.
+//
+// Character / voice content used to ship from a separate
+// personal.md file; it's now folded into SOUL.md and surfaces
+// through BuildKnowledge, so the "character" block is no longer
+// emitted separately. One always-loaded context file = one mental
+// model.
 func Build(mem *memory.Memory, notesDir string) string {
 	var sb strings.Builder
-	// Personal first — character shapes how everything below is
-	// delivered. Always present (the seed defaults guarantee a file
-	// after first boot), but skipped cleanly if the user emptied it.
-	if pb := BuildPersonal(); pb != "" {
-		sb.WriteString(pb)
-		sb.WriteByte('\n')
-	}
 	sb.WriteString(BuildState(mem))
 	if kb := BuildKnowledge(notesDir); kb != "" {
 		sb.WriteByte('\n')
@@ -49,18 +48,6 @@ func Build(mem *memory.Memory, notesDir string) string {
 		sb.WriteString(sk)
 	}
 	return sb.String()
-}
-
-// BuildPersonal returns the personality block injected into every
-// chat / agent turn. Reads ./storage/personal.md (override via
-// $GOON_PERSONAL_FILE). Empty when the file is missing or all
-// whitespace.
-func BuildPersonal() string {
-	body := personal.Read()
-	if body == "" {
-		return ""
-	}
-	return "GOON CHARACTER (how to talk and decide — always loaded):\n" + body + "\n"
 }
 
 // BuildState renders the live-runtime block from passive memory.
@@ -195,7 +182,7 @@ func BuildState(mem *memory.Memory) string {
 	return sb.String()
 }
 
-// BuildKnowledge renders the active markdown-notes block — PINNED.md
+// BuildKnowledge renders the active markdown-notes block — SOUL.md
 // body inline plus an index of every topic note with its first
 // non-empty line as a headline. notesDir overrides notes.New's default
 // discovery; "" uses $GOON_MEMORY_DIR / storage.
@@ -208,10 +195,10 @@ func BuildKnowledge(notesDir string) string {
 		return ""
 	}
 	var sb strings.Builder
-	if pinned := store.Pinned(); strings.TrimSpace(pinned) != "" {
-		fmt.Fprintf(&sb, "[knowledge: PINNED.md — always-loaded notes from %s/%s]\n",
-			store.Path(), notes.PinnedFilename)
-		sb.WriteString(snippet(strings.TrimSpace(pinned), 4000))
+	if soul := store.Soul(); strings.TrimSpace(soul) != "" {
+		fmt.Fprintf(&sb, "[knowledge: SOUL.md — always-loaded notes from %s/%s]\n",
+			store.Path(), notes.SoulFilename)
+		sb.WriteString(snippet(strings.TrimSpace(soul), 4000))
 		sb.WriteString("\n")
 	}
 	names, err := store.List()
@@ -223,7 +210,15 @@ func BuildKnowledge(notesDir string) string {
 	}
 	idx := make([]string, 0, len(names))
 	for _, n := range names {
-		if n == notes.PinnedFilename {
+		// Hide files that have their own dedicated render surface
+		// elsewhere:
+		//   SOUL.md      → rendered above as the always-loaded block
+		//   PINNED.md    → legacy alias of SOUL, read-only
+		//   REPOSITORY.md → its own table view in the dashboard; also
+		//                  surfaces in the confirm_repo menu so it
+		//                  doesn't need to clutter the topic index
+		//   HISTORY.md   → chronological log, rendered separately
+		if n == notes.SoulFilename || n == "PINNED.md" || n == "REPOSITORY.md" || n == "HISTORY.md" {
 			continue
 		}
 		idx = append(idx, n)
@@ -268,7 +263,7 @@ type IndexEntry struct {
 	Headline string
 }
 
-// KnowledgeIndex returns one entry per non-pinned note with its
+// KnowledgeIndex returns one entry per non-soul note with its
 // first-line headline. Independent of BuildKnowledge so callers can
 // render the index in whatever shape they want (table, list, …).
 func KnowledgeIndex(notesDir string) []IndexEntry {
@@ -282,7 +277,10 @@ func KnowledgeIndex(notesDir string) []IndexEntry {
 	}
 	out := make([]IndexEntry, 0, len(names))
 	for _, n := range names {
-		if n == notes.PinnedFilename {
+		// Exclude SOUL / PINNED (read-only alias) / REPOSITORY /
+		// HISTORY — each has a dedicated render surface elsewhere
+		// and would otherwise clutter the "topic notes" index.
+		if n == notes.SoulFilename || n == "PINNED.md" || n == "REPOSITORY.md" || n == "HISTORY.md" {
 			continue
 		}
 		entry := IndexEntry{Name: n}
@@ -301,16 +299,23 @@ func KnowledgeIndex(notesDir string) []IndexEntry {
 	return out
 }
 
-// Pinned returns the PINNED.md body verbatim (or "" if absent).
-// Exposed so UI surfaces can render it as styled markdown without
-// pulling it out of the BuildKnowledge string.
-func Pinned(notesDir string) string {
+// Soul returns the SOUL.md body verbatim (or "" if absent). Falls
+// back to the legacy PINNED.md when SOUL.md is missing so installs
+// mid-rename still render their always-loaded knowledge. Exposed so
+// UI surfaces can render it as styled markdown without pulling it
+// out of the BuildKnowledge string.
+func Soul(notesDir string) string {
 	store, err := notes.New(notesDir)
 	if err != nil {
 		return ""
 	}
-	return store.Pinned()
+	return store.Soul()
 }
+
+// Pinned is a deprecated alias for Soul.
+//
+// Deprecated: use Soul.
+func Pinned(notesDir string) string { return Soul(notesDir) }
 
 // ReadNote returns one note's full body (or empty + error on miss).
 // Thin wrapper so web/telegram surfaces don't need to import notes

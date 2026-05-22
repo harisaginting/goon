@@ -62,12 +62,21 @@ func (m *MemoryList) Run(_ context.Context, _ map[string]string) (Result, error)
 	}
 	var b strings.Builder
 	for _, n := range names {
-		// Annotate the pinned file so the agent knows it's auto-loaded.
-		if n == notes.PinnedFilename {
+		// Annotate the special files so the agent knows what each is
+		// for. SOUL/PINNED auto-load into the system prompt;
+		// REPOSITORY/HISTORY have dedicated roles the agent should
+		// treat carefully (don't overwrite the history log; respect
+		// the table format in REPOSITORY).
+		switch n {
+		case notes.SoulFilename, "PINNED.md":
 			b.WriteString(n + "  (auto-loaded into system prompt)\n")
-			continue
+		case "REPOSITORY.md":
+			b.WriteString(n + "  (repo registry — table of remote→local mappings)\n")
+		case "HISTORY.md":
+			b.WriteString(n + "  (chronological run log — append-only; goon manages it)\n")
+		default:
+			b.WriteString(n + "\n")
 		}
-		b.WriteString(n + "\n")
 	}
 	return Result{ToolName: "memory_list", Stdout: b.String()}, nil
 }
@@ -77,7 +86,7 @@ type MemoryRead struct{ *memoryTool }
 
 func (*MemoryRead) Name() string { return "memory_read" }
 func (*MemoryRead) Description() string {
-	return "read the contents of a persistent memory note by name (e.g. \"PINNED.md\" or \"learnings/regex.md\")"
+	return "read the contents of a persistent memory note by name (e.g. \"SOUL.md\", \"HISTORY.md\", or \"learnings/regex.md\")"
 }
 func (*MemoryRead) Schema() map[string]string {
 	return map[string]string{"name": "note name (relative path under the memory dir, .md auto-appended)"}

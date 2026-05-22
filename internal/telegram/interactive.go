@@ -49,6 +49,10 @@ func (b *Bot) handleCallback(ctx context.Context, q *CallbackQuery) {
 	if b.callbackHandleRepos(ctx, q) {
 		return
 	}
+	// Review-draft approve/dismiss callbacks (rv:…) live in autoreview.go.
+	if b.callbackHandleReview(ctx, q) {
+		return
+	}
 	switch parts[0] {
 	case "v":
 		if len(parts) < 2 {

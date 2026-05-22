@@ -349,6 +349,7 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 		fmt.Fprintf(d.opts.Stderr, "[poll] error: %v\n", err)
 		return
 	}
+	fmt.Println(fmt.Sprintf("TOTAL TICKET%d", len(tickets)))
 	for _, t := range tickets {
 		// Copy every field that chat / web UI / /tickets can render —
 		// dropping Assignee/Labels/Project caused "assigned to me"
@@ -394,6 +395,7 @@ func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
 	var best *boards.Ticket
 	for i := range tickets {
 		t := &tickets[i]
+		fmt.Println("========", t.Key, t.Status)
 		if t.Status != boards.StatusOpen && t.Status != boards.StatusUnknown && t.Status != boards.StatusInProgress {
 			continue
 		}

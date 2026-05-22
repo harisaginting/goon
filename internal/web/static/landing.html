@@ -5,56 +5,47 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goon — your autonomous engineer</title>
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#09090B">
 <meta property="og:title" content="goon — your autonomous engineer">
 <meta property="og:description" content="An autonomous AI engineer in a single Go binary. Triages tickets, asks before changing anything, codes it, tests, opens a PR.">
 <meta property="og:image" content="/logo.svg">
 <style>
   /* ============================================================
-     design tokens
+     design tokens — dark-only by design
+     ------------------------------------------------------------
+     primary / accent  → Neon Purple  #A855F7  (brand, links, CTAs)
+     highlight         → Vibrant Amber #F59E0B  (warm pop, used sparingly)
+     background        → Obsidian Black #09090B family
+     muted             → Cool Grey #94A3B8
+     text              → Pure White #FFFFFF
+     The marketing page intentionally mirrors the dashboard palette so
+     visitors who arrive from goon.app/docs land in a familiar visual
+     system the moment they sign in.
      ============================================================ */
   :root {
-    --bg: #07090d;
-    --bg-soft: #0d1117;
-    --bg-elev: #11161e;
-    --bg-glass: rgba(13, 17, 23, 0.6);
-    --fg: #e6edf3;
-    --fg-soft: #9aa4b2;
-    --fg-mute: #6b7280;
-    --accent: #7c8cff;
-    --accent-2: #c084fc;
-    --accent-3: #22d3ee;
-    --accent-warm: #fb923c;
-    --ok: #34d399;
-    --warn: #fbbf24;
-    --err: #f87171;
-    --border: #1f2937;
-    --border-soft: rgba(31, 41, 55, 0.6);
+    --bg: #09090B;                 /* Obsidian — page background */
+    --bg-soft: #131318;            /* one step up — cards, callouts */
+    --bg-elev: #1A1A21;            /* two steps up — hovered cards */
+    --bg-glass: rgba(19, 19, 24, 0.65);
+    --fg: #FFFFFF;
+    --fg-soft: #94A3B8;            /* Cool Grey */
+    --fg-mute: #64748B;            /* slightly cooler than --fg-soft */
+    --accent: #A855F7;             /* Neon Purple — the brand */
+    --accent-2: #C084FC;            /* lifted purple for gradients */
+    --accent-3: #F59E0B;            /* Vibrant Amber — the warm pop */
+    --accent-warm: #F59E0B;
+    --ok: #34D399;
+    --warn: #F59E0B;
+    --err: #F87171;
+    --border: #27272D;
+    --border-soft: rgba(39, 39, 45, 0.7);
     --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.2);
-    --shadow:    0 16px 40px -20px rgba(124, 140, 255, 0.30);
-    --shadow-lg: 0 30px 80px -30px rgba(124, 140, 255, 0.40);
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #fafbfc;
-      --bg-soft: #ffffff;
-      --bg-elev: #ffffff;
-      --bg-glass: rgba(255, 255, 255, 0.7);
-      --fg: #0c0e12;
-      --fg-soft: #4b5563;
-      --fg-mute: #9ca3af;
-      --accent: #5b6cff;
-      --accent-2: #a855f7;
-      --accent-3: #06b6d4;
-      --accent-warm: #f97316;
-      --ok: #16a34a;
-      --warn: #d97706;
-      --err: #dc2626;
-      --border: #e5e7eb;
-      --border-soft: rgba(229, 231, 235, 0.7);
-    }
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
+    --shadow:    0 18px 40px -18px rgba(168, 85, 247, 0.35);
+    --shadow-lg: 0 32px 80px -28px rgba(168, 85, 247, 0.50);
+    --shadow-amber: 0 24px 60px -24px rgba(245, 158, 11, 0.45);
+    color-scheme: dark;
   }
 
   * { box-sizing: border-box; }
@@ -472,8 +463,7 @@
   .layer::before {
     content: ''; position: absolute; inset: -1px -1px auto -1px; height: 3px;
   }
-  .layer.personal::before  { background: linear-gradient(90deg, var(--accent-warm), var(--accent-2)); }
-  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-3)); }
+  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
   .layer.skills::before    { background: linear-gradient(90deg, var(--accent-3), var(--ok)); }
   .layer .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
   .layer .badge {
@@ -981,25 +971,17 @@
   <section class="section container reveal">
     <div class="section-head">
       <span class="section-eyebrow">memory</span>
-      <h2 class="section-title">A brain in three layers.</h2>
-      <p class="section-lede">Goon isn't a stateless chatbot. It keeps three persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
+      <h2 class="section-title">A brain in two layers.</h2>
+      <p class="section-lede">Goon isn't a stateless chatbot. It keeps two persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
     </div>
 
     <div class="layers">
-      <div class="layer personal">
-        <div class="head">
-          <h3>Personal</h3>
-          <span class="badge">soul · always loaded</span>
-        </div>
-        <p>Goon's character. Voice, tone, defaults. The "who am I" file. One per project, you edit it freely.</p>
-        <div class="file">./storage/personal.md</div>
-      </div>
       <div class="layer knowledge">
         <div class="head">
           <h3>Knowledge</h3>
-          <span class="badge">history · auto-pinned</span>
+          <span class="badge">soul · always loaded</span>
         </div>
-        <p>What goon has learned. PINNED.md auto-injects on every run; topic notes are looked up on demand. Grows as it works.</p>
+        <p>What goon should always remember. SOUL.md holds character and project facts together; HISTORY.md is the running log of past runs; topic notes are looked up on demand. Grows as it works.</p>
         <div class="file">./storage/memory/*.md</div>
       </div>
       <div class="layer skills">

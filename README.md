@@ -176,7 +176,7 @@ the next tick.
 5. Execute              agent runs each plan step, safety-validated
 6. Test                 best-effort `make test` (or repo-defined)
 7. Verify × N           LLM re-checks the work N times
-8. Update memory        agent distils learnings into PINNED.md / notes
+8. Update memory        agent distils learnings into SOUL.md / topic notes; HISTORY.md gets a one-line entry
 9. Open PR              GitHub / GitLab / Bitbucket
 10. Notify              Telegram + board comment + status transition
 ```
@@ -284,6 +284,9 @@ TELEGRAM_BOT_TOKEN=123:abc        # from @BotFather
 GOON_TELEGRAM_SECRET=long-phrase  # required for inbound bot (see below)
 TELEGRAM_CHAT_ID=987654321        # optional default chat for outbound notify
 GOON_REVIEW_REPOS=owner/a,owner/b # default repos for /prs without args
+GOON_AUTO_REVIEW=1                # auto-draft reviews for PRs awaiting you
+GOON_AUTO_NOTIFY=1                # auto-forward review-requests + mentions
+GOON_AUTO_INTERVAL=15m            # auto-loop cadence (default 15m, floor 1m)
 ```
 
 ### Storage knobs (project-local by default)
@@ -307,7 +310,9 @@ GOON_AUTO_APPROVE=1     # skip the confirm_repo + approve_plan gates
 GOON_VERIFY_RUNS=3      # extra verify passes after execute (1..10)
 GOON_MAX_STEPS=5        # agent loop bound (1..50)
 GOON_POLL_SECONDS=300   # daemon poll interval
-GOON_REPO_MAP="ENG=/repos/eng,WEB=/repos/web,*=/repos/default"
+GOON_REPO_MAP="ENG=/repos/eng,WEB=/repos/web,*=/repos/default"  # soft default hint per project key
+# (REPOSITORY.md is the real source of truth — see Memory section. GOON_REPO_MAP
+#  only feeds the triage prompt as a fallback when nothing else is known.)
 ```
 
 ---
@@ -407,6 +412,38 @@ you →  /decline owner/repo 17 needs error-handling on token refresh
 bot →  ✓ requested changes on owner/repo#17
 ```
 
+### Proactive PR review + notifications
+
+Beyond the on-demand `/prs` / `/review` commands, goon can watch for work
+addressed to *you* and push it without being asked:
+
+- **PR review** — finds every PR/MR where you are a requested reviewer
+  (GitHub, GitLab and Bitbucket), drafts an LLM review of the diff, and
+  sends it to Telegram with a one-tap **✅ Post as comment** button. A PR
+  is re-reviewed only when its diff changes.
+- **Notifications** — forwards new review requests and @-mentions
+  (GitHub `/notifications`, GitLab `/todos`). When several are new it
+  leads with a short LLM digest. Bitbucket has no notification-inbox API,
+  so notification forwarding is GitHub/GitLab only.
+
+Two ways to run it:
+
+```sh
+# 1. Automatically, inside the daemon's Telegram bot — opt in via env:
+GOON_AUTO_REVIEW=1 GOON_AUTO_NOTIFY=1 goon start
+#    (both default OFF so an upgrade never starts messaging you unasked)
+
+# 2. On demand / from cron, as standalone commands:
+goon review-prs                  # print review drafts for PRs awaiting you
+goon review-prs --telegram       # …and push them to TELEGRAM_CHAT_ID
+goon notifications --watch       # poll forever, print new notifications
+goon review-prs --watch --interval 30m --telegram   # a cron-free scheduler
+```
+
+Drafts and forwarded notifications are de-duplicated in `storage/memory.json`,
+so `--watch` and the daemon loop never spam you with the same item twice
+(`--all` ignores the dedup state for a one-off full pass).
+
 ---
 
 ## Daily commands
@@ -421,7 +458,10 @@ goon train                               # answer questions queued by the agent
 goon train answer <id> <answer>          # non-interactive
 goon workflow init|show|path|edit|hooks  # customize the pipeline
 goon memory init|list|read|write|append|search|edit|delete|path  # active markdown notes
-goon repo list|forget <project>|clear    # learned project→repo mappings
+goon repo show|edit|scan|add             # manage REPOSITORY.md (repo registry)
+goon repo list|forget|clear              # deprecated — see `goon repo show` instead
+goon review-prs [--watch] [--telegram]   # draft AI reviews for PRs awaiting you
+goon notifications [--watch] [--telegram] # forward git review-requests + mentions
 goon pause | resume                      # toggle the daemon's poll loop
 goon version                             # build info (commit, date, go version)
 goon logs [--tail|--follow|--clear]      # browse the structured log
@@ -533,8 +573,10 @@ persistent knowledge (markdown notes the agent reads + writes).
 ```
 ./storage/
 ├── memory.json     passive: tickets, workflows, queue, daemon status
-├── memory/         active: PINNED.md + topic notes the agent maintains
-│   ├── PINNED.md           ← always loaded into the system prompt
+├── memory/         active: SOUL.md, HISTORY.md, REPOSITORY.md + topic notes
+│   ├── SOUL.md             ← always loaded into the system prompt
+│   ├── HISTORY.md          ← running log of past tasks (one line each)
+│   ├── REPOSITORY.md       ← remote→local repo registry (you maintain it)
 │   └── learnings/...md     ← topic notes the agent fetches as needed
 ├── logs/goon.log
 └── goon.pid        present while the daemon runs
@@ -544,9 +586,10 @@ You don't edit `memory.json` by hand — goon manages it. The notes dir is
 plain markdown; you can edit, version-control, or copy across repos.
 
 ```sh
-goon memory init                        # creates memory/ + seeds PINNED.md
+goon memory init                        # creates memory/ + seeds SOUL.md
 goon memory list                        # * = auto-loaded
-goon memory edit PINNED.md
+goon memory edit SOUL.md
+goon memory read HISTORY.md             # what goon has done lately
 goon memory read learnings/regex.md
 goon memory search "auth"               # case-insensitive grep
 ```
@@ -555,13 +598,40 @@ The agent gets five tools — `memory_list`, `memory_read`,
 `memory_write`, `memory_append`, `memory_search` — and is nudged in the
 system prompt to write down what it learned after each task. The
 **update_memory** workflow phase makes this an explicit step before
-every PR opens, so steady-state knowledge keeps growing.
+every PR opens, so steady-state knowledge keeps growing. Even one-shot
+runs (`goon "do X"`) now leave behind a HISTORY.md line plus a brief
+distillation pass — opt out with `GOON_AUTO_LEARN=0`.
 
-**PINNED.md** is the always-loaded note. Keep it short and high-signal:
+**SOUL.md** is the always-loaded note (renamed from `PINNED.md`; the
+legacy file is still read transparently and auto-migrates the next
+time you run `goon memory init`). Keep it short and high-signal:
 codebase conventions, names of services/people, "don't do this" rules,
 pointers to other notes worth reading. Park bulky context in topic
 notes (`learnings/oauth-flow.md`, `repos/webapp.md`) and let the agent
 fetch them on demand.
+
+**HISTORY.md** is a chronological log — one line per completed run,
+appended automatically. Use it (or ask goon) to remember what's
+already been tried on this repo.
+
+**REPOSITORY.md** is the registry of repos goon knows about: a
+markdown table with `Remote | Local | Notes` columns. Triage reads it
+so goon can name a specific repo from the ticket text (instead of
+guessing project keys), and the confirm_repo gate uses it as the
+primary source for the candidate menu. Quick management:
+
+```sh
+goon repo show                          # print the parsed table
+goon repo scan                          # auto-discover from $GOON_WORKSPACE_DIR
+goon repo add github.com/me/api ~/code/api Go    # add one row
+goon repo edit                          # open in $EDITOR
+```
+
+With REPOSITORY.md populated, goon also classifies each incoming
+ticket as either "needs a repo" (the gate fires, you multi-pick) or
+"doesn't need a repo" (research, docs, comms — gate + test + open_pr
+are skipped, the agent still runs the plan). You stop seeing
+"which repo?" for tickets where the answer is obviously "none."
 
 ---
 

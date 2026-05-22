@@ -75,7 +75,7 @@ next turn.
   /status              daemon snapshot
   /prs [repo]          open PRs on the configured git host
   /review <repo> <num> AI-review a PR
-  /knowledge           show PINNED.md + topic-note index
+  /knowledge           show SOUL.md + topic-note index
   /memory read <name>  read one topic note
   /run <task>          run a one-shot agent task`
 

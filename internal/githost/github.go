@@ -215,23 +215,32 @@ func (g *GitHub) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 	return out, nil
 }
 
-// listPRsInvolvingMe calls the GitHub Search API for every open PR
-// the authenticated user is involved in (authored, assigned to,
-// requested as reviewer, or @-mentioned). Used when neither an
-// explicit repo list nor GOON_REVIEW_REPOS is set.
-//
-// One API call returns up to 100 PRs across every repo the token
-// can see — much cheaper than calling /pulls per-repo when the user
-// has many repos. Cost is capped to one page; if a user has >100
-// open PRs they should narrow with GOON_REVIEW_REPOS anyway.
-//
-// The /search/issues response uses a different schema than /pulls —
-// no `head.ref` field, and the repo URL has to be derived from
-// `repository_url`. We extract the slug from that URL so the
-// returned PR.Repo matches what /review and /approve expect.
+// listPRsInvolvingMe returns every open PR the authenticated user is
+// involved in (authored, assigned, requested as reviewer, or
+// @-mentioned). Used when neither an explicit repo list nor
+// GOON_REVIEW_REPOS is set.
 func (g *GitHub) listPRsInvolvingMe(ctx context.Context) ([]PR, error) {
-	// is:pr is:open archived:false involves:@me sort:updated-desc
-	q := url.QueryEscape("is:pr is:open archived:false involves:@me")
+	return g.searchPRs(ctx, "is:pr is:open archived:false involves:@me")
+}
+
+// ReviewRequestedPRs implements the ReviewRequester interface: every
+// open PR across every repo the token can see where the authenticated
+// user is a requested reviewer. One Search API call covers all repos.
+func (g *GitHub) ReviewRequestedPRs(ctx context.Context) ([]PR, error) {
+	return g.searchPRs(ctx, "is:pr is:open archived:false review-requested:@me")
+}
+
+// searchPRs runs a GitHub issue-search query and maps the results into
+// PR descriptors.
+//
+// The /search/issues response uses a different schema than /pulls — no
+// `head.ref` field, and the repo URL has to be derived from
+// `repository_url`. We extract the slug from that URL so the returned
+// PR.Repo matches what GetPRDetails / CommentPR expect. Cost is capped
+// to one page (100 results); a user with more should narrow the set
+// with GOON_REVIEW_REPOS.
+func (g *GitHub) searchPRs(ctx context.Context, query string) ([]PR, error) {
+	q := url.QueryEscape(query)
 	api := fmt.Sprintf("%s/search/issues?q=%s&per_page=100&sort=updated&order=desc", g.APIURL, q)
 	raw, err := g.do(ctx, http.MethodGet, api, nil)
 	if err != nil {
@@ -276,11 +285,87 @@ func (g *GitHub) listPRsInvolvingMe(ctx context.Context) ([]PR, error) {
 			Body:   it.Body,
 			Repo:   slug,
 			// Branch (head.ref) isn't returned by the search API.
-			// /review fetches full detail via GetPRDetails so the
-			// branch comes back there.
+			// GetPRDetails fills it in when the diff is fetched.
 		})
 	}
 	return out, nil
+}
+
+// Notifications implements the Notifier interface. It reads the
+// authenticated user's unread notification inbox (GET /notifications)
+// and keeps only review requests and @-mentions — the items that need a
+// human response. Requires the token to carry the `notifications` (or
+// classic `repo`) scope; without it GitHub returns 403 and the error is
+// surfaced to the caller so it can degrade gracefully.
+func (g *GitHub) Notifications(ctx context.Context) ([]Notification, error) {
+	raw, err := g.do(ctx, http.MethodGet, g.APIURL+"/notifications?all=false&per_page=50", nil)
+	if err != nil {
+		return nil, fmt.Errorf("github notifications: %w", err)
+	}
+	var items []struct {
+		ID        string    `json:"id"`
+		Reason    string    `json:"reason"`
+		UpdatedAt time.Time `json:"updated_at"`
+		Subject   struct {
+			Title string `json:"title"`
+			URL   string `json:"url"`
+			Type  string `json:"type"`
+		} `json:"subject"`
+		Repository struct {
+			FullName string `json:"full_name"`
+		} `json:"repository"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("github notifications decode: %w", err)
+	}
+	out := []Notification{}
+	for _, it := range items {
+		kind := ""
+		switch it.Reason {
+		case "review_requested":
+			kind = "review_requested"
+		case "mention", "team_mention":
+			kind = "mention"
+		default:
+			continue
+		}
+		out = append(out, Notification{
+			ID:        it.ID,
+			Kind:      kind,
+			Title:     it.Subject.Title,
+			Repo:      it.Repository.FullName,
+			URL:       g.notificationHTMLURL(it.Subject.URL),
+			Reason:    it.Reason,
+			UpdatedAt: it.UpdatedAt,
+		})
+	}
+	return out, nil
+}
+
+// notificationHTMLURL best-effort converts a GitHub API subject URL
+// (".../repos/o/n/pulls/42") into a browser URL (".../o/n/pull/42").
+// Returns "" when the shape is unrecognised — a missing link is fine,
+// the repo + title still identify the item.
+func (g *GitHub) notificationHTMLURL(apiURL string) string {
+	if apiURL == "" {
+		return ""
+	}
+	i := strings.Index(apiURL, "/repos/")
+	if i < 0 {
+		return ""
+	}
+	var base string
+	switch {
+	case g.APIURL == "https://api.github.com":
+		base = "https://github.com"
+	case strings.HasSuffix(g.APIURL, "/api/v3"):
+		base = strings.TrimSuffix(g.APIURL, "/api/v3")
+	default:
+		return ""
+	}
+	path := apiURL[i+len("/repos/"):] // "o/n/pulls/42"
+	path = strings.Replace(path, "/pulls/", "/pull/", 1)
+	return base + "/" + path
 }
 
 // GetPRDetails returns the PR + the unified diff body (via Accept:

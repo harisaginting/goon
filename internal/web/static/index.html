@@ -1,45 +1,66 @@
 <!doctype html>
-<html lang="en" class="h-full">
+<html lang="en" class="h-full dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>goon — dashboard</title>
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
-<meta name="theme-color" content="#0d1117">
+<meta name="theme-color" content="#09090B">
 <meta property="og:title" content="goon — autonomous engineer">
 <meta property="og:image" content="/logo.svg">
 <meta property="og:type" content="website">
 
 <!-- Tailwind via Play CDN. Single-binary "zero deps" applies to the Go
      build; the in-browser stylesheet is cached aggressively and the
-     page degrades gracefully (functional, unstyled) when offline. -->
+     page degrades gracefully (functional, unstyled) when offline.
+
+     Palette ─ dark-by-default, intentional two-tone:
+       primary / accent  → Neon Purple #A855F7  (brand mark, nav highlight,
+                                                  active states, links, focus)
+       highlight          → Vibrant Amber #F59E0B  (CTAs, pending count badge,
+                                                    approval buttons — the
+                                                    "look at this" colour, used
+                                                    sparingly so it stays loud)
+       surface            → Obsidian Black #09090B family  (background layers)
+       muted              → Cool Grey #94A3B8  (secondary text)
+       text               → Pure White #FFFFFF  (primary text)
+  -->
 <script src="https://cdn.tailwindcss.com?plugins=forms,typography"></script>
 <script>
   tailwind.config = {
-    darkMode: 'media',
+    darkMode: 'class',
     theme: {
       extend: {
         colors: {
           accent: {
-            DEFAULT: '#58a6ff',
-            soft:    '#1f6feb22',
-            ring:    '#58a6ff66',
+            DEFAULT: '#A855F7',   // Neon Purple — the brand / primary
+            soft:    '#A855F71F',  // ~12% alpha for soft fills
+            ring:    '#A855F766',  // 40% alpha for focus rings
+            strong:  '#C084FC',    // lifted variant for hover states
+          },
+          highlight: {
+            DEFAULT: '#F59E0B',   // Vibrant Amber — high-attention accent
+            soft:    '#F59E0B1F',  // soft amber wash for callouts
+            ring:    '#F59E0B66',  // focus ring on CTAs
           },
           surface: {
-            DEFAULT: '#0d1117',
-            raised:  '#161b22',
-            sunken:  '#0a0d12',
-            border:  '#21262d',
+            DEFAULT: '#09090B',   // Obsidian Black — page background
+            raised:  '#131318',   // cards / sidebar / panels (one step up)
+            sunken:  '#050507',   // inputs / sunken wells (one step down)
+            border:  '#27272D',   // hairlines (~10% white-on-obsidian)
           },
+          muted: '#94A3B8',
         },
         fontFamily: {
           sans: ['Inter', 'ui-sans-serif', 'system-ui', '-apple-system', 'Segoe UI', 'Roboto', 'sans-serif'],
           mono: ['ui-monospace', 'SF Mono', 'JetBrains Mono', 'Menlo', 'Consolas', 'monospace'],
         },
         boxShadow: {
-          'card': '0 1px 2px 0 rgb(0 0 0 / 0.04), 0 1px 3px 0 rgb(0 0 0 / 0.04)',
-          'lift': '0 4px 12px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.04)',
-          'glow': '0 0 0 4px rgb(88 166 255 / 0.15)',
+          'card':  '0 1px 2px 0 rgb(0 0 0 / 0.35), 0 1px 3px 0 rgb(0 0 0 / 0.25)',
+          'lift':  '0 4px 16px -2px rgb(0 0 0 / 0.45), 0 2px 6px -2px rgb(0 0 0 / 0.30)',
+          'glow':  '0 0 0 4px rgb(168 85 247 / 0.20)',   // purple focus glow
+          'glow-amber': '0 0 0 4px rgb(245 158 11 / 0.22)', // amber CTA glow
+          'neon':  '0 0 18px -2px rgb(168 85 247 / 0.55)',  // primary brand glow
         },
         animation: {
           'fade-in':    'fadeIn 200ms ease-out both',
@@ -99,46 +120,68 @@
   })();
 </script>
 <style>
-  :root { color-scheme: light dark; }
+  :root { color-scheme: dark; }
   body { -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
 
-  /* Subtle gradient on page background — light enough to feel modern,
-     not so loud it competes with content. */
-  html.dark, html:not(.dark) body { background-attachment: fixed; }
-  html.dark body { background-image: radial-gradient(ellipse at top, #161b2240 0%, transparent 70%); }
+  /* Layered radial gradients on obsidian — gives the page a sense of
+     depth without competing with content. Purple top-left for brand
+     warmth, amber bottom-right as a subtle "look down here" cue. */
+  html.dark body, html body {
+    background-attachment: fixed;
+    background-image:
+      radial-gradient(ellipse 60% 50% at 12% 0%,  rgba(168,85,247,0.10) 0%, transparent 60%),
+      radial-gradient(ellipse 50% 40% at 90% 100%, rgba(245,158,11,0.07) 0%, transparent 65%);
+  }
 
-  /* Custom scrollbars. */
+  /* Custom scrollbars — translucent grey on obsidian, purple on hover. */
   .scrollbar-thin::-webkit-scrollbar { width: 10px; height: 10px; }
-  .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(120,128,148,0.18); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
-  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(120,128,148,0.32); background-clip: padding-box; border: 2px solid transparent; }
+  .scrollbar-thin::-webkit-scrollbar-thumb { background: rgba(148, 163, 184, 0.18); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover { background: rgba(168, 85, 247, 0.45); background-clip: padding-box; border: 2px solid transparent; }
   .scrollbar-thin::-webkit-scrollbar-track { background: transparent; }
+
+  /* Selection — purple wash so it feels part of the brand. */
+  ::selection { background: rgba(168, 85, 247, 0.35); color: #FFFFFF; }
 
   /* htmx loading indicator. */
   .htmx-indicator { opacity: 0; transition: opacity 200ms; }
   .htmx-request .htmx-indicator, .htmx-request.htmx-indicator { opacity: 1; }
 
-  /* Tab active state via aria-current. */
+  /* Tab active state via aria-current — neon purple, no fallback. */
   [aria-current="page"] {
-    color: #58a6ff !important;
-    border-bottom-color: #58a6ff !important;
-  }
-  @media (prefers-color-scheme: dark) {
-    [aria-current="page"] { color: #79c0ff !important; border-bottom-color: #79c0ff !important; }
+    color: #A855F7 !important;
+    border-bottom-color: #A855F7 !important;
   }
 
-  /* Status dot pulse for "running". */
+  /* Active sidebar nav row — soft purple wash + amber accent bar on the
+     left so the user can spot which tab they're on at a glance. */
+  .page-nav[aria-current="page"] {
+    background: rgba(168, 85, 247, 0.10);
+    color: #FFFFFF !important;
+    border-bottom-color: transparent !important;
+    box-shadow: inset 3px 0 0 0 #A855F7;
+  }
+
+  /* Status dot pulse for "running" — uses currentColor so we can paint
+     it amber/emerald/grey depending on daemon state. */
   .pulse-dot { animation: pulseDot 2s ease-in-out infinite; }
   @keyframes pulseDot { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.55; transform: scale(1.15); } }
 
-  /* Loading skeleton — neutral shimmering bar. */
+  /* Neon brand glow — applied to the header logo when the daemon is
+     active. JS toggles .brand-live on the <span> wrapping the logo. */
+  .brand-live {
+    box-shadow: 0 0 14px -2px rgba(168, 85, 247, 0.65), inset 0 0 0 1px rgba(168, 85, 247, 0.35);
+  }
+
+  /* Loading skeleton — shimmer tinted with the brand purple so even
+     "nothing loaded yet" looks intentional. */
   .skel {
     background: linear-gradient(90deg,
-      rgba(120,128,148,0.10) 25%,
-      rgba(120,128,148,0.18) 37%,
-      rgba(120,128,148,0.10) 63%);
+      rgba(148, 163, 184, 0.06) 25%,
+      rgba(168, 85, 247, 0.18) 37%,
+      rgba(148, 163, 184, 0.06) 63%);
     background-size: 400% 100%;
     animation: shimmer 1.6s linear infinite;
-    border-radius: 4px;
+    border-radius: 6px;
   }
   @keyframes shimmer { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 
@@ -152,19 +195,31 @@
   .cmdk-overlay { animation: fadeIn 120ms ease-out both; }
   .cmdk-panel   { animation: slideUp 200ms cubic-bezier(0.16, 1, 0.3, 1) both; }
 
-  /* Kbd visual. */
+  /* Keyboard chip visual — soft white on obsidian, looks like a tiny
+     physical key. */
   kbd {
     display: inline-flex; align-items: center; justify-content: center;
     min-width: 1.5em; height: 1.5em; padding: 0 0.35em;
-    border: 1px solid rgba(120, 128, 148, 0.3);
+    border: 1px solid rgba(148, 163, 184, 0.30);
     border-bottom-width: 2px;
     border-radius: 4px;
     font: 0.72rem ui-monospace, "SF Mono", Menlo, monospace;
     background: rgba(255, 255, 255, 0.04);
-    color: inherit;
+    color: #FFFFFF;
   }
 
-  /* Smooth swap of tab content. */
+  /* CTA glow — amber outline that pulses gently on the most important
+     button on the page (e.g. an unanswered approval gate). Class is
+     opt-in via .cta-glow so it stays scarce; if it's on three things
+     at once it stops feeling special. */
+  .cta-glow {
+    animation: ctaGlow 2.4s ease-in-out infinite;
+  }
+  @keyframes ctaGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.55), 0 6px 14px -4px rgba(245, 158, 11, 0.45); }
+    50%      { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0.00), 0 6px 18px -4px rgba(245, 158, 11, 0.65); }
+  }
+
   /* Page transition — sibling sections fade in on first reveal. */
   main#main section.page:not(.hidden) > * { animation: fadeIn 180ms ease-out both; }
 
@@ -173,7 +228,8 @@
 </style>
 </head>
 
-<body class="h-full bg-white text-gray-900 dark:bg-surface dark:text-gray-100 font-sans selection:bg-accent/30 selection:text-gray-900 dark:selection:text-white"
+<!-- dark mode is the only mode — palette is dark by design -->
+<body class="h-full bg-surface text-white font-sans selection:bg-accent/30 selection:text-white"
       hx-ext="morph">
 
 <!-- ===== Layout ==========================================================
@@ -186,33 +242,36 @@
      content on first reveal via hx-trigger="reveal once".
 ============================================================================ -->
 
-<!-- Slim top header — brand + global ⌘K + docs. Persistent across pages. -->
-<header class="sticky top-0 z-30 border-b border-gray-200 dark:border-surface-border bg-white/85 dark:bg-surface-raised/85 backdrop-blur-md">
+<!-- Slim top header — brand + global ⌘K + docs. Persistent across pages.
+     bg uses a slight purple tint on top of surface-raised to lift it
+     visually off the page; the backdrop-blur softens scrolling content
+     behind it. -->
+<header class="sticky top-0 z-30 border-b border-surface-border bg-surface-raised/80 backdrop-blur-md">
   <div class="px-4 lg:px-6 flex items-center gap-3 h-14">
     <!-- Mobile sidebar toggle. Hidden on lg+ where sidebar is always visible. -->
-    <button id="nav-toggle" class="lg:hidden p-1.5 rounded-md text-gray-500 hover:text-accent hover:bg-accent-soft transition" aria-label="Toggle navigation">
+    <button id="nav-toggle" class="lg:hidden p-1.5 rounded-md text-muted hover:text-accent hover:bg-accent-soft transition" aria-label="Toggle navigation">
       <svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
     </button>
 
     <a href="/app" class="flex items-center gap-2 font-semibold tracking-tight group" aria-label="goon home">
-      <span class="grid place-items-center h-7 w-7 rounded-md bg-gradient-to-br from-accent/30 to-accent/10 text-accent group-hover:from-accent/40 transition">
-        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <span id="brand-mark" class="grid place-items-center h-8 w-8 rounded-lg bg-gradient-to-br from-accent/35 via-accent/15 to-transparent text-accent ring-1 ring-accent/30 group-hover:from-accent/50 group-hover:shadow-neon transition">
+        <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
           <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
         </svg>
       </span>
-      <span class="text-[15px]">goon</span>
-      <span class="hidden md:inline text-xs font-normal text-gray-500">autonomous engineer</span>
+      <span class="text-[15px] text-white">goon</span>
+      <span class="hidden md:inline text-xs font-normal text-muted">autonomous engineer</span>
     </a>
 
     <div class="flex-1"></div>
 
-    <button id="cmdk-open" class="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 border border-gray-200 dark:border-surface-border bg-white dark:bg-surface hover:border-accent/40 hover:text-accent transition" aria-label="Open command palette">
+    <button id="cmdk-open" class="hidden md:inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs text-muted border border-surface-border bg-surface hover:border-accent/60 hover:text-white hover:shadow-glow transition" aria-label="Open command palette">
       <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
       <span>Search</span>
       <span class="flex items-center gap-0.5 ml-2"><kbd>⌘</kbd><kbd>K</kbd></span>
     </button>
 
-    <a href="/docs" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-gray-500 dark:text-gray-400 hover:text-accent hover:bg-accent-soft transition" title="Open docs in new tab">
+    <a href="/docs" target="_blank" rel="noopener" class="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-xs text-muted hover:text-accent hover:bg-accent-soft transition" title="Open docs in new tab">
       <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>
       <span class="hidden sm:inline">docs</span>
     </a>
@@ -226,88 +285,98 @@
 <!-- Two-column shell: aside + main. On mobile the aside slides over. -->
 <div class="flex min-h-[calc(100vh-3.5rem)]">
 
-  <!-- ===== Sidebar ========================================================= -->
-  <aside id="sidebar" class="hidden lg:flex flex-col w-60 shrink-0 border-r border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40">
-    <!-- Primary nav. Six items: Questions / Workflows / Tickets / PRs /
-         Chat / Memory. Ordered by attention priority (Questions blocks
-         workflows; Workflows is the live thing goon is doing; Tickets
-         is the board mirror; PRs is the review queue). -->
+  <!-- ===== Sidebar =========================================================
+       Sunken obsidian rail with a hairline right border. Active-row
+       styling is in the global stylesheet (.page-nav[aria-current])
+       so it shows a left purple bar + soft purple wash — like a
+       Discord/Linear-style nav. -->
+  <aside id="sidebar" class="hidden lg:flex flex-col w-60 shrink-0 border-r border-surface-border bg-surface-sunken/60">
+    <!-- Primary nav. Eight items grouped into three sections by goal:
+         Inbox = "what's blocking", Conversation = "I want to talk",
+         Workspace = "I want to poke at files". -->
     <nav class="px-3 py-4 space-y-0.5" role="tablist" aria-label="Sections">
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="dashboard">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12 L12 4 L21 12"/><path d="M5 10 V20 H10 V14 H14 V20 H19 V10"/></svg>
         <span class="flex-1">Home</span>
       </button>
 
-      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Inbox</div>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-muted/70">Inbox</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" aria-current="page" data-page-target="questions">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
         <span class="flex-1">Questions</span>
-        <span data-pending-count class="hidden text-[10px] font-mono rounded-full bg-amber-500/20 text-amber-700 dark:text-amber-400 px-1.5 py-0.5"></span>
+        <!-- Amber pill — high-attention because pending questions block
+             a workflow. JS shows it when count > 0. -->
+        <span data-pending-count class="hidden text-[10px] font-mono font-semibold rounded-full bg-highlight text-surface px-1.5 py-0.5 shadow-glow-amber"></span>
       </button>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="workflows">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         <span class="flex-1">Workflows</span>
       </button>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="tickets">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
         <span class="flex-1">Tickets</span>
       </button>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="prs">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
         <span class="flex-1">Pull requests</span>
       </button>
 
-      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Conversation</div>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-muted/70">Conversation</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="chat">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
         <span class="flex-1">Chat</span>
       </button>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="memory">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
         <span class="flex-1">Memory</span>
       </button>
 
-      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-gray-400">Workspace</div>
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+      <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-muted/70">Workspace</div>
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="files">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         <span class="flex-1">Files</span>
       </button>
     </nav>
 
-    <!-- Live system status — auto-updates via SSE statusChanged event -->
-    <div class="px-4 py-3 mx-3 my-2 rounded-md bg-white dark:bg-surface-raised border border-gray-200 dark:border-surface-border"
+    <!-- Live system status — auto-updates via SSE statusChanged event.
+         The fragment paints the pulse dot purple when running, grey
+         when paused, amber when there's an unanswered gate. -->
+    <div class="px-4 py-3 mx-3 my-2 rounded-lg bg-surface-raised border border-surface-border shadow-card"
          hx-get="/fragments/status-pill" hx-trigger="load, statusChanged from:body">
-      <div class="text-xs text-gray-400">Loading status…</div>
+      <div class="space-y-1.5">
+        <div class="skel h-2 w-20"></div>
+        <div class="skel h-1.5 w-14"></div>
+      </div>
     </div>
 
     <!-- Quick actions — one-tap board refresh + pause/resume -->
     <div class="px-3 pb-3 space-y-1">
       <button type="button" hx-post="/api/refresh" hx-target="#sidebar-action-result" hx-swap="innerHTML"
-              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition">
+              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-muted hover:bg-surface-raised hover:text-accent transition">
         <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
         <span>Refresh from board</span>
       </button>
       <button type="button" onclick="goonDaemonToggle()"
               id="sidebar-pause-resume"
-              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition">
+              class="w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-xs text-muted hover:bg-surface-raised hover:text-accent transition">
         <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/></svg>
         <span>Pause daemon</span>
       </button>
-      <div id="sidebar-action-result" class="text-[11px] text-gray-500 px-3"></div>
+      <div id="sidebar-action-result" class="text-[11px] text-muted px-3"></div>
     </div>
 
     <!-- Spacer + Setup gear at the bottom -->
     <div class="flex-1"></div>
-    <div class="px-3 pb-4 border-t border-gray-200 dark:border-surface-border pt-3">
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-gray-600 dark:text-gray-400 hover:bg-white dark:hover:bg-surface-raised hover:text-accent transition"
+    <div class="px-3 pb-4 border-t border-surface-border pt-3">
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted hover:bg-surface-raised hover:text-accent transition"
               role="tab" data-page-target="setup">
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         <span class="flex-1">Setup</span>
@@ -316,65 +385,77 @@
   </aside>
 
   <!-- Mobile sidebar backdrop. Visible only when #sidebar has .mobile-open. -->
-  <div id="sidebar-backdrop" class="hidden fixed inset-0 z-20 bg-gray-900/40 lg:hidden" onclick="closeMobileSidebar()"></div>
+  <div id="sidebar-backdrop" class="hidden fixed inset-0 z-20 bg-black/70 backdrop-blur-sm lg:hidden" onclick="closeMobileSidebar()"></div>
 
-  <!-- ===== Main content =================================================== -->
-  <!--
-    One <section> per page. Sibling, never re-fetched on tab switch.
-    First reveal triggers the hx-get exactly once (hx-trigger="reveal once").
-    Subsequent switches are pure CSS class toggles — instant, no scroll loss.
-  -->
+  <!-- ===== Main content ===================================================
+       One <section> per page. Sibling, never re-fetched on tab switch.
+       First reveal triggers the hx-get exactly once (hx-trigger="reveal
+       once"). Subsequent switches are pure CSS class toggles — instant,
+       no scroll loss.
+
+       Each empty placeholder is a shimmer skeleton (not plain text)
+       so the first paint feels like real work is happening, not a
+       blank tab. Three bars roughly approximating a card layout — the
+       eye expects content, not a "Loading…" label. -->
   <main id="main" class="flex-1 min-w-0 px-4 lg:px-8 py-6">
+    <template id="tpl-skeleton">
+      <div class="space-y-3">
+        <div class="skel h-4 w-40"></div>
+        <div class="skel h-24 w-full"></div>
+        <div class="skel h-3 w-2/3"></div>
+        <div class="skel h-3 w-1/2"></div>
+      </div>
+    </template>
     <section data-page="dashboard" class="page" data-loaded="false"
              hx-get="/fragments/tab-dashboard" hx-trigger="reveal once, questionsChanged from:body, workflowsChanged from:body, ticketsChanged from:body, statusChanged from:body" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading dashboard…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="questions" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-questions" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading questions…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="workflows" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-workflows" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading workflows…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="tickets" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-tickets" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading tickets…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="prs" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-prs" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading pull requests…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="chat" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-chat" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading chat…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="memory" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-memory" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading memory…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="files" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-files" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading files…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
     <section data-page="setup" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-config" hx-trigger="reveal once" hx-swap="innerHTML">
-      <div class="text-sm text-gray-500">Loading setup…</div>
+      <div class="space-y-3"><div class="skel h-4 w-40"></div><div class="skel h-24 w-full"></div><div class="skel h-3 w-2/3"></div><div class="skel h-3 w-1/2"></div></div>
     </section>
   </main>
 </div>
 
 <!-- ===== Footer ========================================================== -->
-<footer class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 mt-12 text-xs text-gray-500 border-t border-gray-200 dark:border-surface-border">
+<footer class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 mt-12 text-xs text-muted border-t border-surface-border">
   <div class="flex flex-wrap items-center gap-4 justify-between">
     <div>
       same memory file backs the CLI · state at
-      <code class="font-mono">./storage/memory.json</code>
+      <code class="font-mono text-accent/80">./storage/memory.json</code>
     </div>
     <div class="flex items-center gap-4">
       <a href="/docs" class="hover:text-accent transition">documentation</a>
       <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener" class="hover:text-accent transition">source</a>
-      <span class="text-gray-400 dark:text-gray-600">·</span>
+      <span class="text-muted/50">·</span>
       <span class="font-mono text-[10px]">⌘K to search</span>
     </div>
   </div>
@@ -385,17 +466,17 @@
 
 <!-- ===== Command palette ================================================= -->
 <div id="cmdk" class="hidden fixed inset-0 z-50">
-  <div class="cmdk-overlay absolute inset-0 bg-gray-900/40 dark:bg-black/60 backdrop-blur-sm" onclick="closeCmdk()"></div>
-  <div class="cmdk-panel absolute top-24 left-1/2 -translate-x-1/2 w-full max-w-xl rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-2xl overflow-hidden">
-    <div class="flex items-center gap-2 px-4 py-3 border-b border-gray-200 dark:border-surface-border">
-      <svg class="h-4 w-4 text-gray-400" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
+  <div class="cmdk-overlay absolute inset-0 bg-black/70 backdrop-blur-sm" onclick="closeCmdk()"></div>
+  <div class="cmdk-panel absolute top-24 left-1/2 -translate-x-1/2 w-full max-w-xl rounded-xl border border-surface-border bg-surface-raised shadow-lift ring-1 ring-accent/20 overflow-hidden">
+    <div class="flex items-center gap-2 px-4 py-3 border-b border-surface-border">
+      <svg class="h-4 w-4 text-accent" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M9 3.5a5.5 5.5 0 100 11 5.5 5.5 0 000-11zM2 9a7 7 0 1112.452 4.391l3.328 3.329a.75.75 0 11-1.06 1.06l-3.329-3.328A7 7 0 012 9z" clip-rule="evenodd" /></svg>
       <input id="cmdk-input" type="text" placeholder="Search commands, tabs, tickets…"
              autocomplete="off" autocorrect="off" spellcheck="false"
-             class="flex-1 bg-transparent text-sm focus:outline-none placeholder:text-gray-400">
+             class="flex-1 bg-transparent text-sm text-white focus:outline-none placeholder:text-muted/60">
       <kbd>esc</kbd>
     </div>
     <ul id="cmdk-results" class="max-h-80 overflow-y-auto scrollbar-thin py-2" role="listbox"></ul>
-    <div class="px-4 py-2 border-t border-gray-200 dark:border-surface-border bg-gray-50 dark:bg-surface-sunken text-xs text-gray-500 flex items-center gap-3">
+    <div class="px-4 py-2 border-t border-surface-border bg-surface-sunken text-xs text-muted flex items-center gap-3">
       <span class="flex items-center gap-1"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
       <span class="flex items-center gap-1"><kbd>↵</kbd> open</span>
       <span class="flex items-center gap-1"><kbd>esc</kbd> close</span>
@@ -419,13 +500,14 @@
     document.querySelectorAll('main#main section.page').forEach(s => {
       s.classList.toggle('hidden', s.dataset.page !== name);
     });
+    // Active-row styling is driven by aria-current="page" + the global
+    // .page-nav[aria-current] rule in the stylesheet. We just flip the
+    // attribute — no per-class toggling — so the visual stays in sync
+    // with the CSS without us listing utility classes here.
     document.querySelectorAll('.page-nav').forEach(b => {
       const active = b.dataset.pageTarget === name;
-      b.toggleAttribute('aria-current', active);
-      b.classList.toggle('bg-white', active);
-      b.classList.toggle('dark:bg-surface-raised', active);
-      b.classList.toggle('text-accent', active);
-      b.classList.toggle('shadow-sm', active);
+      if (active) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
     });
     // First-time visit to this page: trigger the lazy load. htmx's
     // "reveal once" doesn't fire reliably on display:none → display:block,
@@ -582,13 +664,13 @@
     cmdkIdx = 0;
     const ul = document.getElementById('cmdk-results');
     if (results.length === 0) {
-      ul.innerHTML = '<li class="px-4 py-3 text-sm text-gray-500">no matches</li>';
+      ul.innerHTML = '<li class="px-4 py-3 text-sm text-muted">no matches</li>';
       return;
     }
     ul.innerHTML = results.map((a, i) => `
-      <li role="option" data-i="${i}" class="cmdk-item flex items-center justify-between px-4 py-2 cursor-pointer ${i === 0 ? 'bg-accent-soft text-accent' : 'hover:bg-gray-100 dark:hover:bg-gray-800/50'}">
+      <li role="option" data-i="${i}" class="cmdk-item flex items-center justify-between px-4 py-2 cursor-pointer ${i === 0 ? 'bg-accent-soft text-white' : 'text-muted hover:bg-surface-sunken hover:text-white'}">
         <span class="text-sm">${escapeHtml(a.label)}</span>
-        <span class="text-xs text-gray-400 font-mono">${escapeHtml(a.hint)}</span>
+        <span class="text-xs text-muted/70 font-mono">${escapeHtml(a.hint)}</span>
       </li>`).join('');
     ul.querySelectorAll('.cmdk-item').forEach((el) => {
       el.addEventListener('click', () => results[+el.dataset.i].run());
@@ -598,8 +680,13 @@
   function moveCmdk(i, results) {
     cmdkIdx = i;
     document.querySelectorAll('.cmdk-item').forEach((el, idx) => {
-      if (idx === i) el.classList.add('bg-accent-soft','text-accent');
-      else el.classList.remove('bg-accent-soft','text-accent');
+      if (idx === i) {
+        el.classList.add('bg-accent-soft','text-white');
+        el.classList.remove('text-muted','hover:bg-surface-sunken','hover:text-white');
+      } else {
+        el.classList.remove('bg-accent-soft','text-white');
+        el.classList.add('text-muted','hover:bg-surface-sunken','hover:text-white');
+      }
     });
   }
   document.getElementById('cmdk-input').addEventListener('input', (e) => renderCmdk(e.target.value));
@@ -617,12 +704,17 @@
   function escapeHtml(s) { return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
   // -------- Toast notifications ------------------------------------------
+  //
+  // Toasts live on the obsidian surface, so we wash them with a soft
+  // tint of their semantic colour and keep the border crisp. The "info"
+  // tone is purple — same as the brand — so neutral notifications feel
+  // part of the product, not generic.
   function toast(message, kind) {
     const tone = {
-      ok:    'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30',
-      err:   'bg-rose-500/10    text-rose-700    dark:text-rose-300    border-rose-500/30',
-      warn:  'bg-amber-500/10   text-amber-700   dark:text-amber-300   border-amber-500/30',
-      info:  'bg-sky-500/10     text-sky-700     dark:text-sky-300     border-sky-500/30',
+      ok:    'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+      err:   'bg-rose-500/15    text-rose-300    border-rose-500/40',
+      warn:  'bg-highlight/15   text-highlight   border-highlight/40',
+      info:  'bg-accent/15      text-accent      border-accent/40',
     }[kind || 'info'];
     const icon = { ok: '✓', err: '✗', warn: '⚠', info: 'ⓘ' }[kind || 'info'];
     const el = document.createElement('div');
@@ -634,6 +726,21 @@
       setTimeout(() => el.remove(), 280);
     }, 3200);
   }
+
+  // -------- Brand mark live state ----------------------------------------
+  //
+  // Add .brand-live to the header logo when the daemon is running so it
+  // gently glows purple. Off when paused. Matches the .pulse-dot
+  // semantics on the status pill — same fact, two visual surfaces.
+  function syncBrandLive() {
+    const pill = document.querySelector('[data-paused]');
+    const mark = document.getElementById('brand-mark');
+    if (!pill || !mark) return;
+    const running = pill.dataset.running === '1' && pill.dataset.paused !== '1';
+    mark.classList.toggle('brand-live', running);
+  }
+  document.body.addEventListener('statusChanged',  syncBrandLive);
+  document.body.addEventListener('htmx:afterSwap', syncBrandLive);
 
   // -------- Event → toast mapping ----------------------------------------
   //

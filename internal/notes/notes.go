@@ -15,9 +15,11 @@
 //     absolute paths.
 //   - Provider-agnostic. The contents are plain UTF-8 markdown — every LLM
 //     can read it without special tooling.
-//   - One file gets superpowers: PINNED.md, when present, is auto-included
+//   - One file gets superpowers: SOUL.md, when present, is auto-included
 //     in the agent's system prompt every run. That's how the agent
-//     "remembers" things without being told to look them up.
+//     "remembers" things without being told to look them up. (Legacy
+//     PINNED.md is still read transparently when SOUL.md is absent and
+//     auto-migrated on first seed — see Soul() and SeedSoulTemplate().)
 //
 // Storage location, in order of precedence:
 //
@@ -40,6 +42,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/harisaginting/goon/internal/storage"
 )
@@ -50,9 +53,26 @@ type Store struct {
 	dir string
 }
 
-// PinnedFilename is the special note auto-loaded into the agent's system
+// SoulFilename is the special note auto-loaded into the agent's system
 // prompt. Keep the name in one place so CLI + agent agree.
-const PinnedFilename = "PINNED.md"
+//
+// Renamed from PINNED.md → SOUL.md to make the file's purpose more
+// obvious to first-time users ("the soul of goon" / project conscience).
+// Existing PINNED.md files are still read transparently by Soul() and
+// auto-migrated to SOUL.md on the next SeedSoulTemplate() call so users
+// don't lose context across the rename.
+const SoulFilename = "SOUL.md"
+
+// legacySoulFilename is the pre-rename name we still recognise on disk.
+// Read paths fall back to it; Seed paths migrate it.
+const legacySoulFilename = "PINNED.md"
+
+// PinnedFilename is a deprecated alias for SoulFilename. Kept so any
+// out-of-tree callers (custom plugins, third-party scripts) keep
+// compiling through the rename. New code should use SoulFilename.
+//
+// Deprecated: use SoulFilename.
+const PinnedFilename = SoulFilename
 
 // New opens (and creates) a Store. When dir is empty it falls back to
 // $GOON_MEMORY_DIR, then <storage.Root()>/memory (i.e.
@@ -296,34 +316,46 @@ func (s *Store) Search(query string, maxHits int) ([]SearchHit, error) {
 	return hits, nil
 }
 
-// Pinned returns the contents of PINNED.md, or "" when the file is absent
+// Soul returns the contents of SOUL.md, or "" when the file is absent
 // or unreadable. Used by the agent's SystemPrompt to inject persistent
 // context into every LLM call.
 //
-// On case-sensitive filesystems (Linux ext4, macOS APFS-cs) a user who
-// creates `pinned.md` would otherwise get silent no-auto-load. We try the
-// canonical name first (fast path; works on case-insensitive volumes for
-// free) and fall back to a case-insensitive scan of the root if missing.
+// Backwards-compat: when SOUL.md is absent we also accept the pre-rename
+// PINNED.md so existing installs keep working without manual migration.
 //
-// Errors are deliberately swallowed: a missing pinned file is the common
+// On case-sensitive filesystems (Linux ext4, macOS APFS-cs) a user who
+// creates `soul.md` (any case) would otherwise get silent no-auto-load.
+// We try the canonical names first (fast path; works on case-insensitive
+// volumes for free) and fall back to a case-insensitive scan of the root
+// if missing.
+//
+// Errors are deliberately swallowed: a missing soul file is the common
 // case and shouldn't break the agent. A corrupt/locked file is best
-// reported via the dedicated Read("PINNED.md") path.
-func (s *Store) Pinned() string {
-	if body, err := s.Read(PinnedFilename); err == nil {
+// reported via the dedicated Read("SOUL.md") path.
+func (s *Store) Soul() string {
+	// Canonical name first.
+	if body, err := s.Read(SoulFilename); err == nil {
+		return strings.TrimSpace(body)
+	}
+	// Legacy name — read silently so users mid-migration aren't punished.
+	if body, err := s.Read(legacySoulFilename); err == nil {
 		return strings.TrimSpace(body)
 	}
 	// Fallback: case-insensitive scan of the root only (no recursion —
-	// the convention is PINNED.md sits at the top).
+	// the convention is SOUL.md sits at the top). Match BOTH names.
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return ""
 	}
-	wantLower := strings.ToLower(PinnedFilename)
+	wants := map[string]bool{
+		strings.ToLower(SoulFilename):       true,
+		strings.ToLower(legacySoulFilename): true,
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
 		}
-		if strings.ToLower(e.Name()) == wantLower {
+		if wants[strings.ToLower(e.Name())] {
 			body, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
 			if err != nil {
 				return ""
@@ -334,36 +366,179 @@ func (s *Store) Pinned() string {
 	return ""
 }
 
-// SeedPinnedTemplate writes a starter PINNED.md if none exists. Returns
-// (created, err) — created=false means the file was already there and was
-// left untouched (notes are precious, never overwrite without intent).
-func (s *Store) SeedPinnedTemplate() (bool, error) {
-	p, err := s.Resolve(PinnedFilename)
+// Pinned is a deprecated alias for Soul.
+//
+// Deprecated: use Soul.
+func (s *Store) Pinned() string { return s.Soul() }
+
+// SeedSoulTemplate writes a starter SOUL.md if none exists. Returns
+// (created, err) — created=false means the file was already there and
+// was left untouched (notes are precious, never overwrite without
+// intent).
+//
+// Backwards-compat: if a legacy PINNED.md is present and SOUL.md is not,
+// we rename PINNED.md → SOUL.md instead of seeding a fresh template.
+// This is the one-shot migration path; subsequent calls see SOUL.md and
+// leave it alone like any other already-seeded file.
+func (s *Store) SeedSoulTemplate() (bool, error) {
+	p, err := s.Resolve(SoulFilename)
 	if err != nil {
 		return false, err
 	}
 	if _, err := os.Stat(p); err == nil {
-		return false, nil // exists, leave it
+		return false, nil // SOUL.md already there
 	}
-	tpl := `# Pinned memory
-
-This file is automatically loaded into goon's system prompt every run, so
-anything you write here is visible to the agent on every task.
-
-Use it for facts that should always be top-of-mind:
-
-- Conventions for this codebase / org
-- Names of people, repos, services the agent should know about
-- "Don't do this" rules learned the hard way
-- Pointers to other notes worth reading on relevant tasks
-
-Other notes live alongside this file as ` + "`*.md`" + ` and the agent can
-read or write them with the memory_* tools. Edit this with:
-
-    goon memory edit PINNED.md
-`
-	if err := s.Write(PinnedFilename, tpl); err != nil {
+	// Auto-migrate the legacy file if present. Rename inside the same
+	// directory — same filesystem, atomic on POSIX.
+	legacyPath, lerr := s.Resolve(legacySoulFilename)
+	if lerr == nil {
+		if _, err := os.Stat(legacyPath); err == nil {
+			if err := os.Rename(legacyPath, p); err == nil {
+				return true, nil // migrated
+			}
+			// Rename failed — fall through to seeding a fresh template
+			// alongside the legacy file. Better than crashing.
+		}
+	}
+	if err := s.Write(SoulFilename, DefaultSoulTemplate); err != nil {
 		return false, err
 	}
 	return true, nil
 }
+
+// DefaultSoulTemplate is the starter SOUL.md body. Exported so the
+// migration helper (MergePersonalIntoSoul) can reuse the same body
+// when seeding a fresh file mid-migration.
+//
+// The template intentionally covers BOTH halves of "always-loaded
+// context" — character (how goon talks and decides) and project
+// knowledge (facts about this repo/org). They used to live in
+// separate files (personal.md + SOUL.md); a single file is simpler
+// to find, edit, and review.
+const DefaultSoulTemplate = `# SOUL.md — what goon should always remember
+
+This file is automatically loaded into goon's system prompt every run, so
+anything you write here is visible to the agent on every task. Two halves
+live here side-by-side — feel free to edit either.
+
+## Character
+
+How goon should talk and decide. Edit this to match how you want your
+co-pilot to behave.
+
+- Direct. Lead with the answer, then the reasoning. Don't bury the lede.
+- Plain English. No marketing tone, no "as an AI..." disclaimers, no apologies.
+- When you don't know, say so plainly and propose the next step.
+- When asked for an opinion on a tradeoff, give one. Pushback is fine.
+- Confirm before destructive actions (delete, force-push, merge).
+- Quote ticket KEYs and PR numbers verbatim — never paraphrase IDs.
+- Read REPOSITORY.md before deciding which repo a ticket touches.
+- Read HISTORY.md before retrying something that might already be solved.
+- After finishing a task, write what you learned via memory_* tools.
+
+## Project knowledge
+
+Facts about this codebase / org that should always be top-of-mind.
+Examples to delete + replace with your own:
+
+- Branch prefix is ` + "`feature/`" + `; never push to ` + "`main`" + ` directly.
+- ` + "`web/`" + ` is React + TypeScript; ` + "`api/`" + ` is Go + Postgres.
+- The prod DB lives in eu-west-1; never run migrations from a laptop.
+- Names of people, repos, services worth knowing.
+- "Don't do this" rules learned the hard way.
+
+Other notes live alongside this file as ` + "`*.md`" + ` and the agent reads
+or writes them with the memory_* tools. Edit this file with:
+
+    goon memory edit SOUL.md
+`
+
+// MergePersonalIntoSoul folds a pre-existing personal.md (the old
+// "character" file we used to keep separate) into SOUL.md. Designed
+// to run once during the boot sequence so users upgrading don't
+// silently lose their personality content.
+//
+// Behaviour:
+//
+//   - personal.md absent → no-op, no error.
+//   - SOUL.md absent → write a fresh SOUL.md whose body is the
+//     personal.md content under a "## Character" header + the default
+//     project-knowledge stub.
+//   - both present → prepend personal.md (under "## Character") at
+//     the top of SOUL.md, behind a clear migration banner.
+//   - After a successful merge → rename personal.md to personal.md.bak
+//     so users can sanity-check the migration before deleting the
+//     backup. We never destructively delete user content.
+//
+// Returns (merged, err); merged=true means the file was touched and
+// the user might want to review SOUL.md. Idempotent — once
+// personal.md is renamed to .bak, subsequent calls see no source
+// file and return (false, nil).
+func (s *Store) MergePersonalIntoSoul(personalPath string) (bool, error) {
+	if strings.TrimSpace(personalPath) == "" {
+		return false, nil
+	}
+	personalBody, err := os.ReadFile(personalPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("notes: read %s: %w", personalPath, err)
+	}
+	character := strings.TrimSpace(string(personalBody))
+	if character == "" {
+		// Empty personal.md is treated as "nothing to migrate."
+		// Rename it anyway so we don't re-check on every boot.
+		_ = os.Rename(personalPath, personalPath+".bak")
+		return false, nil
+	}
+
+	soulPath, err := s.Resolve(SoulFilename)
+	if err != nil {
+		return false, err
+	}
+
+	migrationBanner := "<!-- migrated from personal.md on " +
+		time.Now().Format("2006-01-02") +
+		" — see personal.md.bak for the original. -->\n"
+
+	var newBody string
+	if existing, readErr := os.ReadFile(soulPath); readErr == nil && len(strings.TrimSpace(string(existing))) > 0 {
+		// SOUL.md exists with content — prepend the character section
+		// behind a migration banner so the user can find the seam.
+		newBody = migrationBanner +
+			"\n## Character (migrated from personal.md)\n\n" +
+			character +
+			"\n\n---\n\n" +
+			string(existing)
+	} else {
+		// SOUL.md absent or empty — write a fresh file built from the
+		// character content + the default project-knowledge stub.
+		newBody = "# SOUL.md — what goon should always remember\n\n" +
+			migrationBanner +
+			"\n## Character (migrated from personal.md)\n\n" +
+			character +
+			"\n\n## Project knowledge\n\n" +
+			"_(Add facts about this codebase / org that should always be top-of-mind. " +
+			"See `goon memory edit SOUL.md`.)_\n"
+	}
+	if err := s.Write(SoulFilename, newBody); err != nil {
+		return false, err
+	}
+	// Rename personal.md so we don't re-merge on the next boot. Keep
+	// the .bak so the user can verify the migration landed cleanly.
+	if err := os.Rename(personalPath, personalPath+".bak"); err != nil {
+		// Don't return — the merge already succeeded. The next boot
+		// would re-trigger but the prepend would just duplicate the
+		// section, which is annoying but not destructive. Log via
+		// the caller (we deliberately don't import logx here to keep
+		// this package lean).
+		return true, fmt.Errorf("notes: merged personal.md but failed to rename original: %w", err)
+	}
+	return true, nil
+}
+
+// SeedPinnedTemplate is a deprecated alias for SeedSoulTemplate.
+//
+// Deprecated: use SeedSoulTemplate.
+func (s *Store) SeedPinnedTemplate() (bool, error) { return s.SeedSoulTemplate() }

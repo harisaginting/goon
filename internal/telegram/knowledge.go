@@ -11,7 +11,7 @@ import (
 )
 
 // cmdKnowledge renders goon's active-memory layer for the user:
-// PINNED.md body inline (full or capped) plus an index of every topic
+// SOUL.md body inline (full or capped) plus an index of every topic
 // note with a one-line headline. The user pulls a specific note's
 // full body via `/memory read <name>`.
 //
@@ -20,14 +20,14 @@ import (
 // the user can see what goon knows without asking a question first.
 func (b *Bot) cmdKnowledge(ctx context.Context, chatID int64) {
 	var sb strings.Builder
-	pinned := agentctx.Pinned("")
-	if strings.TrimSpace(pinned) != "" {
-		sb.WriteString("📌 PINNED.md (auto-loaded into every agent run):\n")
+	soul := agentctx.Soul("")
+	if strings.TrimSpace(soul) != "" {
+		sb.WriteString("📌 SOUL.md (auto-loaded into every agent run):\n")
 		sb.WriteString("─────────────────────────────────────────────\n")
-		sb.WriteString(strings.TrimSpace(pinned))
+		sb.WriteString(strings.TrimSpace(soul))
 		sb.WriteString("\n─────────────────────────────────────────────\n\n")
 	} else {
-		sb.WriteString("📌 PINNED.md: (empty — `goon memory edit PINNED.md` to seed it)\n\n")
+		sb.WriteString("📌 SOUL.md: (empty — `goon memory edit SOUL.md` to seed it)\n\n")
 	}
 	idx := agentctx.KnowledgeIndex("")
 	if len(idx) == 0 {

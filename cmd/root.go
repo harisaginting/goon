@@ -21,13 +21,15 @@ import (
 
 	"github.com/harisaginting/goon/internal/agent"
 	"github.com/harisaginting/goon/internal/executor"
+	"github.com/harisaginting/goon/internal/learnings"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/notes"
-	"github.com/harisaginting/goon/internal/personal"
+	"github.com/harisaginting/goon/internal/repository"
 	"github.com/harisaginting/goon/internal/safety"
 	"github.com/harisaginting/goon/internal/skills"
+	"github.com/harisaginting/goon/internal/storage"
 	"github.com/harisaginting/goon/internal/tools"
 )
 
@@ -52,19 +54,29 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	}
 	logx.Info("cli.start", "argv", argv)
 
-	// First-run seeds: write defaults for personal.md / PINNED.md /
-	// a few sample skills if they don't already exist. All three
-	// helpers are idempotent — won't clobber user edits — so calling
-	// them on every boot is fine and keeps the first-run experience
-	// "out of the box, has something to read" instead of "empty
-	// folders, what do I do".
-	if err := personal.SeedDefault(); err != nil {
-		logx.Warn("personal.seed_failed", "error", err.Error())
-	}
+	// First-run seeds — idempotent, safe to call on every boot.
+	//
+	// SOUL.md is the single always-loaded context file (character +
+	// project knowledge in one place). SeedSoulTemplate handles two
+	// one-shot migrations: legacy PINNED.md → SOUL.md, and the older
+	// personal.md → folded into SOUL.md under a "## Character" header
+	// (the merge call below). After migration the original
+	// personal.md is renamed to personal.md.bak so users can verify.
 	if store, err := notes.New(""); err == nil {
-		if _, err := store.SeedPinnedTemplate(); err != nil {
+		// Order matters: merge the legacy personal.md FIRST so its
+		// content lands in a fresh SOUL.md (no duplicate-seed). If
+		// SeedSoulTemplate ran first it would write the default
+		// template and the merge would then prepend on top, which
+		// is fine but produces an awkward stub at the bottom.
+		if _, err := store.MergePersonalIntoSoul(storage.Path("personal.md")); err != nil {
+			logx.Warn("notes.merge_personal_failed", "error", err.Error())
+		}
+		if _, err := store.SeedSoulTemplate(); err != nil {
 			logx.Warn("notes.seed_failed", "error", err.Error())
 		}
+	}
+	if _, err := repository.SeedDefault(); err != nil {
+		logx.Warn("repository.seed_failed", "error", err.Error())
 	}
 	if err := skills.SeedDefaults(); err != nil {
 		logx.Warn("skills.seed_failed", "error", err.Error())
@@ -110,6 +122,10 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runMemory(ctx, sargs, stdout, stderr, stdin)
 		case "repo":
 			return runRepo(ctx, sargs, stdout, stderr)
+		case "review-prs":
+			return runReviewPRs(ctx, sargs, stdout, stderr)
+		case "notifications":
+			return runNotifications(ctx, sargs, stdout, stderr)
 		case "pause":
 			return runPause(ctx, sargs, stdout, stderr)
 		case "resume":
@@ -214,7 +230,47 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	return ag.Run(ctx, input)
+	runErr := ag.Run(ctx, input)
+
+	// Self-improvement loop. Runs after every one-shot agent invocation
+	// regardless of success/failure — HISTORY.md records both, and the
+	// distillation pass might learn something even from a failed run.
+	//
+	// Skipped in --explain mode because the agent never actually ran:
+	// nothing happened, nothing to learn. Also skipped when the user
+	// aborted via SIGINT (ctx already cancelled), to avoid surprising
+	// them with extra LLM calls after Ctrl-C.
+	if mode != executor.ModeExplain && ctx.Err() == nil {
+		outcome := "ok"
+		if runErr != nil {
+			outcome = "failed: " + runErr.Error()
+		}
+		// Use a fresh context with a short cap so a misbehaving
+		// distillation can't hang the CLI. Inherit cancellation
+		// signals from the parent.
+		learnCtx, learnCancel := signalAwareContext(ctx)
+		_ = learnings.Capture(learnCtx, learnings.Options{
+			Task:     input,
+			Outcome:  outcome,
+			LLM:      prov,
+			Tools:    reg,
+			Executor: exec,
+			Memory:   mem,
+			Stdout:   stdout,
+			Stderr:   stderr,
+			Debug:    *debugFlag,
+		})
+		learnCancel()
+	}
+	return runErr
+}
+
+// signalAwareContext returns a child context that inherits the
+// parent's signal-based cancellation (so Ctrl-C still works during
+// the learning pass) but starts with a fresh deadline-free state.
+// Caller MUST call the returned cancel to release resources.
+func signalAwareContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithCancel(parent)
 }
 
 // printUsage writes goon's command surface in a stable order. Both the
@@ -236,6 +292,8 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  goon workflow <show|path|init|edit|hooks>           customize the per-ticket workflow")
 	fmt.Fprintln(w, "  goon memory <list|read|write|append|search|edit|delete|path|init>  manage markdown notes")
 	fmt.Fprintln(w, "  goon repo <list|forget <project>|clear>             manage learned project→repo mappings")
+	fmt.Fprintln(w, "  goon review-prs [--watch] [--telegram] [--all]      draft AI reviews for PRs awaiting you")
+	fmt.Fprintln(w, "  goon notifications [--watch] [--telegram] [--all]   forward git review-requests + mentions")
 	fmt.Fprintln(w, "  goon logs [--tail=N|--follow|--clear|--path]        browse the structured log file")
 	fmt.Fprintln(w, "  goon config <show|get|set|unset|path|edit>          ~/.config/goon/.env")
 	fmt.Fprintln(w, "  goon update [<ref>]                                 rebuild from upstream (needs git + go)")
@@ -272,7 +330,7 @@ func splitSubcommand(argv []string) (string, []string) {
 		return "", nil
 	}
 	switch first {
-	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory", "repo", "pause", "resume":
+	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory", "repo", "pause", "resume", "review-prs", "notifications":
 		return first, argv[1:]
 	}
 	return "", nil

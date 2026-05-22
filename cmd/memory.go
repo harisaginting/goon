@@ -22,7 +22,7 @@ import (
 //	goon memory edit <name>           open note in $EDITOR (creates if missing)
 //	goon memory delete <name>         remove a note (asks for confirmation)
 //	goon memory path                  print the memory directory
-//	goon memory init                  ensure dir exists + seed PINNED.md
+//	goon memory init                  ensure dir exists + seed SOUL.md
 //	goon memory search <query>        grep across notes
 //
 // All operations go through internal/notes which enforces path-safety, so
@@ -80,10 +80,12 @@ func printMemoryHelp(w io.Writer) {
 	fmt.Fprintln(w, "  goon memory delete <name>    remove a note (asks for confirmation)")
 	fmt.Fprintln(w, "  goon memory search <query>   case-insensitive grep across notes")
 	fmt.Fprintln(w, "  goon memory path             print the memory dir")
-	fmt.Fprintln(w, "  goon memory init             create dir + seed PINNED.md")
+	fmt.Fprintln(w, "  goon memory init             create dir + seed SOUL.md")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Notes are markdown files in $GOON_MEMORY_DIR (default ./storage/memory under $GOON_STORAGE_DIR).")
-	fmt.Fprintln(w, "PINNED.md is auto-loaded into every agent prompt — keep it short and high-signal.")
+	fmt.Fprintln(w, "SOUL.md is auto-loaded into every agent prompt — keep it short and high-signal.")
+	fmt.Fprintln(w, "HISTORY.md is the running log of past tasks (auto-appended after every run).")
+	fmt.Fprintln(w, "(Legacy PINNED.md is still read transparently and auto-migrates on `goon memory init`.)")
 }
 
 func memList(s *notes.Store, stdout io.Writer) error {
@@ -99,20 +101,20 @@ func memList(s *notes.Store, stdout io.Writer) error {
 	fmt.Fprintf(stdout, "memory dir: %s\n\n", s.Path())
 	for _, n := range names {
 		marker := "  "
-		if n == notes.PinnedFilename {
-			marker = "* " // pinned note is auto-loaded
+		if n == notes.SoulFilename || n == "PINNED.md" {
+			marker = "* " // soul note is auto-loaded
 		}
 		fmt.Fprintf(stdout, "%s%s\n", marker, n)
 	}
-	if hasPinned(names) {
+	if hasSoul(names) {
 		fmt.Fprintf(stdout, "\n* = auto-loaded into the agent's system prompt\n")
 	}
 	return nil
 }
 
-func hasPinned(names []string) bool {
+func hasSoul(names []string) bool {
 	for _, n := range names {
-		if n == notes.PinnedFilename {
+		if n == notes.SoulFilename || n == "PINNED.md" {
 			return true
 		}
 	}
@@ -230,15 +232,15 @@ func memDelete(s *notes.Store, args []string, stdin io.Reader, stdout, stderr io
 }
 
 func memInit(s *notes.Store, stdout io.Writer) error {
-	created, err := s.SeedPinnedTemplate()
+	created, err := s.SeedSoulTemplate()
 	if err != nil {
 		return err
 	}
 	fmt.Fprintf(stdout, "memory dir: %s\n", s.Path())
 	if created {
-		fmt.Fprintf(stdout, "seeded starter %s — edit it with `goon memory edit %s`\n", notes.PinnedFilename, notes.PinnedFilename)
+		fmt.Fprintf(stdout, "seeded starter %s — edit it with `goon memory edit %s`\n", notes.SoulFilename, notes.SoulFilename)
 	} else {
-		fmt.Fprintf(stdout, "(%s already exists — leaving it alone)\n", notes.PinnedFilename)
+		fmt.Fprintf(stdout, "(%s already exists — leaving it alone)\n", notes.SoulFilename)
 	}
 	return nil
 }

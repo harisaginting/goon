@@ -64,12 +64,41 @@ internal/notes/     ACTIVE markdown notes store (./storage/memory/*.md)
 internal/skills/    Specialist markdown store (./storage/skills/*.md)
                     Same Store type as notes; instantiated against a
                     different default root. Sibling of memory, NOT
-                    auto-injected like PINNED.md.
-internal/personal/  Single-file character store (./storage/personal.md).
-                    Auto-injected into every agent run + chat turn
-                    (alongside PINNED.md). The "soul" of goon —
-                    voice, tone, default behaviors. SeedDefault()
-                    writes a starter file on first boot.
+                    auto-injected like SOUL.md.
+internal/personal/  DEPRECATED. Was the single-file character store
+                    (./storage/personal.md). Character + project
+                    knowledge are now unified in SOUL.md (see
+                    internal/notes). The directory remains as a
+                    package-doc stub so external tooling that
+                    `go list`s the repo doesn't 404 — safe to
+                    `rm -rf` it locally.
+internal/repository/ Owns REPOSITORY.md — the user-maintained mapping
+                    of remote git slugs to local checkout paths. Lives
+                    at ./storage/memory/REPOSITORY.md (excluded from
+                    topic-note index). Read by workflow triage so the
+                    LLM can suggest specific repos by name; read by
+                    confirm_repo gate to build the candidate menu;
+                    write surface via `goon repo show/edit/scan/add`.
+                    Lookup() resolves an LLM-supplied name (e.g.
+                    "backend-api") back to its canonical local path.
+                    SeedDefault() writes the starter table + preamble
+                    on first boot.
+internal/learnings/ Capture(): auto-runs after every agent.Run.
+                    Appends a HISTORY.md line (timestamp · task ·
+                    outcome) and fires a short distillation pass that
+                    lets the LLM write durable knowledge to SOUL.md
+                    or topic notes via memory_* tools. Shared between
+                    the one-shot path (cmd/root.go) and the workflow
+                    update_memory phase (internal/workflow). Opt out
+                    with GOON_AUTO_LEARN=0.
+internal/review/    Host-agnostic engine for the "PRs awaiting my
+                    review" + "forward my notifications" features.
+                    Runner.PendingReviews drafts an LLM review for each
+                    review-requested PR whose diff changed; Runner.
+                    Notifications dedups + digests the inbox. Depends
+                    only on the githost companion interfaces, never on
+                    cmd/telegram. Used by cmd/review.go and the bot's
+                    autoreview.go loop.
 internal/safety/    command validator (blocks rm -rf / etc)
 internal/storage/   single source of truth for the per-project state root
 internal/telegram/  inbound bot — auth, /commands, chat, PR review (cmd/start spawns)
@@ -173,6 +202,51 @@ the state machine picks up at `wf.Stage`.
 
 ## Recent decisions worth knowing
 
+- **Proactive PR review + notification forwarding (`internal/review`).**
+  Two user-facing features built on three new pieces:
+  - **githost companion interfaces** (`internal/githost/githost.go`):
+    `ReviewRequester{ReviewRequestedPRs(ctx)}` and
+    `Notifier{Notifications(ctx)}`, plus a `Notification` struct.
+    GitHub implements both (Search API `review-requested:@me`;
+    `/notifications` filtered to review_requested/mention/team_mention).
+    GitLab implements both AND gained the whole `PRReviewer` surface it
+    never had — `ListPRs`, `GetPRDetails` (diff reconstructed from
+    `/merge_requests/{iid}/diffs`), `CommentPR`, `ApprovePR`,
+    `RequestChangesPR` (no native "request changes" REST event — posts
+    a blocking note instead), `ReviewRequestedPRs`
+    (`merge_requests?reviewer_username=`), `Notifications` (`/todos`).
+    Bitbucket implements `ReviewRequester` (per-repo `q=reviewers.uuid`
+    over GOON_REVIEW_REPOS / discovered repos) but deliberately NOT
+    `Notifier` — Bitbucket Cloud has no notification-inbox API, so the
+    type assertion fails and callers degrade. Mock implements both.
+  - **`internal/review.Runner`** — host-agnostic. `PendingReviews`
+    drafts an LLM review (same prompt shape as telegram/pr.go) for each
+    review-requested PR whose diff fingerprint (sha256[:16]) changed
+    since last pass; `Notifications` dedups + adds an LLM digest when
+    >1 is new. Caller marks dedup state AFTER successful delivery so a
+    failed send retries.
+  - **dedup in `internal/memory`** — `ReviewSeen map[string]ReviewMark`
+    (key `host:repo#number`, stores diff hash) + `NotifSeen
+    map[string]time.Time` (key `host:id`). Caps 500/2000, pruned oldest
+    first, merged as a union in `mergeStores`.
+  Delivery: `goon review-prs` / `goon notifications` CLI subcommands
+  (both take `--watch --interval --telegram --all`, so they double as a
+  cron-free scheduler) and the Telegram bot's `autoreview.go` loop —
+  a ticker goroutine started from `Bot.Start`, gated by
+  `GOON_AUTO_REVIEW` / `GOON_AUTO_NOTIFY` (default OFF so an upgrade
+  never starts messaging existing daemon users), cadence
+  `GOON_AUTO_INTERVAL` (default 15m). The bot owns the auto loop because
+  it already holds Host+LLM+Memory+send+authorized-chat-list — daemon.go
+  was NOT touched. Review drafts go out via `SendWithButtons` with a
+  `rv:repo:number` callback; tapping "✅ Post as comment" runs
+  `callbackHandleReview` (claimed early in interactive.go's
+  `handleCallback`, mirroring `callbackHandleRepos`) which extracts the
+  fenced draft from the message text and posts it via `CommentPR` — the
+  user's one-tap approval. **Verify on real hosts:** the Bitbucket
+  `q=reviewers.uuid="..."` PR filter is the one query I couldn't test;
+  if Bitbucket rejects it the per-repo call is skipped + logged
+  (`bitbucket.review_requested_skip`) and review-request detection
+  silently returns empty for that host.
 - **Codebase index (`internal/codeindex` + `internal/tools/search_code.go`).**
   First call to `search_code` builds a per-process index of the
   current repo: regex symbol extraction (Go/Python/JS/TS/Java/Rust/
@@ -397,8 +471,8 @@ the state machine picks up at `wf.Stage`.
   `Memory.ResumableWorkflow()` before fetching new tickets and resumes once
   the user replies via `goon train` or the web UI. New `update_memory` phase
   runs an agent task that asks the LLM to distil what it learned into the
-  markdown notes store (PINNED.md / topic notes) — failures here are
-  non-fatal. Set `cfg.AutoApprove: true` in workflow.json or env
+  markdown notes store (SOUL.md / topic notes) and append a HISTORY.md
+  line via `internal/learnings.Capture` — failures here are non-fatal. Set `cfg.AutoApprove: true` in workflow.json or env
   `GOON_AUTO_APPROVE=1` to skip both gates for unattended runs (tests use
   `Engine.AutoApprove = true` for the same reason). New states added to
   `internal/memory`: `WFAwaitingApproval`, `WFUpdatingMemory`. New fields
@@ -422,9 +496,75 @@ the state machine picks up at `wf.Stage`.
   per-ticket `workflow.start` log includes it. Default name is `"default"`.
 - **`workflow.Announce(repoDir, w)`** is the helper that prints +
   logs the loaded workflow at startup. Call it from any new entry point.
-- **PINNED.md is auto-injected into `agent.SystemPrompt`.** Located at
-  `./storage/memory/PINNED.md` (or `$GOON_MEMORY_DIR/PINNED.md`).
+- **SOUL.md is auto-injected into `agent.SystemPrompt`.** Located at
+  `./storage/memory/SOUL.md` (or `$GOON_MEMORY_DIR/SOUL.md`).
   Whitespace-only files are treated as absent — no empty banner.
+  Renamed from PINNED.md for clarity — `notes.Store.Soul()` still
+  reads the legacy `PINNED.md` filename transparently, and
+  `SeedSoulTemplate()` auto-renames PINNED.md → SOUL.md on first
+  call (one-shot migration). `notes.PinnedFilename` and `Store.Pinned()`
+  are kept as deprecated aliases so out-of-tree code keeps compiling.
+- **personal.md was folded into SOUL.md.** Previously goon shipped two
+  always-loaded files — `personal.md` for character/voice and `SOUL.md`
+  for project knowledge. Users found the split confusing ("which one
+  do I edit?"). SOUL.md now holds both halves in one file, with the
+  default template carrying a `## Character` section and a `## Project
+  knowledge` section side-by-side. On boot, `notes.Store.MergePersonalIntoSoul()`
+  detects a pre-existing `./storage/personal.md`, prepends its content
+  into SOUL.md under "## Character (migrated from personal.md)" behind
+  a dated banner, and renames the original to `personal.md.bak` so the
+  user can verify the migration. The `internal/personal` package is a
+  deprecated empty stub now — nothing imports it. Telegram `/personal`
+  command became a one-line redirect pointing at `/knowledge` /
+  `/memory edit SOUL.md`. Web Memory tab dropped the Personal segment;
+  Knowledge tab (SOUL.md card) covers everything that used to be there.
+  Env var `GOON_PERSONAL_FILE` removed from `.env.example`.
+- **REPOSITORY.md is the canonical "where do my repos live" file.**
+  Lives at `./storage/memory/REPOSITORY.md`. Markdown table format:
+  `| Remote | Local | Notes |`. Read by `triageWithFeedback` so the
+  LLM can suggest specific repos by name (the prompt embeds the raw
+  body verbatim). Read by `buildRepoCandidates` so the confirm_repo
+  gate's menu starts with the user's hand-curated list, then layers
+  workspace + git-host repos underneath. The new `parseTriage` schema
+  adds `needs_repo` (bool) + `repos` (array) so the LLM can:
+  (a) classify a ticket as not needing a repo at all — research/docs/
+  comms work skips confirm_repo + test + open_pr entirely; (b) pre-
+  pick one or more repos that the gate then surfaces as `→ marked`
+  recommended picks. Persisted on the workflow as `*bool NeedsRepo`
+  (nil = legacy/pre-feature → assume true). Helpers: `memory.WorkflowNeedsRepo(wf)`,
+  `repository.Lookup(name)`, `repository.RawBody()`, `repository.SeedDefault()`.
+  CLI surface: `goon repo show/edit/scan/add` for REPOSITORY.md;
+  `goon repo list/forget/clear` for the legacy learned mappings in
+  memory.json. Auto-seed runs alongside personal/SOUL on first boot.
+- **Repo selection is now strictly per-ticket.** The old
+  `Memory.RepoChoices` cache (project key → single repo, written
+  after a confirm_repo gate, read on every subsequent ticket to
+  auto-skip the gate) was the bug behind "ENG-1 and ENG-2 forced to
+  the same single repo." It's gone from the runtime hot path:
+  `phaseConfirmRepo` no longer calls `lookupLearnedRepo`, no longer
+  calls `rememberRepo` after a confirm, and `pickRepoForTicket` no
+  longer consults `Memory.LookupRepoChoice` (it's just a soft hint
+  built from `GOON_REPO_MAP` + ticket project key now). The
+  `Memory.RecordRepoChoice` / `LookupRepoChoice` / `ForgetRepoChoice`
+  methods + `memory.json` storage stay so legacy state loads cleanly
+  but nothing writes fresh entries. `goon repo list / forget / clear`
+  print a deprecation banner pointing at REPOSITORY.md and will
+  silently drop any stale legacy entries the user wants cleared.
+  The gate fires for EVERY ticket where `needs_repo=true` and
+  autoApprove is off — each ticket gets its own multi-select.
+- **Self-improvement loop (`internal/learnings`).** Every successful
+  `agent.Run` from the one-shot CLI path now goes through
+  `learnings.Capture(ctx, opts)` which (a) appends a single
+  `YYYY-MM-DD HH:MM · task · outcome` line to `./storage/memory/HISTORY.md`
+  and (b) fires a short follow-up agent task asking the LLM to distil
+  durable knowledge into SOUL.md / topic notes via the existing
+  `memory_*` tools. Same helper is called by `workflow.phaseUpdateMemory`
+  so the daemon path and the one-shot path share one rule for what
+  "remembering" means. Opt out with `GOON_AUTO_LEARN=0`. The mock LLM
+  provider auto-skips the distillation step so tests stay fast and
+  hermetic; HISTORY.md still gets the entry. The agent's system
+  prompt mentions HISTORY.md so the LLM knows to consult it before
+  re-trying something that's already been attempted.
 - **`memory_*` tools share a single `notes.Store`** via `RegisterMemoryTools()`
   in `internal/tools/memory.go`. Don't construct stores per-call.
 - **Path safety in notes:** rejects absolute paths, any literal `..`

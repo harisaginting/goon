@@ -188,35 +188,170 @@ func TestSearch_RespectsMaxHits(t *testing.T) {
 	}
 }
 
-func TestPinned_EmptyWhenAbsent(t *testing.T) {
+func TestSoul_EmptyWhenAbsent(t *testing.T) {
 	s := newStore(t)
-	if got := s.Pinned(); got != "" {
-		t.Errorf("Pinned with no file: got %q want empty", got)
+	if got := s.Soul(); got != "" {
+		t.Errorf("Soul with no file: got %q want empty", got)
 	}
 }
 
-func TestPinned_ReadsContent(t *testing.T) {
+func TestSoul_ReadsContent(t *testing.T) {
 	s := newStore(t)
-	_ = s.Write(PinnedFilename, "remember this\n")
-	if got := s.Pinned(); got != "remember this" {
-		t.Errorf("Pinned: got %q", got)
+	_ = s.Write(SoulFilename, "remember this\n")
+	if got := s.Soul(); got != "remember this" {
+		t.Errorf("Soul: got %q", got)
 	}
 }
 
-func TestSeedPinnedTemplate(t *testing.T) {
+// TestSoul_ReadsLegacyPinned covers the backwards-compat path: a user
+// upgrading from an older goon has PINNED.md but not SOUL.md and must
+// still see their content auto-loaded until the next seed-driven
+// migration.
+func TestSoul_ReadsLegacyPinned(t *testing.T) {
 	s := newStore(t)
-	created, err := s.SeedPinnedTemplate()
+	_ = s.Write(legacySoulFilename, "legacy content\n")
+	if got := s.Soul(); got != "legacy content" {
+		t.Errorf("Soul (legacy): got %q want %q", got, "legacy content")
+	}
+}
+
+// TestSoul_PrefersCanonicalOverLegacy: if both files exist for some
+// reason (mid-migration crash, manual mucking), canonical SOUL.md wins.
+func TestSoul_PrefersCanonicalOverLegacy(t *testing.T) {
+	s := newStore(t)
+	_ = s.Write(SoulFilename, "canonical wins")
+	_ = s.Write(legacySoulFilename, "legacy loses")
+	if got := s.Soul(); got != "canonical wins" {
+		t.Errorf("Soul: got %q want canonical to win", got)
+	}
+}
+
+func TestSeedSoulTemplate(t *testing.T) {
+	s := newStore(t)
+	created, err := s.SeedSoulTemplate()
 	if err != nil || !created {
-		t.Fatalf("SeedPinnedTemplate: created=%v err=%v", created, err)
+		t.Fatalf("SeedSoulTemplate: created=%v err=%v", created, err)
 	}
-	body, _ := s.Read(PinnedFilename)
-	if !strings.Contains(body, "Pinned memory") {
+	body, _ := s.Read(SoulFilename)
+	if !strings.Contains(body, "SOUL.md") {
 		t.Errorf("template missing header: %q", body)
 	}
 	// Second call should NOT overwrite.
-	created2, err := s.SeedPinnedTemplate()
+	created2, err := s.SeedSoulTemplate()
 	if err != nil || created2 {
-		t.Errorf("SeedPinnedTemplate idempotency: created=%v err=%v", created2, err)
+		t.Errorf("SeedSoulTemplate idempotency: created=%v err=%v", created2, err)
+	}
+}
+
+// TestMergePersonalIntoSoul_FreshSoul: when personal.md exists but
+// SOUL.md doesn't, the merge writes a fresh SOUL.md whose body is
+// the personal content under a Character header. Original is renamed
+// to .bak so we don't re-merge.
+func TestMergePersonalIntoSoul_FreshSoul(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOON_MEMORY_DIR", dir)
+	s, err := New(dir)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	personalPath := filepath.Join(dir, "personal.md")
+	body := "You are GOON. Direct, no apologies, push back when wrong."
+	if err := os.WriteFile(personalPath, []byte(body), 0o644); err != nil {
+		t.Fatalf("seed personal.md: %v", err)
+	}
+
+	merged, err := s.MergePersonalIntoSoul(personalPath)
+	if err != nil {
+		t.Fatalf("MergePersonalIntoSoul: %v", err)
+	}
+	if !merged {
+		t.Fatal("expected merged=true")
+	}
+	soul, err := s.Read(SoulFilename)
+	if err != nil {
+		t.Fatalf("read SOUL.md: %v", err)
+	}
+	if !strings.Contains(soul, body) {
+		t.Errorf("SOUL.md missing personal body; got:\n%s", soul)
+	}
+	if !strings.Contains(soul, "## Character") {
+		t.Errorf("SOUL.md missing Character header; got:\n%s", soul)
+	}
+	// personal.md should be renamed.
+	if _, err := os.Stat(personalPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("personal.md should be renamed; stat err=%v", err)
+	}
+	if _, err := os.Stat(personalPath + ".bak"); err != nil {
+		t.Errorf("personal.md.bak missing: %v", err)
+	}
+}
+
+// TestMergePersonalIntoSoul_PrependsToExisting: when both files
+// exist, the merge prepends the personal content (under a Character
+// header) at the TOP of SOUL.md so the user sees it first. Existing
+// SOUL.md content is preserved verbatim below a horizontal rule.
+func TestMergePersonalIntoSoul_PrependsToExisting(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOON_MEMORY_DIR", dir)
+	s, _ := New(dir)
+	_ = s.Write(SoulFilename, "# Existing knowledge\n\n- branch prefix is feat/")
+	personalPath := filepath.Join(dir, "personal.md")
+	_ = os.WriteFile(personalPath, []byte("Be direct. Push back."), 0o644)
+
+	merged, err := s.MergePersonalIntoSoul(personalPath)
+	if err != nil || !merged {
+		t.Fatalf("MergePersonalIntoSoul: merged=%v err=%v", merged, err)
+	}
+	got, _ := s.Read(SoulFilename)
+	// Character section should be before the original knowledge.
+	charIdx := strings.Index(got, "Be direct")
+	knowIdx := strings.Index(got, "branch prefix")
+	if charIdx < 0 || knowIdx < 0 {
+		t.Fatalf("missing sections; got:\n%s", got)
+	}
+	if charIdx >= knowIdx {
+		t.Errorf("expected Character section before existing knowledge; charIdx=%d knowIdx=%d", charIdx, knowIdx)
+	}
+}
+
+// TestMergePersonalIntoSoul_NoSourceIsNoOp: with no personal.md
+// present, the merge returns (false, nil) and never touches SOUL.md.
+// Boot calls this unconditionally, so the no-op path matters.
+func TestMergePersonalIntoSoul_NoSourceIsNoOp(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("GOON_MEMORY_DIR", dir)
+	s, _ := New(dir)
+	merged, err := s.MergePersonalIntoSoul(filepath.Join(dir, "personal.md"))
+	if err != nil {
+		t.Errorf("unexpected error on no-source: %v", err)
+	}
+	if merged {
+		t.Errorf("merged should be false when personal.md is absent")
+	}
+}
+
+// TestSeedSoulTemplate_MigratesLegacyPinned: a fresh SeedSoulTemplate
+// call on a store that already has PINNED.md should rename it to
+// SOUL.md instead of leaving PINNED behind + seeding a stub. Otherwise
+// users would end up with two files and lose their auto-load.
+func TestSeedSoulTemplate_MigratesLegacyPinned(t *testing.T) {
+	s := newStore(t)
+	original := "team rules — keep this\n"
+	if err := s.Write(legacySoulFilename, original); err != nil {
+		t.Fatalf("seed legacy: %v", err)
+	}
+	created, err := s.SeedSoulTemplate()
+	if err != nil || !created {
+		t.Fatalf("SeedSoulTemplate (migration): created=%v err=%v", created, err)
+	}
+	// Legacy file should be gone, canonical should hold the original body.
+	legacyPath := filepath.Join(s.Path(), legacySoulFilename)
+	if _, err := os.Stat(legacyPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("PINNED.md should have been renamed, but it's still there (err=%v)", err)
+	}
+	got, _ := s.Read(SoulFilename)
+	if got != original {
+		t.Errorf("SOUL.md after migration: got %q want %q", got, original)
 	}
 }
 
@@ -242,25 +377,27 @@ func TestDelete_NonexistentReturnsError(t *testing.T) {
 	}
 }
 
-// TestPinned_CaseInsensitiveFallback ensures that a user who writes
-// pinned.md / Pinned.md / etc on a case-sensitive filesystem still gets
+// TestSoul_CaseInsensitiveFallback ensures that a user who writes
+// soul.md / Soul.md / etc on a case-sensitive filesystem still gets
 // the auto-load behaviour, instead of silently losing it. Reasonable
-// since the whole point of PINNED is to be discoverable.
-func TestPinned_CaseInsensitiveFallback(t *testing.T) {
-	cases := []string{"pinned.md", "Pinned.md", "PiNnEd.Md"}
+// since the whole point of SOUL is to be discoverable. The fallback
+// also still recognises the legacy lowercase pinned variants so an
+// in-place rename of the file doesn't break anyone mid-migration.
+func TestSoul_CaseInsensitiveFallback(t *testing.T) {
+	cases := []string{"soul.md", "Soul.md", "SoUl.Md", "pinned.md", "Pinned.md", "PiNnEd.Md"}
 	for _, name := range cases {
 		t.Run(name, func(t *testing.T) {
 			s := newStore(t)
 			// Write directly with the exact case the user typed — bypass
-			// Resolve, which would normalize to PINNED.md only on
+			// Resolve, which would normalize to SOUL.md only on
 			// case-insensitive volumes.
 			body := "stay sharp"
 			if err := os.WriteFile(filepath.Join(s.Path(), name), []byte(body), 0o644); err != nil {
 				t.Fatalf("seed %s: %v", name, err)
 			}
-			got := s.Pinned()
+			got := s.Soul()
 			if got != body {
-				t.Errorf("Pinned() = %q, want %q (file: %s)", got, body, name)
+				t.Errorf("Soul() = %q, want %q (file: %s)", got, body, name)
 			}
 		})
 	}

@@ -136,19 +136,32 @@ func TestEngine_VerifyMultiplePasses(t *testing.T) {
 
 func TestParseTriage(t *testing.T) {
 	cases := []struct {
-		in       string
-		wantLen  int
-		wantRepo string
-		wantErr  bool
+		in            string
+		wantLen       int
+		wantRepo      string
+		wantRepos     []string
+		wantNeedsRepo bool
+		wantErr       bool
 	}{
-		{`{"steps":[{"title":"a"},{"title":"b"}],"repo":"r"}`, 2, "r", false},
-		{`prefix {"steps":[{"title":"a"}]} suffix`, 1, "", false},
-		{"```json\n{\"steps\":[{\"title\":\"a\"}]}\n```", 1, "", false},
-		{`{"steps":[]}`, 0, "", true},
-		{`not json`, 0, "", true},
+		// Legacy reply (no needs_repo, no repos array) — defaults
+		// to needs_repo=true so old prompts keep behaving like before.
+		{`{"steps":[{"title":"a"},{"title":"b"}],"repo":"r"}`, 2, "r", []string{"r"}, true, false},
+		// JSON wrapped in prose / fences still parses.
+		{`prefix {"steps":[{"title":"a"}]} suffix`, 1, "", nil, true, false},
+		{"```json\n{\"steps\":[{\"title\":\"a\"}]}\n```", 1, "", nil, true, false},
+		// Explicit needs_repo=false (research / docs / comms ticket).
+		{`{"steps":[{"title":"draft email"}],"needs_repo":false,"repos":[]}`, 1, "", nil, false, false},
+		// Multi-repo reply — primary derived from first array element
+		// when "repo" is omitted.
+		{`{"steps":[{"title":"a"}],"needs_repo":true,"repos":["api","web"]}`, 1, "api", []string{"api", "web"}, true, false},
+		// repo + repos with overlap: primary stays first, no dupes.
+		{`{"steps":[{"title":"a"}],"repo":"api","repos":["web","api"]}`, 1, "api", []string{"api", "web"}, true, false},
+		// Errors.
+		{`{"steps":[]}`, 0, "", nil, true, true},
+		{`not json`, 0, "", nil, true, true},
 	}
 	for _, tc := range cases {
-		plan, repo, err := parseTriage(tc.in)
+		got, err := parseTriage(tc.in)
 		if tc.wantErr {
 			if err == nil {
 				t.Errorf("parseTriage(%q) expected error", tc.in)
@@ -159,10 +172,34 @@ func TestParseTriage(t *testing.T) {
 			t.Errorf("parseTriage(%q): %v", tc.in, err)
 			continue
 		}
-		if len(plan) != tc.wantLen || repo != tc.wantRepo {
-			t.Errorf("parseTriage(%q): %d/%q want %d/%q", tc.in, len(plan), repo, tc.wantLen, tc.wantRepo)
+		if len(got.Plan) != tc.wantLen {
+			t.Errorf("parseTriage(%q) plan len: %d want %d", tc.in, len(got.Plan), tc.wantLen)
+		}
+		if got.Repo != tc.wantRepo {
+			t.Errorf("parseTriage(%q) Repo: %q want %q", tc.in, got.Repo, tc.wantRepo)
+		}
+		if got.NeedsRepo != tc.wantNeedsRepo {
+			t.Errorf("parseTriage(%q) NeedsRepo: %v want %v", tc.in, got.NeedsRepo, tc.wantNeedsRepo)
+		}
+		if !slicesEqual(got.Repos, tc.wantRepos) {
+			t.Errorf("parseTriage(%q) Repos: %v want %v", tc.in, got.Repos, tc.wantRepos)
 		}
 	}
+}
+
+// slicesEqual compares two string slices element-wise. Treats nil
+// and empty as equal so the test cases don't need to be paranoid
+// about empty-vs-nil distinctions.
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestEngine_RunsHooksAtEachPhase(t *testing.T) {
@@ -341,86 +378,105 @@ func TestPickRepo(t *testing.T) {
 	}
 }
 
-// TestPickRepoForTicket_PriorityLadder covers the repo-resolution
-// priority documented on the Engine method:
-//   1. GOON_REPO_MAP exact (operator-explicit)
-//   2. Memory.RepoChoices learned (user-confirmed once)
-//   3. GOON_REPO_MAP wildcard "*"
-//   4. ticket.Project literal (last resort)
+// TestPickRepoForTicket_SoftHintLadder covers the soft-hint
+// ladder pickRepoForTicket exposes to the triage prompt:
 //
-// A regression here is silent (goon still finds *some* path) but
-// disastrous in practice — env settings stop being authoritative or
-// learned choices stop carrying forward. The four sub-cases cover the
-// four rungs.
-func TestPickRepoForTicket_PriorityLadder(t *testing.T) {
-	t.Run("env exact wins over learned", func(t *testing.T) {
-		t.Setenv("GOON_REPO_MAP", "ENG=/r/env-eng")
-		mem := memory.Disabled()
-		mem.RecordRepoChoice("ENG", "/r/learned")
-		e := &Engine{Memory: mem}
+//   1. GOON_REPO_MAP exact key match (operator-explicit)
+//   2. GOON_REPO_MAP "*" wildcard fallback
+//   3. ticket.Project literal (last resort)
+//
+// We DELIBERATELY no longer consult Memory.RepoChoices here — that
+// per-project cache was the source of the "ENG-1 and ENG-2 forced
+// to the same single repo" bug. Each ticket is now classified +
+// asked independently via triage + REPOSITORY.md, with this
+// function providing only a low-confidence default the LLM is free
+// to override.
+func TestPickRepoForTicket_SoftHintLadder(t *testing.T) {
+	t.Run("env exact wins over wildcard", func(t *testing.T) {
+		t.Setenv("GOON_REPO_MAP", "ENG=/r/env-eng,*=/r/wildcard")
+		e := &Engine{Memory: memory.Disabled()}
 		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/env-eng" {
-			t.Errorf("env should win over learned; got %q", got)
+			t.Errorf("env exact should win; got %q", got)
 		}
 	})
-	t.Run("learned wins over wildcard", func(t *testing.T) {
+	t.Run("wildcard used when no exact match", func(t *testing.T) {
 		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
-		mem := memory.Disabled()
-		mem.RecordRepoChoice("ENG", "/r/learned")
-		e := &Engine{Memory: mem}
-		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/learned" {
-			t.Errorf("learned should win over wildcard; got %q", got)
-		}
-	})
-	t.Run("wildcard used when no exact match and no learning", func(t *testing.T) {
-		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
-		mem := memory.Disabled()
-		e := &Engine{Memory: mem}
+		e := &Engine{Memory: memory.Disabled()}
 		if got := e.pickRepoForTicket(boards.Ticket{Project: "OTHER"}); got != "/r/wildcard" {
 			t.Errorf("wildcard fallback failed; got %q", got)
 		}
 	})
 	t.Run("project literal as last resort", func(t *testing.T) {
 		t.Setenv("GOON_REPO_MAP", "")
-		mem := memory.Disabled()
-		e := &Engine{Memory: mem}
+		e := &Engine{Memory: memory.Disabled()}
 		if got := e.pickRepoForTicket(boards.Ticket{Project: "owner/repo"}); got != "owner/repo" {
 			t.Errorf("project-literal fallback failed; got %q", got)
 		}
 	})
+	t.Run("learned cache is IGNORED (regression guard)", func(t *testing.T) {
+		// memory.RepoChoices still exists on disk for backwards-compat
+		// with old memory.json files, but pickRepoForTicket must never
+		// consult it. Otherwise we re-introduce the project-level
+		// auto-pick bug — ENG-1 always seeing the same repo as the
+		// last confirmed ENG ticket regardless of triage's per-ticket
+		// classification.
+		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
+		mem := memory.Disabled()
+		mem.RecordRepoChoice("ENG", "/r/stale-cache")
+		e := &Engine{Memory: mem}
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/wildcard" {
+			t.Errorf("learned cache should not influence the hint; got %q want /r/wildcard", got)
+		}
+	})
 }
 
-// TestEngine_PhaseConfirmRepoLearns ensures the gate's success path
-// records the project→repo mapping so the next ticket from the same
-// project skips the gate entirely. This is the user-facing promise of
-// "I confirmed this once, don't ask me again."
-func TestEngine_PhaseConfirmRepoLearns(t *testing.T) {
+// TestEngine_PhaseConfirmRepoDoesNotLearnPerProject is the regression
+// guard for the per-ticket fix. After answering the gate for ENG-1
+// goon must NOT auto-skip the gate for ENG-2 — both tickets share
+// the same project but may need different repos.
+//
+// Concretely: run two ENG tickets through the workflow, confirm the
+// first one's gate, then assert the second one ALSO pauses at the
+// gate (instead of being silently routed to the first one's repo).
+func TestEngine_PhaseConfirmRepoDoesNotLearnPerProject(t *testing.T) {
+	// Two scripted triage replies — one per ticket, both flag
+	// needs_repo so the gate fires.
 	e, _, _, _, mem := gatedEngine(t, []string{
-		`{"steps":[{"title":"x"}],"repo":"/r/eng"}`,
+		`{"steps":[{"title":"x"}],"repo":"/r/eng","needs_repo":true}`,
+		`{"steps":[{"title":"x"}],"repo":"/r/eng","needs_repo":true}`,
 	})
-	ticket := boards.Ticket{
-		ID: "ENG-1", Source: "jira", Key: "ENG-1",
-		Title: "Add login", Project: "ENG",
+	tickets := []boards.Ticket{
+		{ID: "ENG-1", Source: "jira", Key: "ENG-1", Title: "Add login", Project: "ENG"},
+		{ID: "ENG-2", Source: "jira", Key: "ENG-2", Title: "Change UI", Project: "ENG"},
 	}
-	// Run 1 — pauses at confirm_repo.
-	if _, err := e.Run(context.Background(), ticket); err != nil {
-		t.Fatalf("run1: %v", err)
+
+	// Ticket 1 — pause at confirm_repo, then answer.
+	if _, err := e.Run(context.Background(), tickets[0]); err != nil {
+		t.Fatalf("run ENG-1: %v", err)
 	}
 	pending := mem.PendingQuestions()
 	if len(pending) != 1 {
-		t.Fatalf("expected 1 pending question, got %d", len(pending))
+		t.Fatalf("ENG-1: expected 1 pending question, got %d", len(pending))
 	}
 	mem.AnswerQuestion(pending[0].ID, "yes")
+	if _, err := e.Run(context.Background(), tickets[0]); err != nil {
+		t.Fatalf("resume ENG-1: %v", err)
+	}
 
-	// Run 2 — confirm_repo passes; project→repo should be persisted.
-	if _, err := e.Run(context.Background(), ticket); err != nil {
-		t.Fatalf("run2: %v", err)
+	// The per-project cache MUST be empty — we no longer write it.
+	if got := mem.RepoChoices(); len(got) != 0 {
+		t.Errorf("RepoChoices should remain empty after a confirm; got %v", got)
 	}
-	got, ok := mem.LookupRepoChoice("ENG")
-	if !ok {
-		t.Fatal("expected memory to have learned a repo for ENG")
+
+	// Ticket 2 — must pause at confirm_repo too, because each ticket
+	// gets its own gate. If the old auto-skip logic were still in
+	// place, ENG-2 would silently flow through without pausing.
+	if _, err := e.Run(context.Background(), tickets[1]); err != nil {
+		t.Fatalf("run ENG-2: %v", err)
 	}
-	if got != "/r/eng" {
-		t.Errorf("learned repo = %q, want /r/eng", got)
+	pending = mem.PendingQuestions()
+	if len(pending) != 1 {
+		t.Fatalf("ENG-2 should fire its own gate, got %d pending question(s)", len(pending))
 	}
 }
 

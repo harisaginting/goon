@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 // PR is the canonical pull-request descriptor used by goon's workflow.
@@ -85,6 +86,41 @@ type PRReviewer interface {
 	ApprovePR(ctx context.Context, repo string, number int, body string) error
 	// RequestChangesPR submits a "request changes" review.
 	RequestChangesPR(ctx context.Context, repo string, number int, body string) error
+}
+
+// Notification is one actionable item from the authenticated user's
+// git-host inbox — currently a review request or an @-mention. Hosts
+// surface only items relevant to the current user; see Notifier.
+type Notification struct {
+	ID        string    `json:"id"`               // host-unique; used for dedup
+	Kind      string    `json:"kind"`             // "review_requested" | "mention"
+	Title     string    `json:"title"`
+	Repo      string    `json:"repo,omitempty"`   // "owner/repo" when known
+	URL       string    `json:"url,omitempty"`    // browser URL when derivable
+	Reason    string    `json:"reason,omitempty"` // the host's own reason string, verbatim
+	UpdatedAt time.Time `json:"updated_at,omitempty"`
+}
+
+// ReviewRequester is an optional companion interface for hosts that can
+// list the PRs/MRs where the authenticated user is a requested reviewer.
+// Used by `goon review-prs` and the Telegram bot's auto-review loop.
+//
+// Hosts that don't implement it degrade gracefully — callers report
+// "review-request listing not supported on this host". GitHub, GitLab
+// and Bitbucket all implement it.
+type ReviewRequester interface {
+	Host
+	ReviewRequestedPRs(ctx context.Context) ([]PR, error)
+}
+
+// Notifier is an optional companion interface for hosts that expose the
+// authenticated user's notification inbox, filtered to review requests
+// and @-mentions. GitHub (/notifications) and GitLab (/todos) implement
+// it; Bitbucket Cloud has no inbox API and deliberately does not, so a
+// type assertion to Notifier fails and callers degrade gracefully.
+type Notifier interface {
+	Host
+	Notifications(ctx context.Context) ([]Notification, error)
 }
 
 // NormalizeRepoSlug turns whatever the user pasted for a "repo"
@@ -173,6 +209,9 @@ type Mock struct {
 	// Repos backs the Mock's ListRepos implementation so tests can
 	// pre-seed an expected menu and assert on the chosen subset.
 	Repos []Repo
+	// ReviewPRs backs ReviewRequestedPRs; Notifs backs Notifications.
+	ReviewPRs []PR
+	Notifs    []Notification
 }
 
 // ListRepos returns the prefilled mock repo list.
@@ -258,4 +297,18 @@ func (m *Mock) ApprovePR(_ context.Context, repo string, number int, body string
 func (m *Mock) RequestChangesPR(_ context.Context, repo string, number int, body string) error {
 	m.ChangesAsked = append(m.ChangesAsked, MockComment{Repo: repo, Number: number, Body: body})
 	return nil
+}
+
+// ReviewRequestedPRs returns the prefilled review-request list.
+func (m *Mock) ReviewRequestedPRs(_ context.Context) ([]PR, error) {
+	out := make([]PR, len(m.ReviewPRs))
+	copy(out, m.ReviewPRs)
+	return out, nil
+}
+
+// Notifications returns the prefilled notification list.
+func (m *Mock) Notifications(_ context.Context) ([]Notification, error) {
+	out := make([]Notification, len(m.Notifs))
+	copy(out, m.Notifs)
+	return out, nil
 }

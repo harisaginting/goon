@@ -5,7 +5,6 @@ import (
 	"strings"
 
 	"github.com/harisaginting/goon/internal/notes"
-	"github.com/harisaginting/goon/internal/personal"
 	"github.com/harisaginting/goon/internal/tools"
 )
 
@@ -19,38 +18,28 @@ import (
 //   - prefer "finish" when done
 //   - safety: never call destructive commands
 //
-// Persistent memory: when a notes store is available and PINNED.md has
+// Persistent memory: when a notes store is available and SOUL.md has
 // content, that content is injected as a "## Persistent memory" section
-// near the top of the prompt. This is how the agent "remembers" things
-// across runs — anything the user (or a previous run) wrote to PINNED.md
-// is in the model's context on every call.
+// near the top of the prompt. SOUL.md holds BOTH the character /
+// voice instructions (how goon talks) AND the project knowledge
+// (what goon knows about this repo) — a single always-loaded file
+// replaces the older personal.md + SOUL.md split. (Legacy PINNED.md
+// is still read transparently when SOUL.md is absent.)
 func SystemPrompt(reg *tools.Registry) string {
 	manifest := reg.Manifest()
 
-	// Personal block — goon's character / voice / defaults. Auto-
-	// loaded into every prompt so the model speaks consistently.
-	// Sits ABOVE the pinned-knowledge block because personality
-	// shapes how project facts are delivered.
-	personalBlock := ""
-	if body := personal.Read(); body != "" {
-		personalBlock = fmt.Sprintf(`
-CHARACTER (always loaded, from %s):
-%s
-
-`, personal.Path(), body)
-	}
-
-	// Pinned memory block — best-effort. Failures to open the store are
-	// silently swallowed because a missing/unreadable memory dir is the
-	// common case during first-run and shouldn't crash the agent.
-	pinnedBlock := ""
+	// Soul block — character + project knowledge, always loaded.
+	// Failures to open the store are silently swallowed because a
+	// missing/unreadable memory dir is the common case during
+	// first-run and shouldn't crash the agent.
+	soulBlock := ""
 	if store, err := notes.New(""); err == nil {
-		if pinned := store.Pinned(); pinned != "" {
-			pinnedBlock = fmt.Sprintf(`
-PERSISTENT MEMORY (always loaded for you, from %s/%s):
+		if soul := store.Soul(); soul != "" {
+			soulBlock = fmt.Sprintf(`
+PERSISTENT MEMORY (always loaded for you — character + project knowledge, from %s/%s):
 %s
 
-`, store.Path(), notes.PinnedFilename, pinned)
+`, store.Path(), notes.SoulFilename, soul)
 		}
 	}
 
@@ -61,8 +50,10 @@ PERSISTENT MEMORY (always loaded for you, from %s/%s):
   bugs avoided, names+IDs that matter, file layouts learned.
 - One topic per .md file, kebab-case names. Use memory_append to add to
   an existing note instead of overwriting.
-- Anything in PINNED.md is auto-loaded into this prompt — keep that file
-  small and high-signal.
+- Anything in SOUL.md is auto-loaded into this prompt — keep that file
+  small and high-signal (it's the project's soul / always-on context).
+- HISTORY.md is the running log of past tasks (timestamp + outcome);
+  read it to recall what you've already tried on this repo.
 
 `
 
@@ -84,7 +75,7 @@ TOOLS:
 - For destructive shell actions, prefer the safest variant and rely on the executor's confirmation.
 - After completing the user's task or if blocked, call "finish" with a one-paragraph summary.
 - Maximum %d steps total — choose the highest-leverage step each turn.
-`, personalBlock+pinnedBlock, manifest, memoryHowto, MaxSteps)
+`, soulBlock, manifest, memoryHowto, MaxSteps)
 }
 
 // BuildUserContext stitches the user task with the runtime context block.

@@ -119,7 +119,8 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/api/skills/note", s.handleSkillNote)
 	mux.HandleFunc("/api/skills/write", s.handleSkillWrite)
 	mux.HandleFunc("/api/skills/delete", s.handleSkillDelete)
-	mux.HandleFunc("/api/personal/save", s.handlePersonalSave)
+	// /api/personal/save is gone — personal.md was folded into SOUL.md.
+	// Edit via /api/memory/write with name=SOUL.md.
 	mux.HandleFunc("/fragments/skills-list", s.fragSkillsList)
 	mux.HandleFunc("/api/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/events", s.handleEvents) // SSE: server → browser change pings
@@ -807,14 +808,21 @@ func statusKV(w http.ResponseWriter, k, v string) {
 // zero-state for a fresh process before Reconfigure fires, and a red
 // indicator there reads like an error rather than "no work yet."
 // Red is reserved for actual failure surfaces.
+// statusBadge maps daemon state to (label, css-class-for-dot). The dot
+// colours match the new palette's semantic roles:
+//   - stopped → cool grey (muted), no pulse
+//   - paused  → vibrant amber (highlight), no pulse — paused is a
+//               deliberate state, not an error, but should stand out
+//   - running → neon purple (accent) with the pulse-dot animation, so
+//               the brand-purple matches the header logo glow when live
 func statusBadge(st memory.DaemonStatus) (string, string) {
 	switch {
 	case !st.Running:
-		return "stopped", "bg-gray-400 dark:bg-gray-500"
+		return "stopped", "bg-muted"
 	case st.Paused:
-		return "paused", "bg-amber-400"
+		return "paused", "bg-highlight"
 	default:
-		return "running", "bg-emerald-500 pulse-dot"
+		return "running", "bg-accent pulse-dot"
 	}
 }
 
@@ -834,19 +842,32 @@ func (s *Server) fragStatusPill(w http.ResponseWriter, _ *http.Request) {
 	if st.Paused {
 		pausedFlag = "1"
 	}
-	// The data-paused attribute lets the sidebar pause/resume button
-	// query "what's the current state" without a separate API call.
-	fmt.Fprintf(w, `<div class="flex items-center gap-3 text-[11px] font-medium text-gray-700 dark:text-gray-300" data-paused="%s" title="Last poll: %s">
-		<span class="relative flex h-2 w-2 shrink-0">
+	runningFlag := "0"
+	if st.Running {
+		runningFlag = "1"
+	}
+	// data-paused + data-running let the sidebar pause/resume button
+	// and the brand-mark live-glow JS query the current state without
+	// a separate API call. The label colour tracks the dot — purple
+	// when running, amber when paused, muted when stopped — so the
+	// pill reads at a glance.
+	labelColor := "text-muted"
+	if st.Running && !st.Paused {
+		labelColor = "text-accent"
+	} else if st.Paused {
+		labelColor = "text-highlight"
+	}
+	fmt.Fprintf(w, `<div class="flex items-center gap-3 text-[11px] font-medium text-white" data-paused="%s" data-running="%s" title="Last poll: %s">
+		<span class="relative flex h-2.5 w-2.5 shrink-0">
 			<span class="absolute inline-flex h-full w-full rounded-full %s opacity-60 animate-ping"></span>
-			<span class="relative inline-flex rounded-full h-2 w-2 %s"></span>
+			<span class="relative inline-flex rounded-full h-2.5 w-2.5 %s"></span>
 		</span>
 		<div class="min-w-0 flex-1">
-			<div class="uppercase tracking-wider text-[10px] text-gray-500">Daemon</div>
-			<div class="text-sm font-semibold">%s</div>
-			<div class="text-[11px] text-gray-500 font-mono mt-0.5">last poll %s</div>
+			<div class="uppercase tracking-wider text-[10px] text-muted">Daemon</div>
+			<div class="text-sm font-semibold %s">%s</div>
+			<div class="text-[11px] text-muted font-mono mt-0.5">last poll %s</div>
 		</div>
-	</div>`, pausedFlag, html.EscapeString(last), dotClass, dotClass, state, html.EscapeString(last))
+	</div>`, pausedFlag, runningFlag, html.EscapeString(last), dotClass, dotClass, labelColor, state, html.EscapeString(last))
 }
 
 // fragQuestionsBanner renders a yellow strip above the tabs when there
@@ -863,15 +884,20 @@ func (s *Server) fragQuestionsBanner(w http.ResponseWriter, _ *http.Request) {
 	if len(pending) > 1 {
 		plural = "questions"
 	}
-	fmt.Fprintf(w, `<div class="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 flex flex-wrap items-center gap-3 text-sm">
-		<span class="text-amber-700 dark:text-amber-400 text-lg">⏸</span>
+	// Banner is the highest-attention surface on the page when goon is
+	// waiting on the user. Amber tint with a glowing CTA button so it's
+	// impossible to miss without being shouty — the surface is already
+	// obsidian so amber really pops. The .cta-glow class on the button
+	// adds the gentle outward pulse defined in the global stylesheet.
+	fmt.Fprintf(w, `<div class="mt-4 rounded-xl border border-highlight/50 bg-highlight/10 px-4 py-3 flex flex-wrap items-center gap-3 text-sm shadow-glow-amber">
+		<span class="text-highlight text-lg leading-none">⏸</span>
 		<div class="flex-1 min-w-0">
-			<strong class="text-amber-700 dark:text-amber-300">%d pending %s</strong>
-			<span class="text-gray-700 dark:text-gray-400"> — workflows are paused waiting for your approval.</span>
+			<strong class="text-highlight">%d pending %s</strong>
+			<span class="text-muted"> — workflows are paused waiting for your approval.</span>
 		</div>
-		<button type="button" onclick="document.querySelector('button[data-tab=questions]').click()"
-			class="rounded-md bg-amber-500 text-gray-900 px-3 py-1 text-xs font-semibold hover:bg-amber-400 transition">
-			Review
+		<button type="button" onclick="if (typeof showPage==='function') showPage('questions'); else document.querySelector('button[data-page-target=questions]')?.click()"
+			class="cta-glow rounded-md bg-highlight text-surface px-3.5 py-1.5 text-xs font-bold tracking-wide hover:brightness-110 transition">
+			Review now →
 		</button>
 	</div>`, len(pending), plural)
 }
@@ -991,20 +1017,29 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 // Each tone uses paired light/dark text colors so the pill stays
 // readable against both surface modes (light = darker text, dark =
 // lighter text).
+// ticketStatusPill maps a ticket's status string to a colored badge.
+// Tones in the new palette:
+//   - open/todo/backlog → muted grey (the resting state)
+//   - in-progress       → amber highlight (work is happening)
+//   - in-review         → neon purple accent (waiting on a human)
+//   - done/merged       → emerald (universally "shipped")
+//   - blocked           → rose (universally "stop")
+// Keeping emerald + rose for the universal traffic-light semantics; the
+// rest tie back to the brand.
 func ticketStatusPill(status string) string {
 	low := strings.ToLower(strings.TrimSpace(status))
-	cls := "bg-gray-500/15 text-gray-700 dark:text-gray-400 border-gray-500/30"
+	cls := "bg-surface-raised text-muted border-surface-border"
 	switch {
 	case low == "" || strings.Contains(low, "open") || strings.Contains(low, "todo") || strings.Contains(low, "ready") || strings.Contains(low, "backlog"):
-		cls = "bg-sky-500/15 text-sky-700 dark:text-sky-400 border-sky-500/30"
+		cls = "bg-surface-raised text-muted border-surface-border"
 	case strings.Contains(low, "progress") || strings.Contains(low, "doing"):
-		cls = "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+		cls = "bg-highlight/15 text-highlight border-highlight/40"
 	case strings.Contains(low, "review"):
-		cls = "bg-violet-500/15 text-violet-700 dark:text-violet-400 border-violet-500/30"
+		cls = "bg-accent/15 text-accent border-accent/40"
 	case strings.Contains(low, "done") || strings.Contains(low, "closed") || strings.Contains(low, "resolved") || strings.Contains(low, "merged"):
-		cls = "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border-emerald-500/30"
+		cls = "bg-emerald-500/15 text-emerald-400 border-emerald-500/40"
 	case strings.Contains(low, "block"):
-		cls = "bg-rose-500/15 text-rose-700 dark:text-rose-400 border-rose-500/30"
+		cls = "bg-rose-500/15 text-rose-400 border-rose-500/40"
 	}
 	label := status
 	if label == "" {
@@ -1074,16 +1109,20 @@ func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
 		}
 
 		// Pick a left-edge accent strip that matches the workflow state.
-		edgeTone := "bg-gray-300 dark:bg-gray-700"
+		// Edge colour mirrors workflowStateChip — emerald=done,
+		// rose=failed, amber-highlight=awaiting-approval, soft purple
+		// for triaging (planning hasn't earned the full brand colour
+		// yet), full purple-accent for active mid-flight work.
+		edgeTone := "bg-surface-border"
 		switch wf.State {
 		case memory.WFDone:
 			edgeTone = "bg-emerald-500"
 		case memory.WFFailed:
 			edgeTone = "bg-rose-500"
 		case memory.WFAwaitingApproval:
-			edgeTone = "bg-amber-500"
+			edgeTone = "bg-highlight"
 		case memory.WFTriaging:
-			edgeTone = "bg-violet-500"
+			edgeTone = "bg-accent/60"
 		default:
 			if total > 0 && pct < 100 {
 				edgeTone = "bg-accent"
@@ -1423,19 +1462,27 @@ func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 // workflowStateChip renders a small workflow-state badge. Flat —
 // no border, low-opacity background, paired text colors. Less
 // visual weight than the bordered-and-shadowed previous version.
+// workflowStateChip maps a workflow lifecycle state to a colored badge.
+// Palette tones:
+//   - done        → emerald (universally "shipped")
+//   - failed      → rose (universally "stop / broken")
+//   - awaiting_approval → amber highlight (the user must act)
+//   - active phases (executing/testing/verifying/etc) → purple accent
+//                   (live brand state — matches the daemon dot)
+//   - planning phases (triaging/planning) → soft purple wash
 func workflowStateChip(state string) string {
-	cls := "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
+	cls := "bg-surface-raised text-muted border border-surface-border"
 	switch state {
 	case "done":
-		cls = "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-400"
+		cls = "bg-emerald-500/15 text-emerald-400 border border-emerald-500/40"
 	case "failed":
-		cls = "bg-rose-50 text-rose-700 dark:bg-rose-500/15 dark:text-rose-400"
+		cls = "bg-rose-500/15 text-rose-400 border border-rose-500/40"
 	case "awaiting_approval":
-		cls = "bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-400"
+		cls = "bg-highlight/15 text-highlight border border-highlight/40"
 	case "executing", "testing", "verifying", "opening_pr", "notifying", "updating_memory":
-		cls = "bg-sky-50 text-sky-700 dark:bg-sky-500/15 dark:text-sky-400"
+		cls = "bg-accent/15 text-accent border border-accent/40"
 	case "triaging", "planning":
-		cls = "bg-violet-50 text-violet-700 dark:bg-violet-500/15 dark:text-violet-400"
+		cls = "bg-accent-soft text-accent border border-accent/25"
 	}
 	return fmt.Sprintf(`<span class="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 text-[11px] font-medium %s">%s</span>`,
 		cls, html.EscapeString(state))
@@ -1450,31 +1497,41 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 			"When a workflow hits an approval gate (confirm_repo / approve_plan) it parks the question here."))
 		return
 	}
-	fmt.Fprint(w, `<div class="space-y-3">`)
-	for _, q := range pending {
+	fmt.Fprint(w, `<div class="space-y-4">`)
+	for i, q := range pending {
 		// Try to guess at the gate type so we can label appropriately.
+		// Both gate kinds use the same amber rail so the user's eye
+		// learns "amber stripe = goon needs me". Tone variation is
+		// reserved for the small pill, which whispers the gate kind.
 		gateLabel := "approval"
-		gateTone := "bg-amber-500/15 text-amber-700 dark:text-amber-400 border-amber-500/30"
+		gateTone := "bg-highlight/15 text-highlight border-highlight/40"
 		ql := strings.ToLower(q.Question)
 		switch {
 		case strings.Contains(ql, "confirm_repo") || strings.Contains(ql, "repo path") || strings.Contains(ql, "which repo"):
 			gateLabel = "confirm repo"
 		case strings.Contains(ql, "approve") || strings.Contains(ql, "plan"):
 			gateLabel = "approve plan"
-			gateTone = "bg-violet-500/15 text-violet-700 dark:text-violet-400 border-violet-500/30"
+			gateTone = "bg-accent/15 text-accent border-accent/40"
 		}
 		ticketLabel := ""
 		if q.TicketID != "" {
-			ticketLabel = fmt.Sprintf(`<span class="inline-flex items-center gap-1 text-xs font-mono text-gray-500 dark:text-gray-400"><svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>%s</span>`, html.EscapeString(q.TicketID))
+			ticketLabel = fmt.Sprintf(`<span class="inline-flex items-center gap-1 text-xs font-mono text-muted"><svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>%s</span>`, html.EscapeString(q.TicketID))
 		}
 		// Parse the question body for a numbered repo menu (lines like
 		// " * 1. eng-app"). When present, render each as a clickable
 		// button that submits the corresponding number — no typing
 		// required.
 		pickButtons := renderRepoPickButtons(q.Question)
+		// Only the FIRST card gets the cta-glow animation. If we glow
+		// every card the loudness loses meaning; the user's eye should
+		// land on the top of the stack and work down.
+		cardGlow := ""
+		if i == 0 {
+			cardGlow = " shadow-glow-amber"
+		}
 		fmt.Fprintf(w, `<form hx-post="/api/answer" hx-target="this" hx-swap="outerHTML"
-			class="relative overflow-hidden rounded-xl border border-amber-500/40 bg-white dark:bg-surface-raised shadow-card hover:shadow-lift transition-shadow">
-			<div class="absolute left-0 top-0 bottom-0 w-1 bg-amber-500"></div>
+			class="relative overflow-hidden rounded-xl border border-highlight/40 bg-surface-raised shadow-card hover:shadow-lift transition-shadow%s">
+			<div class="absolute left-0 top-0 bottom-0 w-1 bg-highlight"></div>
 			<div class="px-5 py-4 space-y-3">
 				<div class="flex items-center gap-2 flex-wrap">
 					<span class="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wider %s">
@@ -1482,34 +1539,34 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 						%s
 					</span>
 					%s
-					<span class="text-[11px] font-mono text-gray-400 ml-auto">id %s</span>
+					<span class="text-[11px] font-mono text-muted/70 ml-auto">id %s</span>
 				</div>
-				<div class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">%s</div>
+				<div class="text-sm text-white whitespace-pre-line leading-relaxed">%s</div>
 				%s
 				<input type="hidden" name="id" value="%s">
 				<div class="flex flex-col sm:flex-row gap-2 pt-1">
 					<input type="text" name="answer" autocomplete="off" autofocus
 						placeholder="yes &nbsp;·&nbsp; no &nbsp;·&nbsp; change=/path/to/repo &nbsp;·&nbsp; free-form feedback"
-						class="flex-1 font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
+						class="flex-1 font-mono text-sm rounded-lg border border-surface-border bg-surface text-white placeholder:text-muted/60 px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
 					<div class="flex gap-2">
 						<button type="submit" name="answer" value="yes" formnovalidate
-							class="inline-flex items-center gap-1 rounded-lg bg-emerald-500 text-white px-3 py-2 text-sm font-semibold hover:bg-emerald-600 transition">
+							class="inline-flex items-center gap-1 rounded-lg bg-emerald-500 text-surface px-3.5 py-2 text-sm font-bold hover:bg-emerald-400 transition shadow-card">
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
 							yes
 						</button>
 						<button type="submit" name="answer" value="no" formnovalidate
-							class="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 bg-rose-500/5 text-rose-700 dark:text-rose-400 px-3 py-2 text-sm font-semibold hover:bg-rose-500/10 transition">
+							class="inline-flex items-center gap-1 rounded-lg border border-rose-500/40 bg-rose-500/5 text-rose-300 px-3.5 py-2 text-sm font-semibold hover:bg-rose-500/15 transition">
 							<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 							no
 						</button>
 						<button type="submit"
-							class="inline-flex items-center gap-1 rounded-lg bg-accent text-surface px-3 py-2 text-sm font-semibold hover:brightness-110 transition">
+							class="inline-flex items-center gap-1 rounded-lg bg-accent text-white px-3.5 py-2 text-sm font-bold hover:brightness-110 hover:shadow-neon transition">
 							send →
 						</button>
 					</div>
 				</div>
 			</div>
-		</form>`, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(q.Question), pickButtons, html.EscapeString(q.ID))
+		</form>`, cardGlow, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(q.Question), pickButtons, html.EscapeString(q.ID))
 	}
 	fmt.Fprint(w, `</div>`)
 }
@@ -1572,18 +1629,25 @@ func renderRepoPickButtons(question string) string {
 
 	var sb strings.Builder
 	sb.WriteString(`<div class="space-y-2 pt-1">`)
-	sb.WriteString(`<div class="text-[11px] uppercase tracking-wider text-gray-500">Pick one or more — first selected becomes the primary repo:</div>`)
+	sb.WriteString(`<div class="text-[11px] uppercase tracking-wider text-muted">Pick one or more — first selected becomes the primary repo:</div>`)
 	fmt.Fprintf(&sb, `<div class="flex flex-wrap gap-2" data-pick-group="%s">`, mid)
 	for _, o := range opts {
-		cls := "border-gray-300 dark:border-surface-border bg-white dark:bg-surface text-gray-700 dark:text-gray-300 hover:border-accent"
+		// Unselected pill: faint surface, hover lifts toward purple.
+		// Suggested pill: filled with the soft accent wash so the
+		// recommended choice reads first even before the user looks.
+		cls := "border-surface-border bg-surface text-muted hover:border-accent hover:text-white"
 		badge := ""
 		if o.isSug {
-			cls = "border-accent/50 bg-accent-soft text-accent hover:bg-accent hover:text-surface"
+			cls = "border-accent/50 bg-accent-soft text-accent hover:bg-accent hover:text-white"
 			badge = `<span class="text-[10px] uppercase tracking-wider opacity-70">suggested</span>`
 		}
 		remoteBadge := ""
 		if o.isRemote {
-			remoteBadge = `<span class="text-[10px] uppercase tracking-wider text-violet-600 dark:text-violet-400">remote</span>`
+			// "remote" tag uses amber so it stands distinctly apart
+			// from the purple suggested-tag without competing for
+			// the primary CTA's amber rail (those use highlight too,
+			// but in different positions).
+			remoteBadge = `<span class="text-[10px] uppercase tracking-wider text-highlight">remote</span>`
 		}
 		fmt.Fprintf(&sb, `<label class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition cursor-pointer %s">
 			<input type="checkbox" data-pick="%d" data-group="%s" class="h-3.5 w-3.5 accent-accent" onchange="goonPickToggle('%s')">
@@ -1596,10 +1660,10 @@ func renderRepoPickButtons(question string) string {
 	sb.WriteString(`</div>`)
 	fmt.Fprintf(&sb, `<div class="flex items-center gap-2 pt-1">
 		<button type="submit" name="answer" data-pick-submit="%s" formnovalidate disabled
-			class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-3 py-1.5 text-sm font-semibold opacity-40 cursor-not-allowed transition">
+			class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-white px-3 py-1.5 text-sm font-bold opacity-40 cursor-not-allowed transition">
 			<span data-pick-label="%s">pick a repo</span>
 		</button>
-		<span class="text-[11px] text-gray-500" data-pick-summary="%s"></span>
+		<span class="text-[11px] text-muted" data-pick-summary="%s"></span>
 	</div>`, mid, mid, mid)
 	sb.WriteString(`</div>`)
 	// One small script — the renderer is called per-question so we
@@ -1630,11 +1694,12 @@ func renderRepoPickButtons(question string) string {
 }
 
 // emptyState is the standardized empty-list panel — title + helpful hint.
-// Centralized so every empty list looks the same.
+// A dashed accent-purple border + a soft surface-raised wash signals
+// "this slot is ready for content" without screaming.
 func emptyState(title, hint string) string {
-	return fmt.Sprintf(`<div class="rounded-lg border border-dashed border-gray-300 dark:border-gray-700 bg-gray-50/50 dark:bg-surface-raised/40 p-8 text-center">
-		<div class="text-sm font-medium text-gray-700 dark:text-gray-300">%s</div>
-		<div class="mt-1 text-xs text-gray-500 dark:text-gray-500 max-w-md mx-auto">%s</div>
+	return fmt.Sprintf(`<div class="rounded-xl border border-dashed border-accent/25 bg-surface-raised/40 p-8 text-center">
+		<div class="text-sm font-semibold text-white">%s</div>
+		<div class="mt-1 text-xs text-muted max-w-md mx-auto">%s</div>
 	</div>`, html.EscapeString(title), html.EscapeString(hint))
 }
 
@@ -1649,7 +1714,7 @@ func emptyState(title, hint string) string {
 func pageHeader(title, blurb, action string) string {
 	desc := ""
 	if blurb != "" {
-		desc = fmt.Sprintf(`<p class="mt-1 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">%s</p>`, blurb)
+		desc = fmt.Sprintf(`<p class="mt-1 text-sm text-muted max-w-2xl">%s</p>`, blurb)
 	}
 	act := ""
 	if action != "" {
@@ -1657,7 +1722,7 @@ func pageHeader(title, blurb, action string) string {
 	}
 	return fmt.Sprintf(`<div class="mb-5 flex items-start justify-between gap-4 flex-wrap">
 		<div>
-			<h2 class="text-xl font-semibold tracking-tight">%s</h2>
+			<h2 class="text-2xl font-semibold tracking-tight text-white">%s</h2>
 			%s
 		</div>
 		%s
@@ -1668,7 +1733,7 @@ func pageHeader(title, blurb, action string) string {
 // Questions/Workflows/Tickets/PRs page headers.
 func refreshButton() string {
 	return `<button type="button" hx-post="/api/refresh" hx-target="#page-refresh-result" hx-swap="innerHTML"
-		class="inline-flex items-center gap-1.5 rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1.5 text-xs text-gray-600 dark:text-gray-400 hover:border-accent hover:text-accent transition">
+		class="inline-flex items-center gap-1.5 rounded-md border border-surface-border px-2.5 py-1.5 text-xs text-muted hover:border-accent hover:text-accent hover:bg-accent-soft transition">
 		<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/></svg>
 		refresh
 	</button>
@@ -2051,14 +2116,17 @@ func statCard(label, value, tone string) string {
 		ring = "border-emerald-500/30 bg-emerald-500/5"
 		accent = "text-emerald-700 dark:text-emerald-400"
 	case "indigo":
-		ring = "border-indigo-500/30 bg-indigo-500/5"
-		accent = "text-indigo-700 dark:text-indigo-400"
+		// "indigo" was the pre-redesign neutral-but-cool accent. With
+		// the new palette the equivalent slot is the brand accent
+		// itself, so collapse the case onto the accent variant.
+		ring = "border-accent/30 bg-accent/5"
+		accent = "text-accent"
 	case "accent":
 		ring = "border-accent/30 bg-accent/5"
 		accent = "text-accent"
 	default:
-		ring = "border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised"
-		accent = "text-gray-700 dark:text-gray-300"
+		ring = "border-surface-border bg-surface-raised"
+		accent = "text-muted"
 	}
 	return fmt.Sprintf(`<div class="rounded-xl border %s p-4">
 		<div class="text-[11px] uppercase tracking-wider text-gray-500">%s</div>
