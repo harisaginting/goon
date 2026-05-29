@@ -691,9 +691,19 @@ func mustReadRepository() []repository.Entry {
 // list means "accept these picks." When preselected is empty the
 // menu still works — user just types numbers.
 func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoCandidate, preselected []string) string {
+	// "Suggested:" is only meaningful when triage actually picked a
+	// specific repo. The fallback path returns t.Project (the Jira/board
+	// project key, e.g. "EB"), which is NOT a repo name — showing
+	// "Suggested: EB" in the UI is just noise. Detect that case and
+	// switch to honest copy.
+	isRealSuggestion := suggested != "" && suggested != t.Project
+	suggestedLine := "Suggested: " + suggested
+	if !isRealSuggestion {
+		suggestedLine = "No specific repo suggested — pick one below."
+	}
 	if len(candidates) == 0 {
-		return fmt.Sprintf("Confirm repo for %s — %q\nSuggested: %s\nReply: yes / change=<path> / no",
-			t.Key, t.Title, suggested)
+		return fmt.Sprintf("Confirm repo for %s — %q\n%s\nReply: yes / change=<path> / no",
+			t.Key, t.Title, suggestedLine)
 	}
 	// Build a quick lookup for "did triage suggest this one?"
 	pre := map[string]bool{}
@@ -708,15 +718,15 @@ func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoC
 		fmt.Fprintf(&sb, "Triage suggests %d repos (reply `yes` to accept all): %s\n\n",
 			len(preselected), strings.Join(preselected, ", "))
 	} else {
-		fmt.Fprintf(&sb, "Suggested: %s\n\n", suggested)
+		fmt.Fprintf(&sb, "%s\n\n", suggestedLine)
 	}
 	sb.WriteString("Available repos:\n")
 	for i, c := range candidates {
 		marker := " "
 		isSuggested := pre[strings.ToLower(c.Value)]
 		switch {
-		case c.Value == suggested:
-			marker = "*" // primary
+		case isRealSuggestion && c.Value == suggested:
+			marker = "*" // primary — only when triage actually picked it
 		case isSuggested:
 			marker = "→" // also picked by triage
 		}
@@ -726,7 +736,9 @@ func buildRepoGateQuestion(t boards.Ticket, suggested string, candidates []repoC
 		}
 		fmt.Fprintf(&sb, " %s %d. %s%s\n", marker, i+1, c.Label, tag)
 	}
-	sb.WriteString("\nReply: <n> or <n>,<n>,<n> (one or more numbers — first becomes primary)  |  yes (accept the suggested picks)  |  change=<path>  |  no")
+	// Short reply hint for CLI/Telegram. The web UI strips this line
+	// via stripRepoMenu since web users have buttons for every option.
+	sb.WriteString("\nReply with a number, `yes`, or `no`.")
 	return sb.String()
 }
 

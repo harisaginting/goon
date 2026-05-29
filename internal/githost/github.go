@@ -384,6 +384,7 @@ func (g *GitHub) GetPRDetails(ctx context.Context, repo string, number int) (PR,
 		Number: meta.Number, URL: meta.HTMLURL, Title: meta.Title,
 		Branch: meta.Head.Ref, Author: meta.User.Login, State: meta.State,
 		Body: meta.Body, Repo: repo,
+		Reviewers: g.collectReviewers(ctx, repo, number, meta.RequestedReviewers),
 	}
 	// Fetch the diff via the special Accept header.
 	diff, err := g.fetchDiff(ctx, prURL)
@@ -445,6 +446,12 @@ func (g *GitHub) fetchDiff(ctx context.Context, prURL string) (string, error) {
 	return string(raw), nil
 }
 
+// ghUserRef is the minimal GitHub user shape ({"login":"..."}) used by
+// the requested-reviewers and review payloads.
+type ghUserRef struct {
+	Login string `json:"login"`
+}
+
 // ghPRListItem mirrors only the GitHub fields we care about.
 type ghPRListItem struct {
 	Number  int    `json:"number"`
@@ -458,6 +465,75 @@ type ghPRListItem struct {
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
+	RequestedReviewers []ghUserRef `json:"requested_reviewers"`
+}
+
+// collectReviewers builds a PR's reviewer list: the still-pending
+// requested reviewers overlaid with the latest settled review state per
+// user. The /reviews call is best-effort — if it fails we still return
+// the pending set rather than failing GetPRDetails.
+func (g *GitHub) collectReviewers(ctx context.Context, repo string, number int, requested []ghUserRef) []Reviewer {
+	byLogin := map[string]Reviewer{}
+	order := []string{}
+	add := func(login string, r Reviewer) {
+		if login == "" {
+			return
+		}
+		if _, ok := byLogin[login]; !ok {
+			order = append(order, login)
+		}
+		byLogin[login] = r
+	}
+	for _, u := range requested {
+		add(u.Login, Reviewer{Name: u.Login, State: "pending"})
+	}
+	raw, err := g.do(ctx, http.MethodGet,
+		fmt.Sprintf("%s/repos/%s/pulls/%d/reviews?per_page=100", g.APIURL, repo, number), nil)
+	if err == nil {
+		var reviews []struct {
+			User  ghUserRef `json:"user"`
+			State string    `json:"state"`
+		}
+		if json.Unmarshal(raw, &reviews) == nil {
+			// /reviews is chronological — iterating in order means the
+			// latest settled review wins.
+			for _, rv := range reviews {
+				st := ghReviewState(rv.State)
+				if st == "" {
+					continue // PENDING / DISMISSED — not a settled signal
+				}
+				login := rv.User.Login
+				if st == "commented" {
+					// A plain comment must not downgrade a prior
+					// approve / changes-requested.
+					if cur, ok := byLogin[login]; ok && cur.State != "pending" {
+						continue
+					}
+				}
+				add(login, Reviewer{Name: login, State: st, Approved: st == "approved"})
+			}
+		}
+	}
+	out := make([]Reviewer, 0, len(order))
+	for _, l := range order {
+		out = append(out, byLogin[l])
+	}
+	return out
+}
+
+// ghReviewState maps a GitHub review state onto goon's vocabulary.
+// Returns "" for states that don't settle a reviewer's position.
+func ghReviewState(s string) string {
+	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "APPROVED":
+		return "approved"
+	case "CHANGES_REQUESTED":
+		return "changes_requested"
+	case "COMMENTED":
+		return "commented"
+	default:
+		return ""
+	}
 }
 
 func (g *GitHub) do(ctx context.Context, method, url string, body io.Reader) ([]byte, error) {

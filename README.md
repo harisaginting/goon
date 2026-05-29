@@ -444,6 +444,19 @@ Drafts and forwarded notifications are de-duplicated in `storage/memory.json`,
 so `--watch` and the daemon loop never spam you with the same item twice
 (`--all` ignores the dedup state for a one-off full pass).
 
+You can also just **ask in plain chat** — on Telegram or the web dashboard.
+The chat agent has PR tools (`pr_get`, `pr_list`, `pr_comment`, `pr_approve`,
+`pr_request_changes`) on top of the Jira ones, so questions like *"who's
+reviewing https://bitbucket.org/acme/api/pull-requests/629?"* or *"approve
+that PR"* work without a slash command. Paste a PR URL and goon resolves the
+repo + number itself, across GitHub, GitLab and Bitbucket.
+
+The same chat also reaches Confluence (`confluence_search`, `confluence_get`)
+and the web (`web_search`, `web_fetch`) — so one casual question can pull
+from your tickets, PRs, wiki, or a live web lookup, whichever fits. It
+deliberately stops there: running shell commands stays on the explicit
+`goon "<task>"` / `/run` path, never a casual chat message.
+
 ---
 
 ## Daily commands

@@ -64,6 +64,13 @@ next turn.
   notes in GOON STATE first and name the relevant note.
 - When the user wants to ACT on CODE (edit, ship), tell them to use
   /run <task> for the agent runtime — that's outside chat scope.
+- You CAN read and act on pull requests directly via the pr_* tools
+  (reviewers, status, comment, approve, request changes). When the user
+  pastes a PR URL, pass it straight through as the "pr" argument.
+- You can also search the Confluence wiki (confluence_search,
+  confluence_get) and the web (web_search, web_fetch). Check the TOOLS
+  block for which ones are wired this session, and use them instead of
+  guessing from memory.
 
 # COMMANDS THE USER HAS:
 
@@ -110,6 +117,7 @@ func (b *Bot) handleChat(ctx context.Context, chatID int64, text string) {
 		LLM:          b.opts.LLM,
 		Memory:       b.opts.Memory,
 		Board:        b.opts.Board,
+		Host:         b.opts.Host,
 		SystemPrompt: chatSystemPrompt,
 		History:      historySnapshot,
 		UserMessage:  text,

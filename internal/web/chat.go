@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
@@ -10,8 +11,10 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/agentctx"
+	"github.com/harisaginting/goon/internal/chats"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/notes"
+	"github.com/harisaginting/goon/internal/repository"
 )
 
 // chatSystemPrompt mirrors the Telegram bot's chat persona. Both
@@ -58,7 +61,13 @@ next turn.
 - For project facts / how-it-works questions, check the knowledge
   notes in GOON STATE first and name the relevant note.
 - When the user wants to ACT on CODE (edit, ship), tell them to use
-  the CLI's ` + "`" + `goon "<task>"` + "`" + ` for the agent runtime — that's outside chat scope.`
+  the CLI's ` + "`" + `goon "<task>"` + "`" + ` for the agent runtime — that's outside chat scope.
+- You CAN read and act on pull requests directly via the pr_* tools
+  (reviewers, status, comment, approve, request changes). When the user
+  pastes a PR URL, pass it straight through as the "pr" argument.
+- You can also search the Confluence wiki (confluence_search,
+  confluence_get) and the web (web_search, web_fetch). Check the TOOLS
+  block for which ones are wired this session.`
 
 const maxWebChatHistory = 6 // turn pairs
 
@@ -87,11 +96,52 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-thread persistence. The form may carry a thread_id (continuing
+	// an existing thread) or omit it (starting a fresh thread). The repo
+	// form value scopes the conversation to a specific repo — surfaces as
+	// a system-prompt prefix the LLM sees on every turn AND is stored on
+	// the thread so reopening preserves the scope.
+	threadID := strings.TrimSpace(r.FormValue("thread_id"))
+	repoCtx := strings.TrimSpace(r.FormValue("repo"))
+	var existingThread chats.Thread
+	if threadID != "" {
+		if t, err := chats.Read(threadID); err == nil {
+			existingThread = t
+			// If the form didn't carry a repo context but the thread
+			// has one, inherit it — keeps the scope sticky across
+			// page reloads where the form fields might be empty.
+			if repoCtx == "" {
+				repoCtx = t.RepoContext
+			}
+		}
+	}
+	if threadID == "" {
+		threadID = chats.NewID()
+	}
+
+	// Build the system prompt. When the user picked a repo context,
+	// prepend a small "REPO CONTEXT" block so the agent grounds its
+	// answers in that repo without the user having to repeat the slug
+	// on every message.
+	systemPrompt := chatSystemPrompt
+	if repoCtx != "" {
+		systemPrompt = "REPO CONTEXT (the user is talking about this repo unless they say otherwise): " +
+			repoCtx + "\n\n" + chatSystemPrompt
+	}
+
 	// Snapshot existing history (without the new user turn) so the
 	// agent-loop helper can append both turns atomically at the end.
-	s.chatMu.Lock()
-	historySnapshot := append([]llm.Message(nil), s.chatHistory...)
-	s.chatMu.Unlock()
+	// The thread's persisted history takes precedence when present —
+	// it's the canonical record across page reloads. Falls back to
+	// the in-process rolling history when no thread is loaded.
+	var historySnapshot []llm.Message
+	if len(existingThread.Messages) > 0 {
+		historySnapshot = append([]llm.Message(nil), existingThread.Messages...)
+	} else {
+		s.chatMu.Lock()
+		historySnapshot = append([]llm.Message(nil), s.chatHistory...)
+		s.chatMu.Unlock()
+	}
 
 	// Run the LLM↔tool loop. The agent decides whether to query the
 	// board live (search_jira tool) or answer from the GOON STATE
@@ -103,7 +153,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		LLM:          s.opts.LLM,
 		Memory:       s.opts.Memory,
 		Board:        s.opts.Board,
-		SystemPrompt: chatSystemPrompt,
+		Host:         s.opts.Host,
+		SystemPrompt: systemPrompt,
 		History:      historySnapshot,
 		UserMessage:  msg,
 	})
@@ -122,6 +173,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.chatHistory = trimChatHistory(s.chatHistory)
 	s.chatMu.Unlock()
 
+	// Persist the thread atomically. Persisted history is the FULL
+	// conversation (no trim) — chats.Thread is the durable record;
+	// the in-process s.chatHistory is just the working window for
+	// turns when no thread id is in play.
+	persisted := append([]llm.Message(nil), historySnapshot...)
+	persisted = append(persisted, result.NewTurns...)
+	thread := chats.Thread{
+		ID:          threadID,
+		Title:       existingThread.Title,
+		RepoContext: repoCtx,
+		Created:     existingThread.Created,
+		Messages:    persisted,
+	}
+	if err := chats.Write(thread); err != nil {
+		// Non-fatal — the in-process history still works. Log via
+		// stderr so the operator can spot disk issues.
+		fmt.Fprintf(s.opts.Stderr, "chat: persist thread %s: %v\n", threadID, err)
+	} else {
+		// Tell the client side which thread id won, so the form can
+		// continue posting against the right one. HX-Trigger fires
+		// the threadsChanged event so the sidebar list re-renders
+		// with the new title.
+		w.Header().Set("HX-Trigger", fmt.Sprintf(`{"threadsChanged":{},"chatThreadID":"%s"}`,
+			jsEscape(threadID)))
+		s.events.Publish("threadsChanged")
+	}
+
 	// Return TWO bubbles back-to-back: the user's message echoed
 	// (in case the form clear races the response render) + the
 	// assistant reply. htmx's beforeend swap on the message column
@@ -129,6 +207,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	writeChatBubble(w, "user", msg)
 	writeChatBubble(w, "assistant", reply)
+}
+
+// jsEscape is a tiny JSON-string escape so we can interpolate the
+// thread id safely into the HX-Trigger header without pulling in
+// encoding/json just for one value. Only handles the characters
+// that break a JSON string token — backslash and double quote.
+func jsEscape(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`)
 }
 
 // handleChatReset clears the rolling history. Lets the user start a
@@ -147,6 +233,122 @@ func (s *Server) handleChatReset(w http.ResponseWriter, r *http.Request) {
 	io.WriteString(w, chatTranscriptEmpty)
 }
 
+// handleChatThreads renders the left-rail thread list — past
+// conversations the user can reopen. Pure HTML fragment (no JSON)
+// so htmx swaps it directly into the sidebar.
+func (s *Server) handleChatThreads(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	threads, err := chats.List()
+	if err != nil {
+		fmt.Fprintf(w, `<div class="text-xs text-rose-500">failed to list threads: %s</div>`, html.EscapeString(err.Error()))
+		return
+	}
+	fmt.Fprint(w, `<div class="space-y-1">`)
+	if len(threads) == 0 {
+		fmt.Fprint(w, `<div class="text-[11px] text-muted/70 px-2 py-1 italic">No saved chats yet. Send a message to start one.</div>`)
+	}
+	for _, t := range threads {
+		ago := humanizeAgo(time.Since(t.Updated))
+		repoBadge := ""
+		if t.RepoContext != "" {
+			repoBadge = fmt.Sprintf(`<span class="block text-[10px] text-accent/70 truncate">@ %s</span>`, html.EscapeString(t.RepoContext))
+		}
+		fmt.Fprintf(w, `<div class="group flex items-center gap-1 rounded-md hover:bg-surface-raised transition px-1">
+			<button type="button" onclick="goonChatLoadThread('%s')"
+				class="flex-1 min-w-0 text-left py-1.5 px-1.5">
+				<div class="text-xs text-white truncate">%s</div>
+				%s
+				<div class="text-[10px] text-muted/70">%s · %d msg%s</div>
+			</button>
+			<form hx-post="/api/chat/thread/delete" hx-confirm="Delete this saved chat?" hx-target="#chat-threads" hx-swap="innerHTML" class="opacity-0 group-hover:opacity-100 transition">
+				<input type="hidden" name="id" value="%s">
+				<button type="submit" class="text-xs text-muted hover:text-rose-500 px-1.5 py-1" title="delete">✕</button>
+			</form>
+		</div>`,
+			html.EscapeString(t.ID),
+			html.EscapeString(t.Title),
+			repoBadge,
+			html.EscapeString(ago), t.MessageN, pluralS(t.MessageN),
+			html.EscapeString(t.ID),
+		)
+	}
+	fmt.Fprint(w, `</div>`)
+}
+
+// handleChatThread returns one full thread as JSON so the client can
+// hydrate the transcript pane (and the active thread_id form field)
+// without a full page reload.
+func (s *Server) handleChatThread(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	t, err := chats.Read(id)
+	if err != nil {
+		http.Error(w, "load failed: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(t); err != nil {
+		fmt.Fprintf(s.opts.Stderr, "chat: encode thread %s: %v\n", id, err)
+	}
+}
+
+// handleChatThreadDelete removes a saved thread + refreshes the
+// sidebar list. Idempotent: re-deleting a missing thread is a no-op
+// so the UI never gets stuck on a stale row.
+func (s *Server) handleChatThreadDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		http.Error(w, "id required", http.StatusBadRequest)
+		return
+	}
+	if err := chats.Delete(id); err != nil {
+		http.Error(w, "delete failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Re-render the sidebar list with the row gone.
+	s.handleChatThreads(w, r)
+}
+
+// handleChatSaveAsNote distils a saved thread into a markdown file
+// under the notes store so the LLM sees it in every future run.
+// The user supplies a kebab-case filename via the `name` form field;
+// empty falls back to a slug of the thread title.
+func (s *Server) handleChatSaveAsNote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	name := strings.TrimSpace(r.FormValue("name"))
+	if id == "" {
+		fragErr(w, "thread id required")
+		return
+	}
+	path, err := chats.SaveAsNote(id, name)
+	if err != nil {
+		fragErr(w, "save as note failed: "+err.Error())
+		return
+	}
+	w.Header().Set("HX-Trigger", "memoryChanged")
+	s.events.Publish("memoryChanged")
+	fragOK(w, "saved to "+path+" — visible to goon in every future run")
+}
+
 // chatTranscriptEmpty is the "nothing here yet" pane rendered before
 // the first message and after /api/chat/reset. Includes clickable
 // example prompts that auto-fill the composer.
@@ -155,7 +357,7 @@ const chatTranscriptEmpty = `<div id="chat-transcript" class="flex flex-col gap-
 		<div class="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-base font-bold shadow-lift">GO</div>
 		<div class="text-sm font-medium text-gray-700 dark:text-gray-300">Ask goon anything</div>
 		<div class="mt-1 text-xs text-gray-500 dark:text-gray-500">
-			Grounded on your live tickets, workflows, pending questions, and knowledge notes.
+			Grounded on your live tickets, PRs, workflows, and knowledge notes. Tools: Jira · PRs · Confluence · web.
 		</div>
 		<div class="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2 text-left">
 			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="what tickets are open?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
@@ -166,13 +368,13 @@ const chatTranscriptEmpty = `<div id="chat-transcript" class="flex flex-col gap-
 				<div class="font-medium">→ any pending approvals?</div>
 				<div class="mt-0.5 text-[11px] text-gray-500">workflows waiting on you</div>
 			</button>
+			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="review my open PRs awaiting my review" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
+				<div class="font-medium">→ review my open PRs</div>
+				<div class="mt-0.5 text-[11px] text-gray-500">draft a review for PRs awaiting me</div>
+			</button>
 			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="what do you know about this project?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
 				<div class="font-medium">→ what do you know about this project?</div>
 				<div class="mt-0.5 text-[11px] text-gray-500">recall from SOUL.md + notes</div>
-			</button>
-			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="summarize the most recent workflow run" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
-				<div class="font-medium">→ summarize recent runs</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">latest workflow state</div>
 			</button>
 		</div>
 	</div>
@@ -245,19 +447,32 @@ func trimChatHistory(hist []llm.Message) []llm.Message {
 func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	llmAvailable := s.opts.LLM != nil
+
+	// Pre-fetch the REPOSITORY.md entries for the repo-context picker
+	// so users can scope a conversation without typing slugs. Empty
+	// when no host is configured / no repos tracked — the picker
+	// collapses to a free-text input in that case.
+	repoEntries, _ := repositoryEntriesForPicker()
+
 	fmt.Fprint(w, `<section>
 		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
 			<div>
 				<h2 class="text-xl font-semibold tracking-tight">Chat</h2>
 				<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-					Ask about tickets, workflows, and your knowledge notes. Goon can also comment, transition, and update Jira tickets when you ask it to.
+					Ask about tickets, PRs, or your knowledge notes. Goon can comment on Jira tickets and pull requests, move statuses, draft PR reviews, search Confluence, and fetch web pages. Conversations are saved automatically — reopen one anytime from the left rail.
 				</p>
 			</div>
-			<button type="button" hx-post="/api/chat/reset" hx-target="#chat-transcript" hx-swap="outerHTML"
-				class="inline-flex items-center gap-1.5 rounded-md border border-gray-200 dark:border-surface-border px-3 py-1.5 text-xs text-gray-500 hover:border-rose-500/40 hover:text-rose-500 transition">
-				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-				reset
-			</button>
+			<div class="flex items-center gap-2">
+				<button type="button" onclick="goonChatNewThread()"
+					class="inline-flex items-center gap-1.5 rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+					new chat
+				</button>
+				<button type="button" hx-post="/api/chat/reset" hx-target="#chat-transcript" hx-swap="outerHTML"
+					class="inline-flex items-center gap-1.5 rounded-md border border-gray-200 dark:border-surface-border px-3 py-1.5 text-xs text-gray-500 hover:border-rose-500/40 hover:text-rose-500 transition">
+					reset window
+				</button>
+			</div>
 		</div>`)
 	if !llmAvailable {
 		fmt.Fprint(w, `<div class="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
@@ -265,71 +480,214 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 		</div></section>`)
 		return
 	}
-	fmt.Fprint(w, `
-		<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card overflow-hidden">
-			<div class="px-4 py-4 sm:px-5 sm:py-5">
-				`)
+
+	// Two-column layout: thread sidebar (left) + chat panel (right).
+	// Sidebar collapses on narrow viewports to a stacked accordion.
+	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-[16rem_1fr] gap-4">`)
+
+	// --- Left rail: saved threads -------------------------------------------
+	fmt.Fprint(w, `<aside class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card overflow-hidden">
+		<div class="px-3 py-2 border-b border-surface-border flex items-center justify-between">
+			<div class="text-[11px] uppercase tracking-wider text-muted font-semibold">Saved chats</div>
+		</div>
+		<div id="chat-threads" class="px-1.5 py-2 max-h-[60vh] overflow-y-auto scrollbar-thin"
+			hx-get="/api/chat/threads" hx-trigger="load, threadsChanged from:body" hx-swap="innerHTML">
+			<div class="text-xs text-muted px-2 py-1">Loading…</div>
+		</div>
+	</aside>`)
+
+	// --- Right: chat panel --------------------------------------------------
+	fmt.Fprint(w, `<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card overflow-hidden flex flex-col min-h-[60vh]">`)
+
+	// Repo-context picker pinned above the transcript.
+	fmt.Fprint(w, `<div class="px-4 py-3 border-b border-surface-border bg-surface-sunken/40 flex items-center gap-3 flex-wrap">
+		<label class="text-[11px] uppercase tracking-wider text-muted font-semibold whitespace-nowrap">talking about</label>
+		<select id="chat-repo-context" name="repo"
+			class="flex-1 min-w-[180px] rounded-md border border-surface-border bg-surface text-sm text-white px-2 py-1 focus:border-accent focus:outline-none">
+			<option value="">— no specific repo —</option>`)
+	for _, e := range repoEntries {
+		fmt.Fprintf(w, `<option value="%s">%s</option>`,
+			html.EscapeString(e), html.EscapeString(e))
+	}
+	fmt.Fprint(w, `</select>
+		<span class="text-[10px] text-muted/70 hidden sm:inline">Goon uses this as scope for every message until you change it.</span>
+	</div>`)
+
+	// Transcript + composer.
+	fmt.Fprint(w, `<div class="px-4 py-4 sm:px-5 sm:py-5 flex-1 overflow-y-auto">`)
 	fmt.Fprint(w, chatTranscriptEmpty)
-	fmt.Fprint(w, `
-			</div>
-			<div class="border-t border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/60 px-3 py-3 sm:px-4">
-				<form id="goon-chat-form" hx-post="/api/chat" hx-target="#chat-transcript" hx-swap="beforeend"
-					hx-on::after-request="goonChatAfter()" class="flex items-end gap-2">
-					<div class="flex-1 relative">
-						<textarea id="goon-chat-input" name="message" autocomplete="off" required autofocus rows="1"
-							placeholder="ask goon anything about your tickets, workflows, or knowledge…  (Shift+Enter for newline)"
-							class="w-full resize-none rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 pr-10 text-sm focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none max-h-40"
-							onkeydown="goonChatKey(event)"
-							oninput="goonChatAutosize(this)"></textarea>
-						<div class="absolute bottom-2 right-3 text-[10px] text-gray-400 pointer-events-none htmx-indicator">
-							<svg class="h-4 w-4 animate-spin-slow text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"/><path d="M22 12a10 10 0 0 1-10 10"/></svg>
-						</div>
+	fmt.Fprint(w, `</div>
+		<div class="border-t border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/60 px-3 py-3 sm:px-4">
+			<form id="goon-chat-form" hx-post="/api/chat" hx-target="#chat-transcript" hx-swap="beforeend"
+				hx-on::after-request="goonChatAfter(event)" class="flex items-end gap-2">
+				<!-- Hidden fields auto-populated from the picker + the current
+				     thread id. JS keeps them in sync so the server always
+				     knows which thread + which repo scope to write against. -->
+				<input type="hidden" id="goon-chat-thread-id" name="thread_id" value="">
+				<input type="hidden" id="goon-chat-repo-mirror" name="repo" value="">
+				<div class="flex-1 relative">
+					<textarea id="goon-chat-input" name="message" autocomplete="off" required autofocus rows="1"
+						placeholder="ask goon anything…  (Shift+Enter for newline)"
+						class="w-full resize-none rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 pr-10 text-sm focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none max-h-40"
+						onkeydown="goonChatKey(event)"
+						oninput="goonChatAutosize(this)"></textarea>
+					<div class="absolute bottom-2 right-3 text-[10px] text-gray-400 pointer-events-none htmx-indicator">
+						<svg class="h-4 w-4 animate-spin-slow text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"/><path d="M22 12a10 10 0 0 1-10 10"/></svg>
 					</div>
+				</div>
+				<button type="submit"
+					class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 active:brightness-95 transition shadow-sm">
+					<span>send</span>
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+				</button>
+			</form>
+			<!-- Thread actions row: save-as-knowledge is the standout — converts
+			     the conversation into a markdown note goon loads on every run. -->
+			<div id="chat-thread-actions" class="hidden mt-2 flex items-center gap-2 text-[11px]">
+				<form hx-post="/api/chat/save-as-note" hx-target="#chat-action-result" hx-swap="innerHTML" class="flex items-center gap-1.5">
+					<input type="hidden" id="goon-chat-thread-id-mirror" name="id" value="">
+					<input type="text" name="name" placeholder="kebab-case-name (optional)"
+						class="rounded-md border border-surface-border bg-surface px-2 py-1 text-xs w-48 focus:border-accent focus:outline-none">
 					<button type="submit"
-						class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 active:brightness-95 transition shadow-sm">
-						<span>send</span>
-						<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+						class="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 text-emerald-700 dark:text-emerald-400 px-2.5 py-1 text-xs hover:bg-emerald-500/10 transition"
+						title="save this conversation as a knowledge note that goon loads on every run">
+						✨ save as knowledge
 					</button>
 				</form>
+				<span id="chat-action-result" class="text-muted"></span>
 			</div>
 		</div>
+	</div>
+	</div>`)
 
-		<script>
-		(function() {
-			window.goonChatFill = function(q) {
-				const ta = document.getElementById('goon-chat-input');
-				if (!ta) return;
-				ta.value = q;
-				ta.focus();
-				goonChatAutosize(ta);
-			};
-			window.goonChatAutosize = function(el) {
-				el.style.height = 'auto';
-				el.style.height = Math.min(el.scrollHeight, 160) + 'px';
-			};
-			window.goonChatKey = function(ev) {
-				if (ev.key === 'Enter' && !ev.shiftKey) {
-					ev.preventDefault();
-					const form = document.getElementById('goon-chat-form');
-					if (form) htmx.trigger(form, 'submit');
+	// --- JS plumbing --------------------------------------------------------
+	fmt.Fprint(w, `<script>
+	(function() {
+		window.goonChatFill = function(q) {
+			const ta = document.getElementById('goon-chat-input');
+			if (!ta) return;
+			ta.value = q; ta.focus(); goonChatAutosize(ta);
+		};
+		window.goonChatAutosize = function(el) {
+			el.style.height = 'auto';
+			el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+		};
+		window.goonChatKey = function(ev) {
+			if (ev.key === 'Enter' && !ev.shiftKey) {
+				ev.preventDefault();
+				const form = document.getElementById('goon-chat-form');
+				if (form) htmx.trigger(form, 'submit');
+			}
+		};
+		// Mirror the repo picker into the hidden form field on every change
+		// so the form post always carries the latest scope.
+		const picker = document.getElementById('chat-repo-context');
+		const mirror = document.getElementById('goon-chat-repo-mirror');
+		if (picker && mirror) {
+			const sync = function(){ mirror.value = picker.value; };
+			picker.addEventListener('change', sync);
+			sync();
+		}
+		window.goonChatAfter = function(ev) {
+			const ta = document.getElementById('goon-chat-input');
+			if (ta) { ta.value = ''; ta.style.height = ''; ta.focus(); }
+			const t = document.getElementById('chat-transcript');
+			if (t) t.scrollTop = t.scrollHeight;
+			// Pick up the thread id the server resolved (new or existing)
+			// from the HX-Trigger payload so subsequent posts continue
+			// the same thread instead of creating new ones.
+			try {
+				const trig = ev && ev.detail && ev.detail.xhr && ev.detail.xhr.getResponseHeader('HX-Trigger');
+				if (trig) {
+					const j = JSON.parse(trig);
+					if (j && j.chatThreadID) {
+						const f = document.getElementById('goon-chat-thread-id');
+						const fm = document.getElementById('goon-chat-thread-id-mirror');
+						if (f) f.value = j.chatThreadID;
+						if (fm) fm.value = j.chatThreadID;
+						const acts = document.getElementById('chat-thread-actions');
+						if (acts) acts.classList.remove('hidden');
+					}
 				}
-			};
-			window.goonChatAfter = function() {
-				const ta = document.getElementById('goon-chat-input');
-				if (ta) { ta.value = ''; ta.style.height = ''; ta.focus(); }
-				const t = document.getElementById('chat-transcript');
-				if (t) t.scrollTop = t.scrollHeight;
-			};
-			// Scroll on initial load if there's already content (resume cases).
-			document.addEventListener('htmx:afterSwap', function(e) {
-				const t = document.getElementById('chat-transcript');
-				if (t && e.target && (e.target.id === 'chat-transcript' || t.contains(e.target))) {
-					t.scrollTop = t.scrollHeight;
-				}
-			});
-		})();
-		</script>
+			} catch(e) {}
+		};
+		window.goonChatNewThread = function() {
+			// Clear thread id + transcript + composer to start fresh.
+			const fields = ['goon-chat-thread-id','goon-chat-thread-id-mirror'];
+			fields.forEach(function(id){ const f = document.getElementById(id); if (f) f.value = ''; });
+			const t = document.getElementById('chat-transcript');
+			if (t) t.outerHTML = ` + "`" + "`" + `;
+			// Re-fetch the empty transcript template via reset.
+			htmx.ajax('POST', '/api/chat/reset', '#goon-chat-form');
+			const acts = document.getElementById('chat-thread-actions');
+			if (acts) acts.classList.add('hidden');
+			const ta = document.getElementById('goon-chat-input');
+			if (ta) { ta.value = ''; ta.focus(); }
+		};
+		window.goonChatLoadThread = function(id) {
+			fetch('/api/chat/thread?id=' + encodeURIComponent(id))
+				.then(function(r){ if (!r.ok) throw new Error('load failed'); return r.json(); })
+				.then(function(t) {
+					const f  = document.getElementById('goon-chat-thread-id');
+					const fm = document.getElementById('goon-chat-thread-id-mirror');
+					if (f)  f.value = t.id;
+					if (fm) fm.value = t.id;
+					const picker = document.getElementById('chat-repo-context');
+					if (picker && t.repo_context) {
+						picker.value = t.repo_context;
+						const m = document.getElementById('goon-chat-repo-mirror');
+						if (m) m.value = t.repo_context;
+					}
+					const acts = document.getElementById('chat-thread-actions');
+					if (acts) acts.classList.remove('hidden');
+					// Rehydrate the transcript by replacing the pane.
+					const pane = document.getElementById('chat-transcript');
+					if (!pane) return;
+					pane.innerHTML = '';
+					(t.messages || []).forEach(function(m) {
+						const wrap = document.createElement('div');
+						wrap.className = 'mb-3';
+						wrap.innerHTML = '<div class="text-[10px] uppercase tracking-wider text-muted mb-0.5">' +
+							(m.role === 'user' ? 'you' : (m.role === 'assistant' ? 'goon' : m.role)) +
+							'</div><div class="rounded-md px-3 py-2 text-sm whitespace-pre-wrap ' +
+							(m.role === 'user' ? 'bg-accent/10 text-white' : 'bg-surface text-gray-200') +
+							'">' + (m.content || '').replace(/[<>&]/g, function(c){return ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c];}) + '</div>';
+						pane.appendChild(wrap);
+					});
+					pane.scrollTop = pane.scrollHeight;
+				})
+				.catch(function(err){ alert('Could not load thread: ' + err.message); });
+		};
+		// Auto-scroll on streamed swaps.
+		document.addEventListener('htmx:afterSwap', function(e) {
+			const t = document.getElementById('chat-transcript');
+			if (t && e.target && (e.target.id === 'chat-transcript' || t.contains(e.target))) {
+				t.scrollTop = t.scrollHeight;
+			}
+		});
+	})();
+	</script>
 	</section>`)
+}
+
+// repositoryEntriesForPicker returns the slugs from REPOSITORY.md for
+// the chat repo-context picker. Returns nil cleanly when the file is
+// missing — the picker collapses to "— no specific repo —" in that
+// case so the rest of the page still renders.
+func repositoryEntriesForPicker() ([]string, error) {
+	entries, err := repository.Read()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		s := strings.TrimSpace(e.Remote)
+		if s == "" {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out, nil
 }
 
 // fragTabMemory is the consolidated tab covering Knowledge + Skills.
@@ -414,7 +772,7 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 			</form>
 		</details>`)
 
-	soul := agentctx.Soul("")
+	soul := stripSoulMigrationBanner(agentctx.Soul(""))
 	if strings.TrimSpace(soul) == "" {
 		fmt.Fprint(w, `<div class="mb-6 rounded-xl border border-dashed border-accent/30 bg-surface-raised/60 p-6 text-center">
 			<div class="mx-auto h-10 w-10 rounded-xl bg-accent-soft text-accent flex items-center justify-center mb-2">
@@ -490,6 +848,31 @@ func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
 			nameEsc, headline, nameEsc, nameEsc, nameQ)
 	}
 	fmt.Fprint(w, `</div><div id="memory-list-result" class="mt-3"></div>`)
+}
+
+// stripSoulMigrationBanner removes the one-time "<!-- migrated from
+// personal.md on YYYY-MM-DD ... -->" leading HTML comment that the
+// MergePersonalIntoSoul migration prepends to SOUL.md. The comment
+// is fine on disk (it's a real audit trail), but in the Memory tab
+// we render SOUL.md inside an <pre> with html.EscapeString, so the
+// raw comment shows up verbatim to the user — looks like junk in
+// an otherwise clean knowledge view. We strip it from the displayed
+// copy only.
+//
+// Also strips any other leading run of HTML comments + blank lines
+// so future one-time migration banners get the same treatment.
+func stripSoulMigrationBanner(s string) string {
+	for {
+		trimmed := strings.TrimLeft(s, " \t\r\n")
+		if !strings.HasPrefix(trimmed, "<!--") {
+			return trimmed
+		}
+		end := strings.Index(trimmed, "-->")
+		if end < 0 {
+			return trimmed // malformed; leave as-is
+		}
+		s = trimmed[end+3:]
+	}
 }
 
 // urlQueryEscape is a tiny wrapper so we don't import net/url at the

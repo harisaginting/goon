@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/boards"
+	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
 )
@@ -66,6 +67,23 @@ type ToolCall struct {
 	Title       string   `json:"title,omitempty"`
 	Description string   `json:"description,omitempty"`
 	Labels      []string `json:"labels,omitempty"`
+
+	// pr_get / pr_comment / pr_approve / pr_request_changes — a PR
+	// reference: a full PR/MR URL, or "owner/repo#number". pr_comment /
+	// pr_approve / pr_request_changes also use Body for the comment text.
+	PR string `json:"pr,omitempty"`
+	// pr_list — optional repo to scope to ("owner/repo").
+	Repo string `json:"repo,omitempty"`
+	// pr_list — optional filter; "review-requested" lists PRs awaiting
+	// the current user's review.
+	Filter string `json:"filter,omitempty"`
+
+	// confluence_search / web_search — a free-text (or CQL) query.
+	Query string `json:"query,omitempty"`
+	// web_fetch — the page URL to fetch.
+	URL string `json:"url,omitempty"`
+	// confluence_get — the Confluence page id.
+	PageID string `json:"page_id,omitempty"`
 }
 
 // validActions is the closed set of action strings parseToolCall
@@ -73,18 +91,30 @@ type ToolCall struct {
 // prevents the LLM from inventing a "jira_delete" the server will
 // silently accept.
 var validActions = map[string]bool{
-	"jira_search":     true,
-	"jira_comment":    true,
-	"jira_transition": true,
-	"jira_update":     true,
+	"jira_search":        true,
+	"jira_comment":       true,
+	"jira_transition":    true,
+	"jira_transitions":   true,
+	"jira_update":        true,
+	"pr_get":             true,
+	"pr_list":            true,
+	"pr_review":          true,
+	"pr_comment":         true,
+	"pr_approve":         true,
+	"pr_request_changes": true,
+	"confluence_search":  true,
+	"confluence_get":     true,
+	"web_search":         true,
+	"web_fetch":          true,
 }
 
 // ChatTurnOptions configures one ChatTurn invocation.
 type ChatTurnOptions struct {
 	LLM           llm.Provider // required
 	Memory        *memory.Memory
-	Board         boards.Board // may implement boards.Searcher; may be nil
-	NotesDir      string       // "" → derive from storage
+	Board         boards.Board  // may implement boards.Searcher; may be nil
+	Host          githost.Host  // git host; may implement PRReviewer; may be nil
+	NotesDir      string        // "" → derive from storage
 	SystemPrompt  string       // base persona (telegram or web)
 	History       []llm.Message
 	UserMessage   string
@@ -143,7 +173,7 @@ func ChatTurn(ctx context.Context, opt ChatTurnOptions) (ChatTurnResult, error) 
 	// reflects the most recent daemon snapshot; the tool block tells
 	// the LLM whether a search tool is available right now.
 	stateBlock := Build(opt.Memory, opt.NotesDir)
-	toolBlock := buildToolBlock(opt.Board)
+	toolBlock := buildToolBlock(opt.Board, opt.Host)
 
 	systemMsgs := []llm.Message{
 		{Role: llm.RoleSystem, Content: opt.SystemPrompt},
@@ -231,7 +261,7 @@ func ChatTurn(ctx context.Context, opt ChatTurnOptions) (ChatTurnResult, error) 
 			Content: out,
 		})
 		// Execute the tool.
-		result, summary := executeToolCall(ctx, opt.Board, opt.Memory, call)
+		result, summary := executeToolCall(ctx, opt.Board, opt.Host, opt.LLM, opt.Memory, call)
 		toolLog = append(toolLog, summary)
 		_ = rest // unused — we always feed the tool result back, not the prose
 		working = append(working, llm.Message{
@@ -255,20 +285,14 @@ func ChatTurn(ctx context.Context, opt ChatTurnOptions) (ChatTurnResult, error) 
 // the board actually supports, so the LLM can't try to call something
 // that won't work. When no board is wired at all the block tells the
 // LLM to skip tool calls entirely and answer from cached state.
-func buildToolBlock(board boards.Board) string {
+func buildToolBlock(board boards.Board, host githost.Host) string {
 	_, hasSearch := board.(boards.Searcher)
 	_, hasUpdate := board.(boards.Updater)
 	hasBoard := board != nil
+	_, hasPR := host.(githost.PRReviewer)
+	hasConfluence := confluenceConfigured()
 	var sb strings.Builder
 	sb.WriteString("# TOOLS YOU CAN CALL\n\n")
-
-	if !hasBoard {
-		sb.WriteString(`No board is configured for this session
-(GOON_BOARD is unset). Answer strictly from the GOON STATE block
-below. Do NOT emit JSON tool calls — they will be ignored.
-`)
-		return sb.String()
-	}
 
 	sb.WriteString(`## CRITICAL OUTPUT FORMAT
 
@@ -322,23 +346,36 @@ skip and respond in prose.
 `)
 	}
 
-	sb.WriteString(`## jira_comment — post a comment on a ticket
+	if hasBoard {
+		sb.WriteString(`## jira_comment — post a comment on a ticket
 
   {"action":"jira_comment","key":"ENG-123","body":"the comment text"}
 
 The body is sent as plain text. Newlines work. Quote the user's
 exact wording where they asked you to.
 
-## jira_transition — change a ticket's status
+## jira_transition — move a ticket to a new status
 
-  {"action":"jira_transition","key":"ENG-123","status":"in_progress"}
+  {"action":"jira_transition","key":"ENG-123","status":"Ready to Test"}
 
-status MUST be one of: "open", "in_progress", "in_review", "blocked",
-"done". The server fuzzy-matches this against the project's actual
-Jira workflow transitions. If no transition matches, the server
-returns the available options — present those to the user.
+"status" is the status name as it exists on the user's board — pass
+what the user actually said ("ready to test", "in QA", "done", …).
+The server matches it against the ticket's REAL workflow transitions,
+not a fixed vocabulary. If it doesn't match, the error lists the
+ticket's actual available statuses — show those to the user verbatim
+and ask which they meant. Never silently substitute a different
+status.
+
+## jira_transitions — list the statuses a ticket can move to
+
+  {"action":"jira_transitions","key":"ENG-123"}
+
+Returns the ticket's real available statuses. Use it when the user
+asks what statuses exist, or when you're unsure of the exact name
+before calling jira_transition.
 
 `)
+	}
 
 	if hasUpdate {
 		sb.WriteString(`## jira_update — edit a ticket's fields
@@ -351,12 +388,97 @@ labels, send "labels": []. Title and description are sent verbatim.
 `)
 	}
 
+	if hasPR {
+		sb.WriteString(`## pr_get — read a pull request (incl. reviewers)
+
+  {"action":"pr_get","pr":"<PR URL or owner/repo#number>"}
+
+Returns title, author, state, branch, and the reviewer list with each
+reviewer's status (approved / changes_requested / commented /
+pending). Use this for "who is reviewing PR X", "did Y approve",
+"status of <PR url>". The user often pastes a full Bitbucket / GitHub
+/ GitLab PR URL — pass it through verbatim as "pr".
+
+## pr_list — list pull requests
+
+  {"action":"pr_list","repo":"owner/repo"}
+  {"action":"pr_list","filter":"review-requested"}
+
+With "repo" → open PRs in that repo. With "filter":"review-requested"
+→ PRs awaiting the current user's review across all repos.
+
+## pr_review — draft an AI review of a PR (and post on confirmation)
+
+  {"action":"pr_review","pr":"<PR URL or owner/repo#number>"}
+
+Use this when the user says "review PR X", "what do you think of <url>",
+or pastes a PR URL with review intent. The tool fetches the diff, runs
+the model, and hands back the draft with explicit instructions to:
+  1. show the user the review verbatim,
+  2. ask "post this as a comment on the PR?",
+  3. on "yes", call pr_comment with body = the EXACT draft text.
+Follow those instructions exactly — do NOT paraphrase the review when
+posting; the body must match what you showed the user.
+
+## pr_comment — post a comment on a pull request
+
+  {"action":"pr_comment","pr":"<PR ref>","body":"the comment text"}
+
+## pr_approve — approve a pull request
+
+  {"action":"pr_approve","pr":"<PR ref>","body":"optional approval note"}
+
+## pr_request_changes — request changes on a pull request
+
+  {"action":"pr_request_changes","pr":"<PR ref>","body":"what needs to change"}
+
+Only call pr_approve / pr_request_changes / pr_comment when the user
+explicitly asks you to act. "who's reviewing PR 12" → pr_get;
+"approve PR 12" → pr_approve.
+
+`)
+	}
+
+	if hasConfluence {
+		sb.WriteString(`## confluence_search — search the Confluence wiki
+
+  {"action":"confluence_search","query":"<text or CQL>"}
+
+## confluence_get — read one Confluence page in full
+
+  {"action":"confluence_get","page_id":"<id from a confluence_search result>"}
+
+`)
+	}
+
+	sb.WriteString(`## web_search — search the web
+
+  {"action":"web_search","query":"<search text>"}
+
+## web_fetch — fetch the readable text of a web page
+
+  {"action":"web_fetch","url":"https://..."}
+
+Use web_search / web_fetch for general knowledge your other tools and
+the GOON STATE block can't answer — library docs, error messages,
+current facts. Do NOT use them for the user's own tickets, PRs or wiki;
+those have dedicated tools above.
+
+`)
+
 	sb.WriteString(`Rules:
   - The JSON MUST be the entire response — no prose before/after.
   - Tool failures come back as TOOL ERROR system messages — apologize
     in your next turn and either retry with a fix, or tell the user.
   - Action successes come back as ACTION OK system messages —
     confirm to the user in prose ("✓ commented on ENG-123 …").
+  - TRUTHFULNESS: report exactly what the ACTION OK / TOOL ERROR
+    message states — the real resulting status or outcome. NEVER claim
+    a status, value or result the tool did not confirm; if a ticket
+    landed in a different status than the user asked for, say so
+    plainly. If a tool failed, report the actual error — do not invent
+    a reason or a missing capability. You DO have live Jira / PR /
+    Confluence / web access through these tools.
 `)
 	return sb.String()
 }
@@ -403,8 +525,9 @@ func parseToolCall(s string) (ToolCall, string, bool) {
 
 	// Salvage path: find any embedded `{"action":"..."}` blob. Look
 	// for the canonical opener — `"action"` quoted — so we don't pick
-	// up unrelated JSON in the prose.
-	for _, marker := range []string{`"action":"jira_search"`, `"action":"jira_comment"`, `"action":"jira_transition"`, `"action":"jira_update"`, `"action": "jira_search"`, `"action": "jira_comment"`, `"action": "jira_transition"`, `"action": "jira_update"`} {
+	// up unrelated JSON in the prose. validActions filters the result,
+	// so a generic marker is safe.
+	for _, marker := range []string{`"action":"`, `"action": "`} {
 		idx := strings.Index(cleaned, marker)
 		if idx < 0 {
 			continue
@@ -510,7 +633,7 @@ func matchingBrace(s string) int {
 // human_summary). system_message is what we feed back into the next
 // LLM turn; human_summary is a short string the UI can show ("ran
 // jira_search jql=…").
-func executeToolCall(ctx context.Context, board boards.Board, mem *memory.Memory, c ToolCall) (string, string) {
+func executeToolCall(ctx context.Context, board boards.Board, host githost.Host, llmProv llm.Provider, mem *memory.Memory, c ToolCall) (string, string) {
 	switch c.Action {
 	case "jira_search":
 		return execJiraSearch(ctx, board, mem, c)
@@ -518,8 +641,30 @@ func executeToolCall(ctx context.Context, board boards.Board, mem *memory.Memory
 		return execJiraComment(ctx, board, c)
 	case "jira_transition":
 		return execJiraTransition(ctx, board, c)
+	case "jira_transitions":
+		return execJiraListTransitions(ctx, board, c)
 	case "jira_update":
 		return execJiraUpdate(ctx, board, c)
+	case "pr_get":
+		return execPRGet(ctx, host, c)
+	case "pr_list":
+		return execPRList(ctx, host, c)
+	case "pr_comment":
+		return execPRComment(ctx, host, c)
+	case "pr_approve":
+		return execPRApprove(ctx, host, c)
+	case "pr_request_changes":
+		return execPRRequestChanges(ctx, host, c)
+	case "pr_review":
+		return execPRReview(ctx, host, llmProv, c)
+	case "confluence_search":
+		return execConfluenceSearch(ctx, c)
+	case "confluence_get":
+		return execConfluenceGet(ctx, c)
+	case "web_search":
+		return execWebSearch(ctx, c)
+	case "web_fetch":
+		return execWebFetch(ctx, c)
 	default:
 		// Should never happen — parseToolCall already filters action.
 		return fmt.Sprintf("TOOL ERROR: unknown action %q.", c.Action),
@@ -617,34 +762,85 @@ func execJiraComment(ctx context.Context, board boards.Board, c ToolCall) (strin
 		fmt.Sprintf("jira_comment %s ok (%q)", key, preview)
 }
 
-// execJiraTransition changes the ticket's status. board.Transition
-// owns the fuzzy mapping from boards.Status to the project's actual
-// workflow transition id.
+// execJiraTransition moves a ticket to a new status. For boards with a
+// real custom workflow (Jira) it resolves the user's wording against
+// the ticket's actual transitions via TransitionByName — so "ready to
+// test" reaches the genuine "Ready to Test" status instead of being
+// bucketed to "open" by MapStatus. Boards with only the canonical
+// lifecycle (GitHub Issues) fall back to the MapStatus path.
 func execJiraTransition(ctx context.Context, board boards.Board, c ToolCall) (string, string) {
 	if board == nil {
 		return "TOOL ERROR: no board configured — cannot transition.",
 			"jira_transition skipped (no board)"
 	}
 	key := strings.TrimSpace(c.Key)
-	status := strings.ToLower(strings.TrimSpace(c.Status))
+	status := strings.TrimSpace(c.Status)
 	if key == "" || status == "" {
-		return "TOOL ERROR: jira_transition needs both \"key\" and \"status\". Status must be one of: open, in_progress, in_review, blocked, done.",
+		return `TOOL ERROR: jira_transition needs both "key" and "status".`,
 			"jira_transition rejected (missing key/status)"
-	}
-	target := boards.MapStatus(status)
-	if target == boards.StatusUnknown {
-		return fmt.Sprintf("TOOL ERROR: status %q is not recognised. Use one of: open, in_progress, in_review, blocked, done.", c.Status),
-			fmt.Sprintf("jira_transition rejected (bad status %q)", c.Status)
 	}
 	actCtx, cancel := context.WithTimeout(ctx, chatToolBudget)
 	defer cancel()
+
+	// Preferred path: boards that expose their real workflow. Pass the
+	// user's wording straight through — the board matches it against
+	// the ticket's actual transition names.
+	if tr, ok := board.(boards.TransitionResolver); ok {
+		applied, err := tr.TransitionByName(actCtx, key, status)
+		if err != nil {
+			return "TOOL ERROR: jira_transition on " + key + " failed: " + err.Error() +
+					" — show the user the available statuses from this message verbatim and ask which one they meant. Do NOT retry with a guess.",
+				fmt.Sprintf("jira_transition %s failed: %v", key, err)
+		}
+		return fmt.Sprintf("ACTION OK: %s is now in status %q. Tell the user exactly that, using the status name %q verbatim — do not paraphrase it or substitute the wording they originally used.", key, applied, applied),
+			fmt.Sprintf("jira_transition %s → %s ok", key, applied)
+	}
+
+	// Fallback: boards with only the canonical open/closed lifecycle.
+	target := boards.MapStatus(strings.ToLower(status))
+	if target == boards.StatusUnknown {
+		return fmt.Sprintf("TOOL ERROR: this board only understands the canonical lifecycle and %q didn't match. Use one of: open, in_progress, in_review, blocked, done.", status),
+			fmt.Sprintf("jira_transition rejected (bad status %q)", status)
+	}
 	if err := board.Transition(actCtx, key, target); err != nil {
-		return fmt.Sprintf("TOOL ERROR: jira_transition on %s → %s failed: %s. Tell the user what went wrong; if the error lists available transitions, suggest the nearest one.",
-				key, target, err.Error()),
+		return fmt.Sprintf("TOOL ERROR: jira_transition on %s → %s failed: %s.", key, target, err.Error()),
 			fmt.Sprintf("jira_transition %s → %s failed: %v", key, target, err)
 	}
 	return fmt.Sprintf("ACTION OK: transitioned %s → %s. Confirm this to the user in prose.", key, target),
 		fmt.Sprintf("jira_transition %s → %s ok", key, target)
+}
+
+// execJiraListTransitions lists the real status names a ticket can move
+// to right now. Answers "what statuses are available" and lets the LLM
+// learn the exact name before a transition.
+func execJiraListTransitions(ctx context.Context, board boards.Board, c ToolCall) (string, string) {
+	if board == nil {
+		return "TOOL ERROR: no board configured.", "jira_transitions skipped (no board)"
+	}
+	tr, ok := board.(boards.TransitionResolver)
+	if !ok {
+		return "TOOL ERROR: the configured board doesn't expose its workflow transitions.",
+			"jira_transitions skipped (unsupported)"
+	}
+	key := strings.TrimSpace(c.Key)
+	if key == "" {
+		return `TOOL ERROR: jira_transitions needs a ticket "key" — Jira transitions are per-ticket (they depend on the ticket's current status).`,
+			"jira_transitions rejected (no key)"
+	}
+	lctx, cancel := context.WithTimeout(ctx, chatToolBudget)
+	defer cancel()
+	names, err := tr.ListTransitions(lctx, key)
+	if err != nil {
+		return "TOOL ERROR: jira_transitions failed: " + err.Error(),
+			fmt.Sprintf("jira_transitions %s failed: %v", key, err)
+	}
+	if len(names) == 0 {
+		return "AVAILABLE STATUSES for " + key + ": (none — the ticket is likely in a terminal status). Tell the user that.",
+			"jira_transitions ok (0)"
+	}
+	return "AVAILABLE STATUSES for " + key + " — the ticket can move to any of these EXACT names: " +
+			strings.Join(names, ", ") + "\nAnswer the user with this list; if they then ask to transition, use one of these names verbatim.",
+		fmt.Sprintf("jira_transitions %s ok (%d)", key, len(names))
 }
 
 // execJiraUpdate edits one or more mutable fields on a ticket.
@@ -719,9 +915,14 @@ func looksLikeMangledToolCall(s string) bool {
 		return true
 	}
 	// Tool name + opening brace but no clean parse → likely mangled.
-	for _, name := range []string{"jira_search", "jira_comment", "jira_transition", "jira_update"} {
-		if strings.Contains(lower, name) && strings.Contains(s, "{") {
-			return true
+	// Derived from validActions so every tool (jira_*, pr_*,
+	// confluence_*, web_*) is covered without a second list to keep
+	// in sync.
+	if strings.Contains(s, "{") {
+		for name := range validActions {
+			if strings.Contains(lower, name) {
+				return true
+			}
 		}
 	}
 	return false

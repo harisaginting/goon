@@ -158,6 +158,20 @@ type bbPRDetail struct {
 			Name string `json:"name"`
 		} `json:"branch"`
 	} `json:"source"`
+	// Participants includes both reviewers and anyone who has
+	// commented; we filter to role=="REVIEWER" in reviewers().
+	Participants []bbParticipant `json:"participants"`
+}
+
+// bbParticipant is one entry in a Bitbucket PR's participants array.
+type bbParticipant struct {
+	User struct {
+		DisplayName string `json:"display_name"`
+		Nickname    string `json:"nickname"`
+	} `json:"user"`
+	Role     string `json:"role"`  // "REVIEWER" | "PARTICIPANT"
+	Approved bool   `json:"approved"`
+	State    string `json:"state"` // "approved" | "changes_requested" | ""
 }
 
 // authorName returns the friendliest non-empty author label.
@@ -169,6 +183,28 @@ func (d bbPRDetail) authorName() string {
 		return d.Author.Username
 	}
 	return d.Author.Nickname
+}
+
+// reviewers extracts the PR's reviewer list from the participants
+// array (a Bitbucket reviewer always appears as a participant with
+// role REVIEWER).
+func (d bbPRDetail) reviewers() []Reviewer {
+	out := []Reviewer{}
+	for _, p := range d.Participants {
+		if p.Role != "REVIEWER" {
+			continue
+		}
+		name := p.User.DisplayName
+		if name == "" {
+			name = p.User.Nickname
+		}
+		state := strings.ToLower(strings.TrimSpace(p.State))
+		if state == "" {
+			state = "pending"
+		}
+		out = append(out, Reviewer{Name: name, State: state, Approved: p.Approved})
+	}
+	return out
 }
 
 // ListPRs returns open PRs across the supplied repos. Fallback chain
@@ -409,6 +445,7 @@ func (b *Bitbucket) GetPRDetails(ctx context.Context, repo string, number int) (
 		Number: d.ID, Title: d.Title, URL: d.Links.HTML.Href,
 		Branch: d.Source.Branch.Name, Author: d.authorName(),
 		State: strings.ToLower(d.State), Body: d.Description, Repo: repo,
+		Reviewers: d.reviewers(),
 	}
 	diff, err := b.fetchDiff(ctx, fmt.Sprintf("%s/diff", metaURL))
 	if err != nil {

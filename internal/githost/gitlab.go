@@ -120,6 +120,48 @@ type glMR struct {
 	Author       struct {
 		Username string `json:"username"`
 	} `json:"author"`
+	Reviewers []struct {
+		Username string `json:"username"`
+		Name     string `json:"name"`
+	} `json:"reviewers"`
+}
+
+// collectReviewers builds a merge request's reviewer list, marking those
+// who have approved. The /approvals call is best-effort.
+func (g *GitLab) collectReviewers(ctx context.Context, projEscaped string, iid int, mr glMR) []Reviewer {
+	approved := map[string]bool{}
+	raw, err := g.do(ctx, http.MethodGet,
+		fmt.Sprintf("%s/projects/%s/merge_requests/%d/approvals", g.APIURL, projEscaped, iid), nil)
+	if err == nil {
+		var ap struct {
+			ApprovedBy []struct {
+				User struct {
+					Username string `json:"username"`
+				} `json:"user"`
+			} `json:"approved_by"`
+		}
+		if json.Unmarshal(raw, &ap) == nil {
+			for _, a := range ap.ApprovedBy {
+				if a.User.Username != "" {
+					approved[a.User.Username] = true
+				}
+			}
+		}
+	}
+	out := make([]Reviewer, 0, len(mr.Reviewers))
+	for _, rv := range mr.Reviewers {
+		name := rv.Name
+		if name == "" {
+			name = rv.Username
+		}
+		r := Reviewer{Name: name, State: "pending"}
+		if approved[rv.Username] {
+			r.State = "approved"
+			r.Approved = true
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // toPR converts a GitLab MR into the host-agnostic PR descriptor. The
@@ -224,6 +266,7 @@ func (g *GitLab) GetPRDetails(ctx context.Context, repo string, number int) (PR,
 	if pr.Repo == "" {
 		pr.Repo = strings.TrimSpace(repo)
 	}
+	pr.Reviewers = g.collectReviewers(ctx, proj, number, mr)
 	diff, err := g.fetchMRDiff(ctx, proj, number)
 	if err != nil {
 		return pr, "", err

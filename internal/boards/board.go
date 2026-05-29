@@ -98,6 +98,29 @@ type Updater interface {
 // the Updater path.
 var ErrUpdateUnsupported = errors.New("board does not support ticket update")
 
+// TransitionResolver is an optional companion interface for boards
+// whose workflow has custom statuses that goon's five-value Status
+// enum cannot represent — Jira boards routinely have "Ready to Test",
+// "In QA", "UAT", "Selected for Development", etc. It lets the chat
+// agent list a ticket's REAL transitions and move it by the board's
+// own status name, instead of bucketing through MapStatus (which, for
+// example, collapses "Ready to Test" to "open" because the name
+// contains the substring "ready").
+//
+// Boards that don't implement it degrade gracefully: the chat agent
+// falls back to the canonical MapStatus + Transition path.
+type TransitionResolver interface {
+	// ListTransitions returns the status names the ticket can move to
+	// right now, exactly as the board names them.
+	ListTransitions(ctx context.Context, id string) ([]string, error)
+	// TransitionByName moves the ticket to the status whose name best
+	// matches `name`, against the board's real workflow. It returns the
+	// actual status name applied — so callers report the truth, not the
+	// user's wording. On no match it returns an error listing the
+	// available status names.
+	TransitionByName(ctx context.Context, id, name string) (string, error)
+}
+
 // NewFromEnv selects and constructs the board adapter from environment
 // variables. Returns ErrNoBoard when no board is configured, so the daemon
 // can degrade gracefully.
@@ -155,6 +178,10 @@ type Mock struct {
 	Tickets  []Ticket
 	Comments []string
 	Transit  []string
+	// Transitions is the set of status names the mock board reports as
+	// available — ListTransitions returns it, TransitionByName matches
+	// against it.
+	Transitions []string
 	// Searches records every query passed to Search (newest at the end)
 	// — handy in tests to verify the chat agent actually queried the
 	// board rather than hallucinating an answer from cached state.
@@ -199,6 +226,34 @@ func (m *Mock) Transition(_ context.Context, id string, s Status) error {
 		}
 	}
 	return nil
+}
+
+// ListTransitions implements TransitionResolver for the mock board.
+func (m *Mock) ListTransitions(_ context.Context, _ string) ([]string, error) {
+	out := make([]string, len(m.Transitions))
+	copy(out, m.Transitions)
+	return out, nil
+}
+
+// TransitionByName implements TransitionResolver for the mock board:
+// it matches name against m.Transitions (normalised exact, then
+// containment) and records the move in m.Transit.
+func (m *Mock) TransitionByName(_ context.Context, id, name string) (string, error) {
+	w := normStatus(name)
+	for _, s := range m.Transitions {
+		if normStatus(s) == w {
+			m.Transit = append(m.Transit, id+"->"+s)
+			return s, nil
+		}
+	}
+	for _, s := range m.Transitions {
+		n := normStatus(s)
+		if n != "" && w != "" && (strings.Contains(n, w) || strings.Contains(w, n)) {
+			m.Transit = append(m.Transit, id+"->"+s)
+			return s, nil
+		}
+	}
+	return "", fmt.Errorf("no status matches %q — available: %s", name, strings.Join(m.Transitions, ", "))
 }
 
 // Search implements Searcher for the mock board. It records every

@@ -152,14 +152,19 @@
     border-bottom-color: #A855F7 !important;
   }
 
-  /* Active sidebar nav row — soft purple wash + amber accent bar on the
-     left so the user can spot which tab they're on at a glance. */
+  /* Active sidebar nav row — stronger purple wash + chunkier left bar +
+     bolder text so the active tab is unmistakable in a dense sidebar.
+     Reviewed UX in May 2026: the previous soft-wash variant looked
+     identical to hover on most monitors, so users couldn't tell which
+     tab they were on without clicking around. */
   .page-nav[aria-current="page"] {
-    background: rgba(168, 85, 247, 0.10);
+    background: rgba(168, 85, 247, 0.18);
     color: #FFFFFF !important;
+    font-weight: 600;
     border-bottom-color: transparent !important;
-    box-shadow: inset 3px 0 0 0 #A855F7;
+    box-shadow: inset 4px 0 0 0 #A855F7;
   }
+  .page-nav[aria-current="page"] svg { color: #A855F7; }
 
   /* Status dot pulse for "running" — uses currentColor so we can paint
      it amber/emerald/grey depending on daemon state. */
@@ -322,8 +327,11 @@
       </button>
       <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
               role="tab" data-page-target="prs">
-        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="18" cy="18" r="3"/><circle cx="6" cy="6" r="3"/><path d="M13 6h3a2 2 0 0 1 2 2v7"/><line x1="6" y1="9" x2="6" y2="21"/></svg>
-        <span class="flex-1">Pull requests</span>
+        <!-- Icon: stacked-books / repo silhouette. Replaces the old
+             "fork" icon — the tab is now repo-centric, PRs live one
+             level deeper inside each repo card. -->
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/><path d="M10 6h6"/><path d="M10 10h6"/></svg>
+        <span class="flex-1">Repositories</span>
       </button>
 
       <div class="px-3 mt-4 mb-1 text-[10px] uppercase tracking-wider text-muted/70">Conversation</div>
@@ -344,6 +352,23 @@
         <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
         <span class="flex-1">Files</span>
       </button>
+      <!-- Setup is intentionally in the regular nav flow now (was
+           bottom-anchored via flex-1 — became unreachable on tall
+           sidebars / narrow viewports when it scrolled off-screen).
+           Kept under the same Workspace group as Files for grouping. -->
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm font-medium text-muted hover:bg-surface-raised hover:text-white transition"
+              role="tab" data-page-target="setup">
+        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="flex-1">Setup</span>
+      </button>
+
+      <!-- Tiny hint so the cmdk command palette (⌘K / Ctrl+K) is
+           discoverable from the sidebar. -->
+      <div class="px-3 mt-4 pt-3 border-t border-surface-border/60 text-[10px] text-muted/70 leading-snug">
+        Press <kbd class="px-1 py-0.5 rounded bg-surface-raised border border-surface-border text-[10px]">⌘K</kbd>
+        / <kbd class="px-1 py-0.5 rounded bg-surface-raised border border-surface-border text-[10px]">Ctrl+K</kbd>
+        to jump to any tab.
+      </div>
     </nav>
 
     <!-- Live system status — auto-updates via SSE statusChanged event.
@@ -373,15 +398,8 @@
       <div id="sidebar-action-result" class="text-[11px] text-muted px-3"></div>
     </div>
 
-    <!-- Spacer + Setup gear at the bottom -->
-    <div class="flex-1"></div>
-    <div class="px-3 pb-4 border-t border-surface-border pt-3">
-      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-2 rounded-md text-sm text-muted hover:bg-surface-raised hover:text-accent transition"
-              role="tab" data-page-target="setup">
-        <svg class="h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        <span class="flex-1">Setup</span>
-      </button>
-    </div>
+    <!-- Setup is now in the regular nav flow above (was here as a
+         bottom-anchored entry — became unreachable on tall sidebars). -->
   </aside>
 
   <!-- Mobile sidebar backdrop. Visible only when #sidebar has .mobile-open. -->
@@ -559,13 +577,29 @@
   // -------- Daemon pause/resume toggle (sidebar one-click) -----------------
   // Reads current paused state from the sidebar status pill so the same
   // button toggles either way without us tracking state separately.
+  //
+  // We use plain fetch() (not htmx) because the button isn't an htmx
+  // target — but that means the HX-Trigger: statusChanged header the
+  // server sends back goes nowhere. So we manually dispatch the same
+  // event on body after the fetch succeeds, which (a) re-renders the
+  // status pill (it listens to "statusChanged from:body"), and (b)
+  // re-labels this very button via syncPauseButton(). Without this
+  // the user clicked Pause and saw nothing change until the next SSE
+  // push arrived seconds later.
   async function goonDaemonToggle() {
     const pill = document.querySelector('[data-paused]');
     const paused = pill && pill.dataset.paused === '1';
     const action = paused ? 'resume' : 'pause';
     const r = await fetch('/api/daemon/' + action, { method: 'POST' });
-    if (r.ok) toast('daemon ' + action + 'd', 'ok');
-    else toast(action + ' failed', 'err');
+    if (r.ok) {
+      toast('daemon ' + action + 'd', 'ok');
+      // Optimistically flip the local data-paused so syncPauseButton
+      // picks up the new label even before the pill re-fetches.
+      if (pill) pill.dataset.paused = paused ? '0' : '1';
+      document.body.dispatchEvent(new CustomEvent('statusChanged'));
+    } else {
+      toast(action + ' failed', 'err');
+    }
   }
 
   // Re-label the sidebar pause/resume button whenever the daemon
@@ -620,7 +654,7 @@
     { label: 'Questions',     hint: 'q',         run: () => navTo('questions') },
     { label: 'Workflows',     hint: 'w',         run: () => navTo('workflows') },
     { label: 'Tickets',       hint: 't',         run: () => navTo('tickets') },
-    { label: 'Pull requests', hint: 'p',         run: () => navTo('prs') },
+    { label: 'Repositories',  hint: 'p',         run: () => navTo('prs') },
     { label: 'Chat',          hint: 'c',         run: () => navTo('chat') },
     { label: 'Memory',        hint: 'm',         run: () => navTo('memory') },
     { label: 'Files',         hint: 'f',         run: () => navTo('files') },
@@ -635,6 +669,74 @@
     showPage(name);
     closeCmdk();
   }
+
+  // goonWorkflowEditorToggle expands/collapses the workflow.json
+  // editor inside the Workflows tab's config band. Re-labels the
+  // trigger button so the toggle state is unambiguous.
+  window.goonWorkflowEditorToggle = function() {
+    var ed  = document.getElementById('wf-editor');
+    var lbl = document.getElementById('wf-editor-toggle-label');
+    if (!ed) return;
+    var opening = ed.classList.contains('hidden');
+    ed.classList.toggle('hidden');
+    if (lbl) lbl.textContent = opening ? 'hide editor' : 'view / edit';
+    if (opening) {
+      var ta = ed.querySelector('textarea');
+      if (ta) setTimeout(function(){ ta.focus(); ta.setSelectionRange(0,0); }, 30);
+    }
+  };
+
+  // goonPRRowToggle is called from a PR-row's top-row "write comment"
+  // or "block" button. It expands the matching hidden form below the
+  // row AND flips the chevron + ARIA state on the trigger button so
+  // open/closed is visually obvious. Auto-focuses the textarea on open
+  // so the user can start typing immediately.
+  window.goonPRRowToggle = function(btn, formId) {
+    var el = document.getElementById(formId);
+    if (!el) return;
+    var isOpen = !el.classList.contains('hidden');
+    if (isOpen) {
+      el.classList.add('hidden');
+      btn.setAttribute('data-disclose', 'closed');
+      btn.setAttribute('aria-expanded', 'false');
+      var ic = btn.querySelector('[data-disclose-icon]');
+      if (ic) ic.textContent = '▸';
+    } else {
+      el.classList.remove('hidden');
+      btn.setAttribute('data-disclose', 'open');
+      btn.setAttribute('aria-expanded', 'true');
+      var ic2 = btn.querySelector('[data-disclose-icon]');
+      if (ic2) ic2.textContent = '▾';
+      var ta = el.querySelector('textarea, input[type=text]');
+      if (ta) setTimeout(function(){ ta.focus(); }, 30);
+    }
+  };
+
+  // goonJumpToQuestion is called from Workflow cards that are parked
+  // at an approval gate. It switches to the Questions tab and scrolls
+  // the matching <form data-question-id="q-N"> into view, briefly
+  // highlighting it so the user can tell which one is theirs even
+  // when 35 questions are stacked.
+  window.goonJumpToQuestion = function(qid) {
+    showPage('questions');
+    closeCmdk();
+    var tries = 0;
+    function scroll() {
+      var el = document.querySelector('[data-question-id="' + qid + '"]');
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        el.classList.add('ring-2','ring-accent','ring-offset-2','ring-offset-surface');
+        setTimeout(function(){
+          el.classList.remove('ring-2','ring-accent','ring-offset-2','ring-offset-surface');
+        }, 2400);
+        return;
+      }
+      // The Questions fragment is lazy-loaded on first reveal; retry
+      // a few times while it streams in.
+      if (tries++ < 20) setTimeout(scroll, 150);
+    }
+    scroll();
+  };
   async function doRefresh() {
     closeCmdk();
     const r = await fetch('/api/refresh', { method: 'POST' });

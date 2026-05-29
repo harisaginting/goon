@@ -349,7 +349,7 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 		fmt.Fprintf(d.opts.Stderr, "[poll] error: %v\n", err)
 		return
 	}
-	fmt.Println(fmt.Sprintf("TOTAL TICKET%d", len(tickets)))
+	logx.Info("daemon.tickets_listed", "count", len(tickets))
 	for _, t := range tickets {
 		// Copy every field that chat / web UI / /tickets can render —
 		// dropping Assignee/Labels/Project caused "assigned to me"
@@ -390,12 +390,13 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 }
 
 // nextTicket picks the most-recently-updated Open ticket that doesn't already
-// have an in-flight workflow.
+// have an in-flight workflow. Ignored tickets (set via the web Tickets-tab
+// "🚫 ignore" toggle or the CLI) are filtered out so they never get picked,
+// even if they're the freshest thing on the board.
 func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
 	var best *boards.Ticket
 	for i := range tickets {
 		t := &tickets[i]
-		fmt.Println("========", t.Key, t.Status)
 		if t.Status != boards.StatusOpen && t.Status != boards.StatusUnknown && t.Status != boards.StatusInProgress {
 			continue
 		}
@@ -403,6 +404,12 @@ func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
 			continue
 		}
 		if d.opts.Memory.HasCompletedWorkflowFor(t.ID) {
+			continue
+		}
+		// User-driven opt-out. Both the key (e.g. "EB-4978") and the
+		// id (board-internal, often the same as key) are checked so
+		// boards that surface different identifiers stay consistent.
+		if d.opts.Memory.IsTicketIgnored(t.Key) || d.opts.Memory.IsTicketIgnored(t.ID) {
 			continue
 		}
 		if best == nil || t.UpdatedAt.After(best.UpdatedAt) {

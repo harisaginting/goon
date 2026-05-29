@@ -202,6 +202,200 @@ the state machine picks up at `wf.Stage`.
 
 ## Recent decisions worth knowing
 
+- **Repositories tab (`internal/web/actions.go`).** Reframed the
+  former flat "Pull requests" tab into a repo-centric list. The
+  tab's internal id stays `data-page="prs"` (so the sidebar's
+  showPage() and the keyboard shortcut `p` don't need rewiring),
+  but the user-visible label is now **Repositories** and the
+  content composer (`fragTabPRs`) lazy-loads
+  `/fragments/repositories` instead of the old `/fragments/prs`.
+  - **Source of truth**: REPOSITORY.md (the user-curated registry).
+    Every entry becomes a row, sorted alphabetically. Repos the
+    git host returned PRs for but that aren't in REPOSITORY.md
+    show up under a `Detected · not tracked in REPOSITORY.md`
+    divider at the bottom so the user can adopt them.
+  - **Per-row signals** (`renderRepoSummary`): open-PR count
+    bubble, local-mapping status (`✓ cloned` / `⚠ no local path`
+    / `⚠ path mapped · not cloned` / `untracked`), and the notes
+    column from REPOSITORY.md. data-repo-name powers a typeahead
+    filter when the row count > 8.
+  - **Click to expand**: each row is a `<details>` whose body
+    lazy-loads `/fragments/repo?slug=<slug>`. The detail panel
+    contains: (1) a **map-to-local form** that POSTs to
+    `/api/repo/map` and upserts REPOSITORY.md via
+    `repository.Add`; (2) a **clone-here form** (visible only
+    when the repo isn't cloned) that POSTs to `/api/repo/clone`
+    — composes `git clone <url> <target>`, validates via
+    `safety.Default()`, refuses to clone over a non-empty target,
+    runs via `safety.ShellCommand` with a 5-minute budget, and
+    on success auto-upserts the new mapping so the row instantly
+    flips to "✓ cloned"; (3) the per-repo **PR list**, lazy-
+    loaded from `/fragments/prs?repo=<slug>` so the existing
+    PR-row machinery (comment / approve / block + ✨ Draft with
+    AI) is reused as-is — single source of truth for the actions.
+  - **Clone safety scope**: goon does NOT manage credentials —
+    the spawned `git clone` uses whatever SSH/HTTPS auth is
+    already configured on the user's machine. Errors stream
+    back verbatim (no wrapping) so "Permission denied
+    (publickey)" or "Repository not found" reach the user
+    directly.
+  - **shellQuote helper**: tiny POSIX single-quote escaper used
+    to safely build the clone command — handles spaces and
+    metacharacters in remote URLs / target paths.
+  - **guessCloneURL**: best-effort clone-URL inference for the
+    pre-filled URL field. Tries `RepoLister.ListRepos` first,
+    falls back to host-specific defaults (`github.com`,
+    `gitlab.com`, `bitbucket.org`).
+  - **SSE event**: a new `repositoriesChanged` topic fires after
+    map / clone succeeds so the list re-renders without a
+    page reload.
+  - **New imports**: `actions.go` gained `path/filepath`,
+    `sort`, `internal/repository`, `internal/safety`. Server.go
+    registers 4 new routes (`/fragments/repositories`,
+    `/fragments/repo`, `/api/repo/map`, `/api/repo/clone`) + a
+    `/fragments/tab-repositories` alias for the consistent
+    naming convention.
+  - **Sidebar**: button label "Pull requests" → "Repositories";
+    icon changed from the fork icon to a stacked-pages
+    silhouette. The cmdk command-palette entry was renamed to
+    match.
+
+- **Web UX pass round 2 — May 2026.** Same-session follow-up after
+  the user reported three additional gaps. All three landed:
+  - **Pause-daemon button now flips the UI instantly
+    (`internal/web/static/index.html`).** Bug: `goonDaemonToggle` used
+    raw `fetch()` so the server's `HX-Trigger: statusChanged` header
+    was discarded (HTMX only fires events on requests made via
+    `hx-*` attributes, not on naked fetches). Fix: after a successful
+    fetch, optimistically flip the local `[data-paused]` attribute
+    AND dispatch a `CustomEvent('statusChanged')` on `body`. That
+    re-renders the status pill and re-labels the button in the same
+    paint — no waiting for the next SSE push.
+  - **Workflows tab now shows "which pipeline am I running?"
+    (`fragWorkflowConfig` in `internal/web/server.go`).** New
+    workflow-config band at the top of the Workflows tab — renders
+    `cfg.Name`, `cfg.Description`, stage count, the source path
+    (`./workflow.json` or wherever it loaded from), the branch
+    prefix, and a pill that calls out `auto_approve` vs the default
+    gated mode in plain language ("⏸ gated · asks before run" vs
+    "⚡ auto-approve · runs unattended"). Without this band the user
+    had no way to tell which `workflow.json` was loaded, and
+    couldn't tell whether goon was going to ask before running or
+    just blast through.
+  - **Workflow.json editor in the web UI (`handleWorkflowSave`).**
+    Same band has a collapsible JSON editor (textarea pre-filled
+    with the active config, marshalled from in-memory state so
+    "what you see = what's running"). Save POSTs to
+    `/api/workflow/save`, which validates JSON via `json.Unmarshal`
+    into `workflow.Config` (same schema the daemon uses), writes
+    atomically via tmp+rename, patches the in-memory snapshot, and
+    fires `workflowConfigChanged + workflowsChanged` so the header
+    re-renders with the new name and the cards reflow. Path safety:
+    the destination is allowlisted to the loaded path or
+    `workflow.DefaultConfigFilePath()` — no arbitrary writes from
+    the form. JS helper `goonWorkflowEditorToggle` flips the band
+    open/closed and re-labels the trigger button.
+  - **Plumbing.** `web.Options` gained `Workflow *workflow.Config`
+    + `WorkflowPath string`; `cmd/start.go` reads them via
+    `workflow.LoadConfig("")` before constructing the server (load
+    errors print a stderr warning + leave the editor read-only).
+    Server.go gained a `path/filepath` import for the atomic-rename
+    parent-dir step.
+
+- **Web UX pass — May 2026 (`internal/web` + `internal/workflow`).**
+  Live UX audit at `http://localhost:8080/app` with 35 questions stacked
+  surfaced 12 issues; all fixed in this pass. Land in two files mostly:
+  `internal/web/server.go`, `internal/web/actions.go`, plus the static
+  template `internal/web/static/index.html` and the chat panel in
+  `internal/web/chat.go`. Highlights:
+  - **`renderRepoPickButtons` — repo pill markup.** Dropped the leading
+    integer span (it was the map-iteration index — random-looking and
+    read as a rank). Replaced the word badge `<span>suggested</span>`
+    with a `★` for the suggested pills (eye-trackable in a long list,
+    no horizontal whitespace cost). Cut `initialVisibleOthers` from
+    8 → 5 so a 100-repo org doesn't drown the user's screen in
+    alphabetical noise on first render. The selection summary now
+    shows repo names ("primary: meditap/api · others: …") instead of
+    the now-removed `#71` numeric form.
+  - **`buildRepoGateQuestion` (workflow.go) — honest "Suggested:" line.**
+    Old behavior: when `pickRepoForTicket` fell back to `t.Project`
+    (the Jira project key), the prompt read "Suggested: EB" which
+    isn't a repo. New: only render "Suggested: X" when `suggested !=
+    t.Project`; otherwise show "No specific repo suggested — pick one
+    below." Also dropped the verbose CLI hint "Reply: <n> or <n>,<n>...
+    change=<path> ... no" — web users have buttons; CLI/Telegram users
+    get the shorter "Reply with a number, `yes`, or `no`." line.
+  - **`stripRepoMenu` (server.go) — also strips Reply/Triage prose.**
+    Defensive: even if a legacy stored question still has the long
+    verbose hint, the web rendering drops it. Also drops "Triage
+    suggests N repos ..." preamble (the picker shows the same picks
+    as ★ pills).
+  - **Workflow → Question jump.** Awaiting-approval cards in the
+    Workflows tab now show two affordances: "open" (expands the
+    in-card detail) and "→ answer" (calls new `goonJumpToQuestion(qid)`
+    JS helper which switches to Questions tab, scroll-into-views the
+    matching `<form data-question-id="q-N">`, and briefly rings it
+    with `ring-2 ring-accent`).
+  - **Tickets transition uses `TransitionResolver`.** New endpoint
+    `/api/ticket/transitions?key=KEY` returns `<option>` tags lazy-
+    loaded into the Transition `<select>` via
+    `hx-trigger="toggle from:closest details once"`. On boards that
+    implement `TransitionResolver`, options are the real workflow
+    names (e.g. "Ready to Test"); on boards that don't, fallback to
+    the canonical 5-status enum so the dropdown is never empty.
+    `handleTicketTransition` now prefers `TransitionByName` over
+    `MapStatus + Transition`, killing the same enum-substring bug
+    we fixed in chat ("ready to test" → "ready" → StatusOpen →
+    Backlog).
+  - **PR row — toggles labeled to read as toggles.** The top-row
+    buttons keep their dual role (expand the form THEN click the
+    inner submit) but are now labeled "▸ write comment" / "▸ block
+    (request changes)" with a chevron that flips to ▾ when open.
+    The new `goonPRRowToggle` JS helper auto-focuses the textarea
+    on open and toggles `aria-expanded` so the disclosure is
+    keyboard- and screen-reader-friendly. Inner submit buttons
+    relabeled "send →" so they don't read as duplicates of the
+    top-row toggle.
+  - **Chat tab copy refreshed.** Subtitle: "Ask about tickets, PRs,
+    or your knowledge notes. Goon can comment on Jira tickets and
+    pull requests, move statuses, draft PR reviews, search
+    Confluence, and fetch web pages." Replaces the pre-pr_tools /
+    pre-ext_tools wording that only mentioned Jira. Prompt
+    suggestion grid now includes "→ review my open PRs" instead of
+    "summarize recent runs"; empty-state caption now says "Tools:
+    Jira · PRs · Confluence · web."
+  - **Active sidebar tab is now visually obvious.** Bumped the
+    inset left bar from 3px → 4px, the wash from `bg/0.10` →
+    `bg/0.18`, added `font-weight: 600` on the text and `color:
+    #A855F7` on the icon. Pre-pass the active row read identical
+    to hover on most monitors.
+  - **SOUL.md migration banner stripped from render only.** New
+    `stripSoulMigrationBanner(s)` in `internal/web/chat.go` strips
+    any leading `<!-- ... -->` HTML comments (plus matching blank
+    lines) before the `<pre>` renders SOUL.md. The on-disk file is
+    untouched — the migration audit trail is real, just shouldn't
+    show in the always-loaded knowledge panel.
+  - **`/fragments/tab-setup` alias added.** Every other tab is
+    `/fragments/tab-<name>` but Setup was at the bare `/fragments/setup`
+    (because the Setup section is hoisted out of the tab list and
+    reused as a top-of-page mis-configuration banner). Now both
+    URLs resolve so a dev-tools fetch on the conventional path
+    succeeds.
+  - **`⌘K` discoverability hint in sidebar.** Tiny `Press ⌘K /
+    Ctrl+K to jump to any tab.` line at the bottom of the sidebar
+    nav. The header has a Search button but most users miss it;
+    the inline hint teaches the shortcut without adding a button
+    to chase.
+  - **Pre-existing test breakage fixed as drive-by.**
+    `internal/workflow/workspace_test.go` was calling
+    `buildRepoGateQuestion` with 3 args but the function signature
+    has been 4 args since the multi-repo preselected[] addition.
+    Both calls patched to pass `nil` for the missing arg.
+  - **Tests touched:** `internal/web/repopick_test.go` (initial
+    visibility budget asserted 8 → 5 to match the new constant);
+    `internal/workflow/workspace_test.go` (reply-hint assertion
+    swapped from `"<n>"` to `"Reply with a number"`).
+
 - **Proactive PR review + notification forwarding (`internal/review`).**
   Two user-facing features built on three new pieces:
   - **githost companion interfaces** (`internal/githost/githost.go`):
@@ -247,6 +441,151 @@ the state machine picks up at `wf.Stage`.
   if Bitbucket rejects it the per-repo call is skipped + logged
   (`bitbucket.review_requested_skip`) and review-request detection
   silently returns empty for that host.
+- **Review feature — tests + cleanup follow-up.** `internal/review`,
+  the memory dedup, the githost review/notify methods, and the telegram
+  auto-loop helpers now have network-free unit tests (httptest + mock
+  LLM): `internal/review/review_test.go`,
+  `internal/memory/dedup_test.go`, `internal/githost/review_test.go`,
+  `internal/telegram/autoreview_test.go`. Same pass also: removed two
+  stray `fmt.Println` debug statements in `internal/daemon/daemon.go`
+  (the ticket-count one became `logx.Info("daemon.tickets_listed")`);
+  made the Telegram auto-loop's message truncation rune-safe
+  (`clampUTF8` in autoreview.go — a raw `s[:n]` can split a UTF-8 rune
+  and Telegram rejects invalid UTF-8); and `goon start` now prints a
+  hint when `GOON_AUTO_REVIEW`/`GOON_AUTO_NOTIFY` is set but the
+  Telegram bot isn't configured (the auto loop has nowhere to deliver).
+- **PR tools in the chat agent (`internal/agentctx/pr_tools.go`).**
+  Motivation: a user pasted a Bitbucket PR URL into Telegram chat and
+  goon correctly said it had no tool for it — the free-text chat loop
+  (`agentctx.ChatTurn`) was Jira-only. Fix: five pull-request tools
+  alongside the four jira_* ones — `pr_get` (metadata + reviewer
+  list), `pr_list` (open, or `filter:review-requested`), `pr_comment`,
+  `pr_approve`, `pr_request_changes` — thin wrappers over the githost
+  `PRReviewer` / `ReviewRequester` interfaces. `ChatTurnOptions`
+  gained `Host githost.Host` (plumbed from `b.opts.Host` /
+  `s.opts.Host`); `buildToolBlock` now takes `(board, host)`,
+  advertises the PR section when the host implements `PRReviewer`, and
+  no longer early-returns "no tools" when a host exists but a board
+  doesn't. `parseToolCall`'s salvage path is now generic (`"action":"`
+  marker + `validActions` filter) instead of a hardcoded jira-only
+  list. `parsePRReference` accepts a pasted PR URL (GitHub `/pull/`,
+  GitLab `/-/merge_requests/` incl. nested groups, Bitbucket
+  `/pull-requests/`) or `owner/repo#number`. Reviewer data is new:
+  `githost.Reviewer{Name,State,Approved}` + `PR.Reviewers`, populated
+  by every host's `GetPRDetails` — Bitbucket from the `participants`
+  array (role==REVIEWER), GitHub from `requested_reviewers` overlaid
+  with a best-effort `/pulls/{n}/reviews` call (latest settled state
+  per user; a COMMENTED review never downgrades a prior approve),
+  GitLab from `reviewers[]` overlaid with a best-effort `/approvals`
+  call. The extra per-host call is best-effort — a failure leaves the
+  pending set rather than failing GetPRDetails. Tests:
+  `internal/agentctx/pr_tools_test.go`,
+  `internal/githost/reviewers_test.go`.
+- **"Draft with AI" button on the web PR list (`internal/web/actions.go`).**
+  Each PR row's existing **comment** form gained a `✨ Draft with AI`
+  button next to **post comment**. Clicking it `hx-get`s the new
+  `/api/pr/draft-review?repo=…&number=…` endpoint, which calls
+  `review.DraftReview` (the same shared engine the chat `pr_review`
+  tool and the auto-loop use) and writes the draft straight into the
+  textarea via `hx-swap="innerHTML"`. The user previews, edits if they
+  want, and posts via the existing `/api/pr/comment` endpoint — no new
+  posting path, no risk of auto-publishing. Errors land in the
+  textarea prefixed `✗` so the user always sees what happened. Three-
+  minute budget + `errors.Is(err, context.DeadlineExceeded)` branches
+  match the chat `pr_review` ceiling for consistency. Tests:
+  `internal/web/draft_review_test.go`.
+- **Repo-pick UI for orgs with 100+ repos (`internal/web/server.go`
+  `renderRepoPickButtons`).** Two bugs from a Telegram-screenshot
+  report: (1) the menu-line parser capped at `n > 99`, silently
+  dropping items 100+ from the checkbox UI; (2) presenting 100+ flat
+  checkboxes drowned the LLM's "suggested" picks in alphabetical
+  noise. Fix in one function: cap bumped to 999; sort suggested first,
+  then alphabetical; typeahead `data-pick-filter` input (only when
+  the list is large); long tail tagged `data-overflow="1"` and hidden
+  behind a `show all N (X more) →` expander; checked overflow pills
+  auto-graduate out of overflow so a selection isn't lost when the
+  filter clears. Initial visible budget = suggested + 8 non-suggested.
+  Tests: `internal/web/repopick_test.go` — including the explicit
+  regression that items past 99 render.
+- **`pr_review` for large PRs: smart diff digest + 3-min budget
+  (`internal/review` + `agentctx/pr_tools.go`).** Bug surfaced from a
+  Telegram transcript: review of a 784 KB PR timed out at the 90-second
+  budget, and even when the fetch succeeded the old `trimDiff(diff,
+  18000)` byte-truncated alphabetically — the model only ever saw the
+  first ~2 files of a 30-file change. Fix in two parts. (1)
+  `trimDiffSmart` in `internal/review`: when a diff exceeds 18 KB, it
+  parses at `diff --git a/X b/Y` boundaries into per-file chunks and
+  emits a "DIFF DIGEST" — a top-level Files-changed list with per-file
+  +/- stats (so the model sees the SHAPE of the whole PR no matter
+  the size), then fairly-budgeted head excerpts of each file's hunks.
+  Falls back to plain line-boundary trim when the diff lacks
+  `diff --git` markers (raw patches). `DraftReview` switched from
+  `trimDiff` to `trimDiffSmart`, so both `pr_review` and the auto-loop
+  benefit. (2) `execPRReview` timeout 90 s → 3 min, with
+  `errors.Is(err, context.DeadlineExceeded)` branches emitting specific
+  TOOL ERROR messages (separately for fetch-timeout vs LLM-timeout)
+  that name the real reason and explicitly forbid the LLM from
+  recommending `/review` as a workaround — the same engine backs both,
+  so that suggestion was always a hallucination. Tests:
+  `internal/review/review_test.go` (TestTrimDiffSmart_*,
+  TestSplitDiffByFile, TestCountAddsDels).
+- **Jira transitions: chat moves tickets by REAL status name now
+  (`internal/boards` + `agentctx/chat.go`).** Bug surfaced from a
+  Telegram transcript: "change EB-4978 to ready to test" → goon
+  silently moved it to **Backlog** and reported success. Root cause:
+  `boards.MapStatus("ready to test")` matched the substring "ready"
+  → `StatusOpen` → Jira matched the "Backlog" transition (which also
+  maps to open). The chat then hallucinated "moved to Ready to Test"
+  because the ACTION OK message only carried the canonical status.
+  Fix: optional companion interface
+  `boards.TransitionResolver{ListTransitions, TransitionByName}`. Jira
+  lists the workflow transitions and matches the user's wording
+  against the REAL status names via `matchTransition` (exact on a
+  normalised lowercase+alphanumeric form, then containment, no
+  MapStatus bucketing). The chat's `jira_transition` uses
+  `TransitionByName` when the board implements it, falling back to
+  the canonical enum path for GitHub Issues. New `jira_transitions`
+  chat action lists a ticket's actual available statuses. The
+  ACTION OK message states the REAL applied status name and tells
+  the LLM to use it verbatim. A new TRUTHFULNESS bullet in the Rules
+  footer forbids the LLM from claiming an outcome the tool didn't
+  confirm or inventing missing capabilities ("I don't have REST API
+  access" was another hallucination from the same transcript). Mock
+  implements TransitionResolver. Tests:
+  `internal/boards/transition_test.go`,
+  `internal/agentctx/transition_test.go`.
+- **`pr_review` chat tool — natural review-then-comment flow
+  (`internal/agentctx/pr_tools.go`).** New chat action that does
+  what `/review` + `/comment` do, in one conversation: fetch the
+  diff, run the model (via the newly exported `review.DraftReview`),
+  hand back the draft fenced by `——— BEGIN REVIEW ———` /
+  `——— END REVIEW ———` plus explicit instructions for the assistant
+  to (1) show the user the review verbatim, (2) ask "post this as a
+  comment on the PR?", (3) on confirmation call `pr_comment` with
+  the EXACT draft body (the fences let the LLM locate the verbatim
+  text in its own previous turn). Triggers on "review pr <url>",
+  "what do you think of <url>", etc. `executeToolCall` grew an
+  `llm.Provider` parameter (passed from `ChatTurnOptions.LLM`) —
+  this is the only chat tool that runs an LLM call itself.
+  `review.DraftReview` is the exported entry point;
+  `Runner.draftReview` now delegates to it so the auto-loop and
+  chat share one prompt. Tests:
+  `internal/agentctx/pr_review_test.go`.
+- **Confluence + web tools in the chat agent (`internal/agentctx/ext_tools.go`).**
+  Casual chat (Telegram + web) gained four tools beyond the jira_* and
+  pr_* sets: `confluence_search` + `confluence_get` (wrap
+  `tools.Confluence`, advertised only when `atlassian.Confluence().Filled()`)
+  and `web_search` + `web_fetch` (wrap `tools.WebSearch` /
+  `tools.FetchURL`, always available — no config needed). `agentctx`
+  now imports `internal/tools`; no cycle (`tools` imports neither
+  `agentctx` nor `web`/`telegram`). `buildToolBlock` lost its "no
+  board → no tools" early return — web tools always exist, so there's
+  always at least one tool. Tool results are size-clamped before being
+  fed back into chat context (`clampForChat`, 8 KB cap, rune-safe) — a
+  fetched page can be 256 KB. New `ToolCall` fields: `Query`, `URL`,
+  `PageID`. Deliberately NOT added: run_command / file tools — casual
+  chat stays read-or-scoped-action; `/run` remains the path for the
+  full executor. Tests: `internal/agentctx/ext_tools_test.go`.
 - **Codebase index (`internal/codeindex` + `internal/tools/search_code.go`).**
   First call to `search_code` builds a per-process index of the
   current repo: regex symbol extraction (Go/Python/JS/TS/Java/Rust/

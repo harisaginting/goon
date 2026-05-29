@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/util"
+	"github.com/harisaginting/goon/internal/workflow"
 )
 
 // Reconfigurable is the small slice of *daemon.Daemon the web layer touches.
@@ -62,9 +64,17 @@ type Options struct {
 	// (list, comment, approve, request-changes) — no LLM needed.
 	// When nil, the PR panel renders a "no git host configured"
 	// hint instead of a list.
-	Host   githost.Host
-	Stdout io.Writer
-	Stderr io.Writer
+	Host githost.Host
+	// Workflow + WorkflowPath surface the active pipeline config so the
+	// Workflows tab can show "what pipeline am I running?" (the user's
+	// #1 confusion when goon has multiple workflows configured) and the
+	// new editor surface (/api/workflow/save) can write changes back to
+	// disk. Either may be nil — the UI degrades to a "no workflow.json
+	// loaded" hint.
+	Workflow     *workflow.WorkflowConfig
+	WorkflowPath string
+	Stdout       io.Writer
+	Stderr       io.Writer
 }
 
 // Server is goon's web frontend.
@@ -113,6 +123,14 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/api/daemon/resume", s.handleDaemonResume)
 	mux.HandleFunc("/api/chat", s.handleChat)
 	mux.HandleFunc("/api/chat/reset", s.handleChatReset)
+	// Persisted chat threads — each turn auto-saves to ./storage/chats/
+	// so the user can reopen a past conversation, continue it, delete
+	// it, or distill it into a permanent knowledge note that future
+	// runs will load via SOUL.md / topic-notes injection.
+	mux.HandleFunc("/api/chat/threads", s.handleChatThreads)
+	mux.HandleFunc("/api/chat/thread", s.handleChatThread)
+	mux.HandleFunc("/api/chat/thread/delete", s.handleChatThreadDelete)
+	mux.HandleFunc("/api/chat/save-as-note", s.handleChatSaveAsNote)
 	mux.HandleFunc("/api/knowledge/note", s.handleKnowledgeNote)
 	mux.HandleFunc("/api/memory/write", s.handleMemoryWrite)
 	mux.HandleFunc("/api/memory/delete", s.handleMemoryDelete)
@@ -129,13 +147,29 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/api/ticket/comment", s.handleTicketComment)
 	mux.HandleFunc("/api/ticket/transition", s.handleTicketTransition)
 	mux.HandleFunc("/api/ticket/edit", s.handleTicketEdit)
+	// Ignore/claim toggles let the user opt a ticket out of the daemon
+	// workflow without changing its board status. The daemon's
+	// nextTicket() filter respects the ignore set on every poll.
+	mux.HandleFunc("/api/ticket/ignore", s.handleTicketIgnore)
+	mux.HandleFunc("/api/ticket/unignore", s.handleTicketUnignore)
 	mux.HandleFunc("/fragments/prs", s.handlePRList)
 	mux.HandleFunc("/api/pr/comment", s.handlePRComment)
 	mux.HandleFunc("/api/pr/approve", s.handlePRApprove)
 	mux.HandleFunc("/api/pr/request-changes", s.handlePRRequestChanges)
+	mux.HandleFunc("/api/pr/draft-review", s.handlePRDraftReview)
 	// Repo picker: list all repos visible to the token, save the
 	// selected subset into GOON_REVIEW_REPOS without restart.
 	mux.HandleFunc("/fragments/repos-picker", s.handleReposPicker)
+	// Repositories tab — repo-centric reframing of the old flat-PR view.
+	// /fragments/repositories renders the per-repo card list with PR
+	// counts + local-mapping status; /fragments/repo?slug=… lazy-loads
+	// the per-repo detail panel (map form + clone button + PR list).
+	// /api/repo/map writes REPOSITORY.md; /api/repo/clone shells out
+	// git clone via the safety validator.
+	mux.HandleFunc("/fragments/repositories", s.handleRepositoryList)
+	mux.HandleFunc("/fragments/repo", s.handleRepoDetail)
+	mux.HandleFunc("/api/repo/map", s.handleRepoMap)
+	mux.HandleFunc("/api/repo/clone", s.handleRepoClone)
 	mux.HandleFunc("/api/repos/save", s.handleReposSave)
 	// Plan editor — replace wf.Plan with user-edited steps and
 	// approve the approve_plan gate in one shot.
@@ -156,12 +190,28 @@ func (s *Server) mux() *http.ServeMux {
 	// and direct htmx polls).
 	mux.HandleFunc("/fragments/status", s.fragStatus)
 	mux.HandleFunc("/fragments/tickets", s.fragTickets)
+	// Real-Jira-status dropdown source for the Tickets tab. Returns
+	// <option> tags inline so the Transition <select> can hx-get
+	// straight into innerHTML — no JSON parse needed on the client.
+	mux.HandleFunc("/api/ticket/transitions", s.handleTicketTransitions)
 	mux.HandleFunc("/fragments/questions", s.fragQuestions)
 	mux.HandleFunc("/fragments/workflows", s.fragWorkflows)
 	// Per-workflow detail panel — path-parameterized.
 	mux.HandleFunc("/fragments/workflow/", s.fragWorkflowDetail)
+	// Workflow-config header + editor surface for the Workflows tab.
+	// The editor shows workflow.json verbatim in a textarea, validates
+	// JSON on save, writes via /api/workflow/save, then fires
+	// workflowConfigChanged so the header re-renders with the new name.
+	mux.HandleFunc("/fragments/workflow-config", s.fragWorkflowConfig)
+	mux.HandleFunc("/api/workflow/save", s.handleWorkflowSave)
 	mux.HandleFunc("/fragments/config", s.fragConfig)
 	mux.HandleFunc("/fragments/setup", s.fragSetup)
+	// Alias so the sidebar "Setup" tab can follow the same
+	// /fragments/tab-<name> convention every other tab uses. Some
+	// dev-tools fetches and at least one user-extension was hitting
+	// the conventional URL and getting a 404; both paths now resolve
+	// to the same banner renderer.
+	mux.HandleFunc("/fragments/tab-setup", s.fragSetup)
 	// Header + chrome fragments served separately so the dashboard
 	// can refresh them on different cadences without re-rendering
 	// the entire main panel.
@@ -180,6 +230,11 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/fragments/tab-workflows", s.fragTabWorkflows)
 	mux.HandleFunc("/fragments/tab-tickets", s.fragTabTickets)
 	mux.HandleFunc("/fragments/tab-prs", s.fragTabPRs)
+	// /fragments/tab-repositories alias so future bookmarks can follow
+	// the new tab name — the old tab-prs URL keeps working forever for
+	// existing links and in-page navigation (the sidebar still uses
+	// data-page="prs" internally).
+	mux.HandleFunc("/fragments/tab-repositories", s.fragTabPRs)
 	// Legacy compatibility — old bookmarks still resolve.
 	mux.HandleFunc("/fragments/tab-work", s.fragTabQuestions)
 	mux.HandleFunc("/fragments/tab-overview", s.fragTabQuestions)
@@ -683,6 +738,213 @@ func (s *Server) fragConfig(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `</form>`)
 }
 
+// fragWorkflowConfig renders the "what pipeline am I running?" header
+// for the Workflows tab. Shows the active workflow's name + description
+// + source path, plus a collapsible JSON editor that POSTs to
+// /api/workflow/save. Without this band the user had no way to know
+// which workflow.json was loaded (or that they could edit it from the
+// web — most users only knew the CLI subcommand).
+func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	cfg := s.opts.Workflow
+	path := s.opts.WorkflowPath
+	// Compose the header. When no workflow.json is loaded (daemon
+	// started before any was found, or workflow.LoadConfig errored)
+	// we still show the band — but with a "create one" CTA instead
+	// of the read-current-config form.
+	name := "default"
+	desc := "Built-in pipeline (no workflow.json found)."
+	stageCount := 0
+	autoApprove := false
+	branchPrefix := ""
+	if cfg != nil {
+		if cfg.Name != "" {
+			name = cfg.Name
+		}
+		if cfg.Description != "" {
+			desc = cfg.Description
+		}
+		stageCount = len(cfg.Stages)
+		autoApprove = cfg.AutoApprove
+		branchPrefix = cfg.BranchPrefix
+	}
+	srcLabel := path
+	if srcLabel == "" {
+		srcLabel = "(no file — using built-in default)"
+	}
+	approveBadge := `<span class="inline-flex items-center gap-1 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/40 px-2 py-0.5 text-[11px] font-medium" title="goon will pause at confirm_repo + approve_plan gates and wait for your answer">⏸ gated · asks before run</span>`
+	if autoApprove {
+		approveBadge = `<span class="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/40 px-2 py-0.5 text-[11px] font-medium" title="auto_approve=true — gates are skipped; goon runs end-to-end without asking">⚡ auto-approve · runs unattended</span>`
+	}
+	stageLabel := fmt.Sprintf("%d stage%s", stageCount, pluralS(stageCount))
+	if stageCount == 0 {
+		stageLabel = "built-in stages"
+	}
+	branchLabel := ""
+	if branchPrefix != "" {
+		branchLabel = fmt.Sprintf(`<span class="text-[11px] font-mono text-muted">branch: <span class="text-accent">%s</span></span>`, html.EscapeString(branchPrefix))
+	}
+
+	fmt.Fprintf(w, `<div class="rounded-xl border border-accent/30 bg-gradient-to-br from-accent-soft to-transparent shadow-card">
+	<div class="px-5 py-4">
+		<div class="flex items-start gap-3 flex-wrap">
+			<div class="min-w-0 flex-1">
+				<div class="flex items-center gap-2 mb-1 flex-wrap">
+					<span class="text-[11px] font-semibold uppercase tracking-wider text-accent">workflow</span>
+					<span class="text-base font-semibold text-white">%s</span>
+					<span class="text-[11px] text-muted">·</span>
+					<span class="text-[11px] text-muted">%s</span>
+				</div>
+				<div class="text-xs text-muted leading-relaxed max-w-2xl">%s</div>
+				<div class="mt-2 flex items-center gap-3 flex-wrap text-[11px]">
+					<span class="font-mono text-muted/80">source: <span class="text-accent">%s</span></span>
+					%s
+				</div>
+			</div>
+			<div class="flex items-center gap-2 flex-shrink-0">
+				%s
+				<button type="button" onclick="goonWorkflowEditorToggle()"
+					class="inline-flex items-center gap-1.5 rounded-md border border-accent/40 text-accent px-3 py-1.5 text-xs font-medium hover:bg-accent/10 transition">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+					<span id="wf-editor-toggle-label">view / edit</span>
+				</button>
+			</div>
+		</div>
+	</div>`,
+		html.EscapeString(name), html.EscapeString(stageLabel),
+		html.EscapeString(desc),
+		html.EscapeString(srcLabel),
+		branchLabel,
+		approveBadge,
+	)
+
+	// Editor — hidden by default. Loads workflow.json source so the
+	// user can edit + save. We render it inside the band so a Save
+	// posts back without losing the header.
+	rawJSON := ""
+	if cfg != nil {
+		// Marshal the in-memory cfg to JSON so what the user edits
+		// matches what goon is actually running, not whatever stale
+		// disk content might exist. Pretty-printed for readability.
+		if b, err := json.MarshalIndent(cfg, "", "  "); err == nil {
+			rawJSON = string(b)
+		}
+	}
+	// Default save target: the path goon loaded from, or the standard
+	// repo-root ./workflow.json if no file was found yet.
+	saveTarget := path
+	if saveTarget == "" {
+		saveTarget = workflow.DefaultConfigFilePath()
+	}
+	fmt.Fprintf(w, `<div id="wf-editor" class="hidden border-t border-surface-border">
+		<form hx-post="/api/workflow/save" hx-target="#wf-editor-result" hx-swap="innerHTML"
+			class="px-5 py-4 space-y-2">
+			<div class="flex items-center justify-between gap-2">
+				<label class="text-[11px] font-semibold uppercase tracking-wider text-muted">workflow.json</label>
+				<span class="text-[11px] text-muted">writes to <span class="font-mono text-accent">%s</span></span>
+			</div>
+			<textarea name="body" rows="18" spellcheck="false"
+				class="w-full font-mono text-xs leading-relaxed rounded-md border border-surface-border bg-surface text-white px-3 py-2 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">%s</textarea>
+			<input type="hidden" name="path" value="%s">
+			<div class="flex items-center gap-2">
+				<button type="submit" class="inline-flex items-center gap-1 rounded-md bg-accent text-surface px-3 py-1.5 text-sm font-semibold hover:brightness-110 transition">save workflow</button>
+				<button type="button" onclick="goonWorkflowEditorToggle()" class="text-xs text-muted hover:text-white transition">cancel</button>
+				<span class="text-[11px] text-muted ml-auto">JSON only — invalid syntax is rejected. Daemon picks up the new config on its next poll.</span>
+			</div>
+			<div id="wf-editor-result" class="text-xs"></div>
+		</form>
+	</div>
+</div>`,
+		html.EscapeString(saveTarget),
+		html.EscapeString(rawJSON),
+		html.EscapeString(saveTarget),
+	)
+}
+
+// handleWorkflowSave writes the posted body to workflow.json after
+// validating that it parses as a workflow.WorkflowConfig. Returns a small
+// HTML success/error fragment for the editor's result slot and fires
+// workflowConfigChanged so the header re-renders with the new name.
+//
+// Path safety: the target path must be either the currently-loaded
+// WorkflowPath or workflow.DefaultConfigFilePath(). We don't let the
+// caller write to arbitrary paths via this surface — that would be
+// an obvious file-system-write vector.
+func (s *Server) handleWorkflowSave(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		fragErr(w, "invalid form: "+err.Error())
+		return
+	}
+	body := r.FormValue("body")
+	if strings.TrimSpace(body) == "" {
+		fragErr(w, "empty body — paste JSON or click cancel")
+		return
+	}
+	target := strings.TrimSpace(r.FormValue("path"))
+	if target == "" {
+		target = workflow.DefaultConfigFilePath()
+	}
+	// Allowlist the destination — only the loaded path or the default.
+	allowed := target == s.opts.WorkflowPath || target == workflow.DefaultConfigFilePath()
+	if !allowed {
+		fragErr(w, "refusing to write to unexpected path: "+target)
+		return
+	}
+	// Validate as a workflow.WorkflowConfig — same code path LoadConfig uses,
+	// so any error here is the same error the daemon would hit on next
+	// poll. Better to surface it now in the editor than let the daemon
+	// silently skip the bad config.
+	var probe workflow.WorkflowConfig
+	if err := json.Unmarshal([]byte(body), &probe); err != nil {
+		fragErr(w, "JSON parse error: "+err.Error())
+		return
+	}
+	// Write atomically — tmp file + rename — so the daemon never sees
+	// a half-written workflow.json mid-save.
+	dir := filepath.Dir(target)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			fragErr(w, "mkdir failed: "+err.Error())
+			return
+		}
+	}
+	tmp, err := os.CreateTemp(dir, ".workflow.*.tmp")
+	if err != nil {
+		fragErr(w, "create tmp: "+err.Error())
+		return
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.WriteString(body); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		fragErr(w, "write tmp: "+err.Error())
+		return
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		fragErr(w, "close tmp: "+err.Error())
+		return
+	}
+	if err := os.Rename(tmpName, target); err != nil {
+		_ = os.Remove(tmpName)
+		fragErr(w, "rename: "+err.Error())
+		return
+	}
+	// Patch the in-memory copy so the header reflects the new state
+	// immediately (without waiting for a daemon restart).
+	s.opts.Workflow = &probe
+	s.opts.WorkflowPath = target
+	// Fire both triggers so the header band re-renders AND any external
+	// listener (e.g. the Home tab) refreshes too.
+	w.Header().Set("HX-Trigger", "workflowConfigChanged, workflowsChanged")
+	s.events.Publish("workflowConfigChanged")
+	fragOK(w, fmt.Sprintf("saved to %s — daemon picks it up on next poll", target))
+}
+
 // fragSetup renders a banner if the daemon isn't fully configured yet.
 func (s *Server) fragSetup(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -932,7 +1194,15 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 			</tr>
 		</thead>
 		<tbody class="divide-y divide-gray-100 dark:divide-surface-border/60">`)
+	ignored := s.opts.Memory.IgnoredTickets()
 	for _, t := range tks {
+		isIgnored := false
+		if ignored != nil {
+			_, isIgnored = ignored[t.Key]
+			if !isIgnored {
+				_, isIgnored = ignored[t.ID]
+			}
+		}
 		key := html.EscapeString(t.Key)
 		if t.URL != "" {
 			key = fmt.Sprintf(`<a href="%s" target="_blank" rel="noopener" class="text-accent hover:underline inline-flex items-center gap-1">%s<svg class="h-3 w-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 17L17 7"/><path d="M7 7h10v10"/></svg></a>`,
@@ -946,67 +1216,128 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 		if project == "" {
 			project = `<span class="text-gray-400">—</span>`
 		}
-		// Actions popover — toggles a hidden row revealing comment /
-		// transition / edit forms specific to this ticket.
+		// Visual treatment when ignored: opacity-50 + a small badge
+		// next to the title. Row is still fully interactive — the
+		// user can claim it back from the same drawer.
+		rowOpacity := ""
+		titleBadge := ""
+		if isIgnored {
+			rowOpacity = " opacity-50"
+			titleBadge = `<span class="ml-2 inline-flex items-center gap-1 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/40 px-1.5 py-0 text-[10px] font-medium align-middle" title="daemon is skipping this ticket">🚫 ignored</span>`
+		}
+		// Actions popover — toggles a hidden row revealing the action
+		// drawer. The drawer is laid out as a single flex row of three
+		// focused sub-sections (status / comment / edit + the ignore
+		// toggle), each with its own primary button — replaces the
+		// previous cramped 3-column grid that read as duplicate forms.
 		safeID := strings.ReplaceAll(html.EscapeString(t.Key), "/", "-")
 		actionsRowID := "ta-" + safeID
 		actions := fmt.Sprintf(`<button type="button" onclick="document.getElementById('%s').classList.toggle('hidden')" class="text-xs text-accent hover:underline">⋯ actions</button>`, actionsRowID)
-		fmt.Fprintf(w, `<tr data-ticket-row data-status="%s" class="hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition-colors">
-			<td class="px-4 py-2.5 font-mono whitespace-nowrap">%s</td>
-			<td class="px-4 py-2.5 max-w-md truncate">%s</td>
-			<td class="px-4 py-2.5 whitespace-nowrap">%s</td>
-			<td class="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap">%s</td>
-			<td class="px-4 py-2.5 font-mono text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap">%s</td>
-			<td class="px-4 py-2.5 text-gray-500 text-xs whitespace-nowrap">%s</td>
-			<td class="px-4 py-2.5 text-right whitespace-nowrap">%s</td>
+
+		// Build the ignore/claim toggle form per row. Two distinct
+		// endpoints so the button posts a single semantic action;
+		// the row re-renders via the ticketsChanged SSE.
+		var ignoreToggle string
+		if isIgnored {
+			ignoreToggle = fmt.Sprintf(`<form hx-post="/api/ticket/unignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline-flex">
+				<input type="hidden" name="key" value="%s">
+				<button type="submit" class="inline-flex items-center gap-1 rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-700 dark:text-emerald-400 px-3 py-1.5 text-xs font-semibold hover:bg-emerald-500/25 transition" title="let the daemon consider this ticket again">↺ claim back into workflow</button>
+			</form>`, actionsRowID, html.EscapeString(t.Key))
+		} else {
+			ignoreToggle = fmt.Sprintf(`<form hx-post="/api/ticket/ignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline-flex">
+				<input type="hidden" name="key" value="%s">
+				<button type="submit" class="inline-flex items-center gap-1 rounded-md border border-amber-500/40 text-amber-700 dark:text-amber-400 px-3 py-1.5 text-xs font-medium hover:bg-amber-500/10 transition" title="daemon will skip this ticket on the next poll">🚫 ignore from workflow</button>
+			</form>`, actionsRowID, html.EscapeString(t.Key))
+		}
+
+		fmt.Fprintf(w, `<tr data-ticket-row data-status="%s" class="hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition-colors%s">
+			<td class="px-4 py-2.5 font-mono whitespace-nowrap align-top">%s</td>
+			<td class="px-4 py-2.5 align-top">
+				<div class="text-sm font-medium text-gray-900 dark:text-white max-w-xl truncate">%s%s</div>
+			</td>
+			<td class="px-4 py-2.5 whitespace-nowrap align-top">%s</td>
+			<td class="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap align-top text-xs">%s</td>
+			<td class="px-4 py-2.5 font-mono text-xs text-gray-600 dark:text-gray-400 whitespace-nowrap align-top">%s</td>
+			<td class="px-4 py-2.5 text-gray-500 text-xs whitespace-nowrap align-top">%s</td>
+			<td class="px-4 py-2.5 text-right whitespace-nowrap align-top">%s</td>
 		</tr>
 		<tr id="%s" data-action-row class="hidden bg-gray-50/40 dark:bg-surface-sunken/40">
-			<td colspan="7" class="px-4 py-3">
-				<div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
-					<form hx-post="/api/ticket/comment" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
-						<label class="font-semibold uppercase tracking-wider text-gray-500">Comment</label>
-						<input type="hidden" name="key" value="%s">
-						<textarea name="body" rows="2" required placeholder="add a comment…"
-							class="w-full font-mono rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none"></textarea>
-						<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1 font-medium hover:brightness-110 transition">post</button>
-					</form>
-					<form hx-post="/api/ticket/transition" hx-target="#%s-r" hx-swap="innerHTML" class="space-y-2">
-						<label class="font-semibold uppercase tracking-wider text-gray-500">Transition</label>
-						<input type="hidden" name="key" value="%s">
-						<select name="status" class="w-full rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
-							<option value="open">open</option>
-							<option value="in_progress">in progress</option>
-							<option value="in_review">in review</option>
-							<option value="blocked">blocked</option>
-							<option value="done">done</option>
-						</select>
-						<button type="submit" class="rounded-md border border-accent/40 text-accent px-3 py-1 font-medium hover:bg-accent-soft transition">move</button>
-					</form>
-					<form hx-post="/api/ticket/edit" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
-						<label class="font-semibold uppercase tracking-wider text-gray-500">Edit field</label>
-						<input type="hidden" name="key" value="%s">
-						<div class="flex gap-1">
-							<select name="field" class="rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:outline-none">
+			<td colspan="7" class="px-4 py-4">
+				<!-- Three sub-sections side-by-side (each one focused on
+				     a single action), then a footer with the workflow
+				     ignore/claim toggle. Cleaner than the old 3-column
+				     grid which made all three forms look like the same
+				     submit button. -->
+				<div class="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs">
+					<div class="rounded-lg border border-surface-border bg-surface p-3 space-y-2">
+						<div class="text-[10px] uppercase tracking-wider text-muted font-semibold flex items-center gap-1">
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg>
+							Add comment
+						</div>
+						<form hx-post="/api/ticket/comment" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
+							<input type="hidden" name="key" value="%s">
+							<textarea name="body" rows="2" required placeholder="comment text…"
+								class="w-full font-mono text-xs rounded-md border border-surface-border bg-surface text-white px-2 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none"></textarea>
+							<button type="submit" class="w-full rounded-md bg-accent text-surface px-3 py-1.5 font-semibold hover:brightness-110 transition">send →</button>
+						</form>
+					</div>
+					<div class="rounded-lg border border-surface-border bg-surface p-3 space-y-2">
+						<div class="text-[10px] uppercase tracking-wider text-muted font-semibold flex items-center gap-1">
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+							Move to status
+						</div>
+						<form hx-post="/api/ticket/transition" hx-target="#%s-r" hx-swap="innerHTML" class="space-y-2">
+							<input type="hidden" name="key" value="%s">
+							<select name="status"
+								hx-get="/api/ticket/transitions?key=%s"
+								hx-trigger="toggle from:closest details once, load delay:200ms"
+								hx-swap="innerHTML"
+								class="w-full rounded-md border border-surface-border bg-surface text-white px-2 py-1.5 focus:border-accent focus:outline-none">
+								<option value="" disabled selected>loading statuses…</option>
+							</select>
+							<button type="submit" class="w-full rounded-md border border-accent/40 text-accent px-3 py-1.5 font-medium hover:bg-accent/10 transition">move →</button>
+						</form>
+					</div>
+					<div class="rounded-lg border border-surface-border bg-surface p-3 space-y-2">
+						<div class="text-[10px] uppercase tracking-wider text-muted font-semibold flex items-center gap-1">
+							<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+							Edit field
+						</div>
+						<form hx-post="/api/ticket/edit" hx-target="#%s-r" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful) this.reset()" class="space-y-2">
+							<input type="hidden" name="key" value="%s">
+							<select name="field" class="w-full rounded-md border border-surface-border bg-surface text-white px-2 py-1.5 focus:border-accent focus:outline-none">
 								<option value="title">title</option>
 								<option value="desc">description</option>
 								<option value="labels">labels (a,b,c)</option>
 							</select>
-						</div>
-						<input type="text" name="value" required placeholder="new value…"
-							class="w-full font-mono rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
-						<button type="submit" class="rounded-md border border-accent/40 text-accent px-3 py-1 font-medium hover:bg-accent-soft transition">apply</button>
-					</form>
+							<input type="text" name="value" required placeholder="new value…"
+								class="w-full font-mono text-xs rounded-md border border-surface-border bg-surface text-white px-2 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+							<button type="submit" class="w-full rounded-md border border-accent/40 text-accent px-3 py-1.5 font-medium hover:bg-accent/10 transition">apply →</button>
+						</form>
+					</div>
+				</div>
+				<!-- Workflow opt-out lives in its own bar at the bottom
+				     — it's a meta-action (does NOT touch the board),
+				     so putting it next to the board-action sections
+				     would muddle the mental model. -->
+				<div class="flex items-center justify-between gap-3 mt-3 pt-3 border-t border-surface-border">
+					<div class="text-[11px] text-muted leading-snug max-w-md">
+						Ignoring a ticket tells goon's daemon to skip it on every poll. It does NOT change the ticket's status on the board.
+					</div>
+					%s
 				</div>
 				<div id="%s-r" class="mt-2 text-xs"></div>
 			</td>
 		</tr>`,
-			html.EscapeString(strings.ToLower(t.Status)), key, html.EscapeString(t.Title),
+			html.EscapeString(strings.ToLower(t.Status)), rowOpacity, key,
+			html.EscapeString(t.Title), titleBadge,
 			ticketStatusPill(t.Status), assignee, project,
 			html.EscapeString(fuzzyTime(t.UpdatedAt)), actions,
 			actionsRowID,
 			actionsRowID, html.EscapeString(t.Key),
+			actionsRowID, html.EscapeString(t.Key), html.EscapeString(t.Key),
 			actionsRowID, html.EscapeString(t.Key),
-			actionsRowID, html.EscapeString(t.Key),
+			ignoreToggle,
 			actionsRowID,
 		)
 	}
@@ -1205,12 +1536,27 @@ func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
 				</a>`, html.EscapeString(wf.PRURL), html.EscapeString(wf.PRURL))
 			}
 			if wf.PendingQuestionID != "" {
-				fmt.Fprintf(w, `<button type="button"
-					onclick="this.closest('div.group').querySelector('details').open = true"
-					class="flex items-center gap-2 w-full text-left rounded-md bg-amber-500/10 hover:bg-amber-500/15 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400 transition">
-					<span class="flex-1">⏸ paused — answer needed (<span class="font-mono">%s</span>)</span>
-					<span class="font-medium">open</span>
-				</button>`, html.EscapeString(wf.PendingQuestionID))
+				qid := html.EscapeString(wf.PendingQuestionID)
+				// Two affordances side-by-side: (a) expand the in-card
+				// detail to see plan + history without leaving the tab,
+				// (b) jump to the Questions tab and scroll the matching
+				// q-N card into view. Most users pick (b) — the picker
+				// only lives on Questions — but (a) is still useful for
+				// glancing at the plan first.
+				fmt.Fprintf(w, `<div class="flex gap-1.5 items-stretch">
+					<button type="button"
+						onclick="this.closest('div.group').querySelector('details').open = true"
+						class="flex-1 flex items-center gap-2 text-left rounded-md bg-amber-500/10 hover:bg-amber-500/15 px-2.5 py-1.5 text-xs text-amber-700 dark:text-amber-400 transition">
+						<span class="flex-1">⏸ paused — answer needed (<span class="font-mono">%s</span>)</span>
+						<span class="font-medium">open</span>
+					</button>
+					<button type="button"
+						onclick="goonJumpToQuestion('%s')"
+						title="open the Questions tab and scroll to this question"
+						class="inline-flex items-center gap-1 rounded-md bg-accent/15 hover:bg-accent/25 px-2.5 py-1.5 text-xs text-accent font-medium transition">
+						→ answer
+					</button>
+				</div>`, qid, qid)
 			}
 			if wf.Error != "" {
 				fmt.Fprintf(w, `<div class="rounded-md bg-rose-500/10 px-2.5 py-1.5 text-xs text-rose-700 dark:text-rose-400 break-words">
@@ -1288,6 +1634,10 @@ func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 		if q, ok := s.opts.Memory.GetQuestion(wf.PendingQuestionID); ok && q.Pending() {
 			isApprovePlan := wf.Stage == "approve_plan" && len(wf.Plan) > 0
 			pickButtons := renderRepoPickButtons(q.Question)
+			qBody := q.Question
+			if pickButtons != "" {
+				qBody = stripRepoMenu(q.Question)
+			}
 
 			fmt.Fprint(w, `<div class="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
 				<div class="flex items-center gap-2 text-[11px] uppercase tracking-wider text-amber-700 dark:text-amber-400 font-semibold">
@@ -1295,7 +1645,7 @@ func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 					paused — awaiting your answer
 					<span class="ml-auto font-mono normal-case tracking-normal text-gray-400">id `+html.EscapeString(q.ID)+`</span>
 				</div>
-				<div class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">`+html.EscapeString(q.Question)+`</div>`)
+				<div class="text-sm text-gray-800 dark:text-gray-200 whitespace-pre-line leading-relaxed">`+html.EscapeString(qBody)+`</div>`)
 			fmt.Fprint(w, pickButtons)
 
 			// Plan editor for approve_plan only. Each step is an
@@ -1522,6 +1872,10 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 		// button that submits the corresponding number — no typing
 		// required.
 		pickButtons := renderRepoPickButtons(q.Question)
+		qBody := q.Question
+		if pickButtons != "" {
+			qBody = stripRepoMenu(q.Question)
+		}
 		// Only the FIRST card gets the cta-glow animation. If we glow
 		// every card the loudness loses meaning; the user's eye should
 		// land on the top of the stack and work down.
@@ -1529,7 +1883,12 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 		if i == 0 {
 			cardGlow = " shadow-glow-amber"
 		}
+		// data-question-id is the scroll-into-view target for
+		// goonJumpToQuestion (called from a workflow card's
+		// "→ answer" button).
+		qIDEsc := html.EscapeString(q.ID)
 		fmt.Fprintf(w, `<form hx-post="/api/answer" hx-target="this" hx-swap="outerHTML"
+			data-question-id="%s"
 			class="relative overflow-hidden rounded-xl border border-highlight/40 bg-surface-raised shadow-card hover:shadow-lift transition-shadow%s">
 			<div class="absolute left-0 top-0 bottom-0 w-1 bg-highlight"></div>
 			<div class="px-5 py-4 space-y-3">
@@ -1566,7 +1925,7 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 					</div>
 				</div>
 			</div>
-		</form>`, cardGlow, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(q.Question), pickButtons, html.EscapeString(q.ID))
+		</form>`, qIDEsc, cardGlow, gateTone, gateLabel, ticketLabel, html.EscapeString(q.ID), html.EscapeString(qBody), pickButtons, html.EscapeString(q.ID))
 	}
 	fmt.Fprint(w, `</div>`)
 }
@@ -1580,10 +1939,14 @@ func (s *Server) fragQuestions(w http.ResponseWriter, _ *http.Request) {
 //	   4. owner/svc (remote)  (remote-tagged entries)
 //
 // and returns a multi-select panel: a row of checkboxes (so the user
-// can pick more than one) plus a "select picks" submit button that
-// submits a comma-separated answer. Single-click "Pick N" buttons
-// stay as a quick-path for the common single-pick case. Returns "" if
-// no menu is detected.
+// can pick more than one), a typeahead filter (essential when an org
+// has 100+ repos), an overflow expander, plus a submit button that
+// posts a comma-separated answer. Returns "" if no menu is detected.
+//
+// Ordering: suggested options first (preserving their original number
+// badges), then alphabetical. Anything past initialVisibleOthers in
+// the non-suggested set is hidden under a "show all" expander until
+// the user clicks it or types into the filter.
 func renderRepoPickButtons(question string) string {
 	type opt struct {
 		num      int
@@ -1604,8 +1967,11 @@ func renderRepoPickButtons(question string) string {
 		if dot <= 0 {
 			continue
 		}
+		// Bumped from 99 → 999: orgs routinely have 100+ repos, and
+		// the old cap silently dropped items 100+ from the UI (the
+		// user could see them in the prompt text but not click them).
 		n, err := strconv.Atoi(strings.TrimSpace(trimmed[:dot]))
-		if err != nil || n < 1 || n > 99 {
+		if err != nil || n < 1 || n > 999 {
 			continue
 		}
 		rest := strings.TrimSpace(trimmed[dot+1:])
@@ -1623,41 +1989,89 @@ func renderRepoPickButtons(question string) string {
 		return ""
 	}
 
-	// Unique form id so the multi-select JS doesn't collide if the
-	// page renders several pending questions.
+	// Suggested first, then alphabetical — the original numeric ordering
+	// is preserved by the per-pill `num` badge, but on long lists the
+	// alphabetical sort makes a name easy to find with the eye.
+	sort.SliceStable(opts, func(i, j int) bool {
+		if opts[i].isSug != opts[j].isSug {
+			return opts[i].isSug
+		}
+		return strings.ToLower(opts[i].name) < strings.ToLower(opts[j].name)
+	})
+
+	// Visibility budget: every suggested option always shows; among the
+	// non-suggested set, only the first initialVisibleOthers render by
+	// default. The rest are tagged data-overflow="1" and hidden until
+	// the user expands or types into the filter.
+	// Cut from 8 → 5 after a 100-repo org filled the screen with
+	// alphabetical noise even when triage had marked 1-2 picks.
+	const initialVisibleOthers = 5
+	overflowNums := map[int]bool{}
+	others := 0
+	for _, o := range opts {
+		if o.isSug {
+			continue
+		}
+		if others < initialVisibleOthers {
+			others++
+		} else {
+			overflowNums[o.num] = true
+		}
+	}
+	overflowCount := len(overflowNums)
+	showFilter := len(opts) > initialVisibleOthers+1
+
+	// Unique form id so multiple pending questions on one page don't
+	// collide on their JS hooks.
 	mid := fmt.Sprintf("ms%d", time.Now().UnixNano())
 
 	var sb strings.Builder
 	sb.WriteString(`<div class="space-y-2 pt-1">`)
-	sb.WriteString(`<div class="text-[11px] uppercase tracking-wider text-muted">Pick one or more — first selected becomes the primary repo:</div>`)
+	fmt.Fprintf(&sb, `<div class="text-[11px] uppercase tracking-wider text-muted">Pick one or more — first selected becomes the primary repo (%d options):</div>`, len(opts))
+	if showFilter {
+		fmt.Fprintf(&sb, `<input type="text" data-pick-filter="%s" placeholder="filter repos by name…" autocomplete="off"
+			class="w-full rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-sm focus:border-accent focus:outline-none"
+			oninput="goonPickRefresh('%s')">`, mid, mid)
+	}
 	fmt.Fprintf(&sb, `<div class="flex flex-wrap gap-2" data-pick-group="%s">`, mid)
 	for _, o := range opts {
-		// Unselected pill: faint surface, hover lifts toward purple.
-		// Suggested pill: filled with the soft accent wash so the
-		// recommended choice reads first even before the user looks.
 		cls := "border-surface-border bg-surface text-muted hover:border-accent hover:text-white"
-		badge := ""
+		// Leading marker per pill. A ★ for suggested replaces the old
+		// "suggested" word badge — eye-trackable in a long list, no
+		// horizontal whitespace cost.
+		marker := `<span class="text-xs opacity-30" aria-hidden="true">·</span>`
 		if o.isSug {
 			cls = "border-accent/50 bg-accent-soft text-accent hover:bg-accent hover:text-white"
-			badge = `<span class="text-[10px] uppercase tracking-wider opacity-70">suggested</span>`
+			marker = `<span class="text-amber-400" aria-label="suggested by triage" title="suggested by triage">★</span>`
 		}
 		remoteBadge := ""
 		if o.isRemote {
-			// "remote" tag uses amber so it stands distinctly apart
-			// from the purple suggested-tag without competing for
-			// the primary CTA's amber rail (those use highlight too,
-			// but in different positions).
 			remoteBadge = `<span class="text-[10px] uppercase tracking-wider text-highlight">remote</span>`
 		}
-		fmt.Fprintf(&sb, `<label class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition cursor-pointer %s">
+		overflowAttr := ""
+		hiddenStyle := ""
+		if overflowNums[o.num] {
+			overflowAttr = ` data-overflow="1"`
+			hiddenStyle = ` style="display:none"`
+		}
+		// Pill markup. data-pick still carries the menu number (the
+		// answer parser is index-driven, so this can't go away), but
+		// it is NOT shown to the user — the leading integer was just
+		// noise (random map-iteration order) that read like a rank.
+		fmt.Fprintf(&sb, `<label data-pick-pill="%s" data-pick-name="%s"%s%s class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm font-medium transition cursor-pointer %s">
 			<input type="checkbox" data-pick="%d" data-group="%s" class="h-3.5 w-3.5 accent-accent" onchange="goonPickToggle('%s')">
-			<span class="font-mono text-xs opacity-60">%d</span>
+			%s
 			<span>%s</span>
 			%s
-			%s
-		</label>`, cls, o.num, mid, mid, o.num, html.EscapeString(o.name), badge, remoteBadge)
+		</label>`, mid, html.EscapeString(strings.ToLower(o.name)), overflowAttr, hiddenStyle, cls, o.num, mid, mid, marker, html.EscapeString(o.name), remoteBadge)
 	}
 	sb.WriteString(`</div>`)
+	if overflowCount > 0 {
+		fmt.Fprintf(&sb, `<button type="button" data-pick-expand="%s" onclick="goonPickExpand('%s')"
+			class="text-[11px] text-muted underline-offset-2 hover:text-accent hover:underline transition">
+			show all %d (%d more) →
+		</button>`, mid, mid, len(opts), overflowCount)
+	}
 	fmt.Fprintf(&sb, `<div class="flex items-center gap-2 pt-1">
 		<button type="submit" name="answer" data-pick-submit="%s" formnovalidate disabled
 			class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-white px-3 py-1.5 text-sm font-bold opacity-40 cursor-not-allowed transition">
@@ -1666,15 +2080,33 @@ func renderRepoPickButtons(question string) string {
 		<span class="text-[11px] text-muted" data-pick-summary="%s"></span>
 	</div>`, mid, mid, mid)
 	sb.WriteString(`</div>`)
-	// One small script — the renderer is called per-question so we
-	// guard via window flag to avoid redefining the function.
+	// goonPickToggle: existing behavior + auto-graduate a checked
+	// overflow pill out of the hidden set, so the user never loses
+	// sight of what they've picked when the filter clears.
+	// goonPickRefresh: filter + overflow visibility recomputation.
+	// goonPickExpand: reveal the long tail.
 	sb.WriteString(`<script>
 		window.goonPickToggle = window.goonPickToggle || function(mid) {
 			var boxes = document.querySelectorAll('input[data-group="' + mid + '"]:checked');
+			boxes.forEach(function(b) {
+				var pill = b.closest('[data-pick-pill="' + mid + '"]');
+				if (pill && pill.getAttribute('data-overflow') === '1') {
+					pill.removeAttribute('data-overflow');
+				}
+			});
 			var btn = document.querySelector('button[data-pick-submit="' + mid + '"]');
 			var lbl = document.querySelector('[data-pick-label="' + mid + '"]');
 			var sum = document.querySelector('[data-pick-summary="' + mid + '"]');
 			var nums = Array.from(boxes).map(function(b){ return b.getAttribute('data-pick'); });
+			// Look up the human-readable repo name for each selected pill,
+			// so the summary reads "primary: meditap/api · others: …"
+			// instead of "#71 · #52" (the leading integer was removed
+			// from the pill, so a numeric summary is now meaningless).
+			var names = Array.from(boxes).map(function(b){
+				var pill = b.closest('[data-pick-pill="' + mid + '"]');
+				var name = pill && pill.querySelector('span:not([class*="text-amber"]):not([class*="opacity-30"]):not([class*="text-highlight"])');
+				return name ? name.textContent.trim() : '#' + b.getAttribute('data-pick');
+			});
 			if (nums.length === 0) {
 				btn.disabled = true;
 				btn.classList.add('opacity-40','cursor-not-allowed');
@@ -1686,11 +2118,100 @@ func renderRepoPickButtons(question string) string {
 				btn.classList.remove('opacity-40','cursor-not-allowed');
 				btn.value = nums.join(',');
 				lbl.textContent = (nums.length === 1 ? 'use pick' : 'use ' + nums.length + ' picks') + ' →';
-				if (sum) sum.textContent = 'primary: #' + nums[0] + (nums.length > 1 ? ' · others: ' + nums.slice(1).map(function(n){return '#'+n;}).join(', ') : '');
+				if (sum) sum.textContent = 'primary: ' + names[0] + (names.length > 1 ? ' · others: ' + names.slice(1).join(', ') : '');
 			}
+		};
+		window.goonPickRefresh = window.goonPickRefresh || function(mid) {
+			var input = document.querySelector('input[data-pick-filter="' + mid + '"]');
+			var q = ((input && input.value) || '').toLowerCase().trim();
+			document.querySelectorAll('[data-pick-pill="' + mid + '"]').forEach(function(p) {
+				var name = (p.getAttribute('data-pick-name') || '').toLowerCase();
+				var matchFilter = !q || name.indexOf(q) >= 0;
+				var inOverflow = p.getAttribute('data-overflow') === '1' && !q;
+				p.style.display = (matchFilter && !inOverflow) ? '' : 'none';
+			});
+			var btn = document.querySelector('[data-pick-expand="' + mid + '"]');
+			if (btn) {
+				var hasOverflow = document.querySelectorAll('[data-pick-pill="' + mid + '"][data-overflow="1"]').length > 0;
+				btn.style.display = (hasOverflow && !q) ? '' : 'none';
+			}
+		};
+		window.goonPickExpand = window.goonPickExpand || function(mid) {
+			document.querySelectorAll('[data-pick-pill="' + mid + '"][data-overflow="1"]').forEach(function(p) {
+				p.removeAttribute('data-overflow');
+			});
+			window.goonPickRefresh(mid);
 		};
 	</script>`)
 	return sb.String()
+}
+
+// stripRepoMenu removes the numbered "Available repos:" block from a
+// confirm_repo question body, leaving just the preamble. Called when
+// the picker is being rendered right below — the prose enumeration of
+// 100+ repos would otherwise duplicate every checkbox and bury the
+// actual ticket context. The numbered references are still preserved
+// for answer parsing (the picker submits the same numbers).
+func stripRepoMenu(body string) string {
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines))
+	repoCount := 0
+	headerStripped := false
+	hintStripped := false
+	for _, raw := range lines {
+		line := strings.TrimRight(raw, " \t")
+		if strings.EqualFold(strings.TrimSpace(line), "Available repos:") {
+			headerStripped = true
+			continue
+		}
+		// Drop the CLI/Telegram "Reply with ..." hint line(s) from the
+		// web rendering — web users have buttons for every option, so
+		// the prose is pure noise. Covers the short new form ("Reply
+		// with a number, `yes`, or `no`.") and the old verbose form
+		// ("Reply: <n> or <n>,<n>,<n> ... change=<path> ... no").
+		trimLower := strings.ToLower(strings.TrimSpace(line))
+		if strings.HasPrefix(trimLower, "reply:") || strings.HasPrefix(trimLower, "reply with") {
+			hintStripped = true
+			continue
+		}
+		// Also drop a "Triage suggests N repos ..." multi-pick preamble
+		// — the picker shows the same picks as ★ badges below.
+		if strings.HasPrefix(trimLower, "triage suggests ") {
+			hintStripped = true
+			continue
+		}
+		trimmed := strings.TrimLeft(line, " \t")
+		if strings.HasPrefix(trimmed, "*") || strings.HasPrefix(trimmed, "→") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+		}
+		if dot := strings.IndexByte(trimmed, '.'); dot > 0 {
+			if n, err := strconv.Atoi(strings.TrimSpace(trimmed[:dot])); err == nil && n >= 1 && n <= 999 {
+				repoCount++
+				continue
+			}
+		}
+		out = append(out, raw)
+	}
+	if !headerStripped && repoCount == 0 && !hintStripped {
+		return body
+	}
+	// Collapse runs of blank lines the strip leaves behind.
+	var sb strings.Builder
+	prevBlank := false
+	for _, line := range out {
+		blank := strings.TrimSpace(line) == ""
+		if blank && prevBlank {
+			continue
+		}
+		sb.WriteString(line)
+		sb.WriteByte('\n')
+		prevBlank = blank
+	}
+	cleaned := strings.TrimRight(sb.String(), "\n")
+	if repoCount > 0 {
+		cleaned += fmt.Sprintf("\n\n(picker below — %d repo option%s)", repoCount, pluralS(repoCount))
+	}
+	return cleaned
 }
 
 // emptyState is the standardized empty-list panel — title + helpful hint.
@@ -1760,6 +2281,14 @@ func (s *Server) fragTabWorkflows(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, pageHeader("Workflows",
 		"What goon is doing right now. Each card shows plan progress, the open PR, errors, and a clickable history of earlier attempts.",
 		""))
+	// Workflow-config header band — shows the user "which pipeline am
+	// I running?" (the #1 source of confusion when goon has multiple
+	// workflow.json files) plus a one-tap "view / edit config" expander.
+	// Lazy-loads via /fragments/workflow-config so the user can edit
+	// the workflow.json from this tab without dropping to a terminal.
+	fmt.Fprint(w, `<div class="mb-4" hx-get="/fragments/workflow-config" hx-trigger="load, workflowConfigChanged from:body" hx-swap="innerHTML">
+		<div class="rounded-xl border border-dashed border-surface-border bg-surface-raised/40 px-4 py-3 text-sm text-muted">Loading workflow config…</div>
+	</div>`)
 	fmt.Fprint(w, `<div hx-get="/fragments/workflows" hx-trigger="load, workflowsChanged from:body" hx-swap="morph">
 		<div class="text-sm text-gray-500">Loading workflows…</div>
 	</div>`)
@@ -1827,15 +2356,19 @@ func (s *Server) fragTabTickets(w http.ResponseWriter, _ *http.Request) {
 	</script>`)
 }
 
-// fragTabPRs — pull requests page. Same content as the in-Work
-// inline section but standalone with a proper page header.
+// fragTabPRs — Repositories page. Reframed from a flat PR firehose
+// to a repo-centric list (REPOSITORY.md ∪ repos that returned PRs),
+// each row expandable to per-repo detail with map / clone / PR
+// actions. Internal route name stays "tab-prs" + data-page="prs"
+// so existing bookmarks and the sidebar's showPage() logic don't
+// need to change; the user-visible label is "Repositories".
 func (s *Server) fragTabPRs(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, pageHeader("Pull requests",
-		"Approve, comment, or request changes — straight from here, no LLM round-trip. Use <code class=\"font-mono text-xs\">⚙ manage which repos goon follows</code> inside the list to scope the queue.",
+	fmt.Fprint(w, pageHeader("Repositories",
+		"Every repo goon works on, with its open PRs underneath. Click a row to expand — map a local path, clone if it isn't on disk yet, or act on a PR (comment / approve / block).",
 		""))
-	fmt.Fprint(w, `<div hx-get="/fragments/prs" hx-trigger="load, prsChanged from:body" hx-swap="innerHTML">
-		<div class="text-sm text-gray-500">Loading pull requests…</div>
+	fmt.Fprint(w, `<div hx-get="/fragments/repositories" hx-trigger="load, prsChanged from:body, repositoriesChanged from:body" hx-swap="innerHTML">
+		<div class="text-sm text-gray-500">Loading repositories…</div>
 	</div>`)
 }
 

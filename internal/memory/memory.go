@@ -231,6 +231,14 @@ type storeFile struct {
 	// which inbox items have already been forwarded.
 	ReviewSeen map[string]ReviewMark `json:"review_seen,omitempty"`
 	NotifSeen  map[string]time.Time  `json:"notif_seen,omitempty"`
+
+	// Ignored tracks ticket keys the user has explicitly opted out of
+	// the daemon workflow. The daemon's ticket-picker filters this
+	// set, so an ignored ticket never gets a workflow opened against
+	// it (no triage, no confirm_repo, nothing). Per-key timestamp is
+	// "ignored at" — useful for showing the user when they last
+	// opted out + for any future "auto-unclaim after N days" policy.
+	Ignored map[string]time.Time `json:"ignored,omitempty"`
 }
 
 // New opens (or creates) the memory file. If path is empty it defaults to
@@ -269,6 +277,7 @@ func New(path string) (*Memory, error) {
 		RepoChoices: map[string]string{},
 		ReviewSeen:  map[string]ReviewMark{},
 		NotifSeen:   map[string]time.Time{},
+		Ignored:     map[string]time.Time{},
 	}}
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &m.store)
@@ -286,6 +295,9 @@ func New(path string) (*Memory, error) {
 		}
 		if m.store.NotifSeen == nil {
 			m.store.NotifSeen = map[string]time.Time{}
+		}
+		if m.store.Ignored == nil {
+			m.store.Ignored = map[string]time.Time{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("memory: read %s: %w", path, err)
@@ -743,6 +755,74 @@ func (m *Memory) SeenTicket(s TicketSnapshot) {
 		pruneOldestTickets(m.store.Tickets, maxTicketSnapshots)
 	}
 	m.flush()
+}
+
+// IgnoreTicket marks a ticket key as opted-out of the daemon
+// workflow. The daemon's ticket-picker filters this set, so an
+// ignored ticket never gets a workflow opened against it. The
+// per-key timestamp is "ignored at" — used for future "auto-
+// unclaim after N days" policies and surfaced in the UI.
+func (m *Memory) IgnoreTicket(key string) {
+	if m == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.Ignored == nil {
+		m.store.Ignored = map[string]time.Time{}
+	}
+	m.store.Ignored[key] = time.Now()
+	m.flush()
+}
+
+// UnignoreTicket removes the opt-out so the ticket can be picked up
+// by the next poll cycle. No-op when the key wasn't ignored.
+func (m *Memory) UnignoreTicket(key string) {
+	if m == nil || strings.TrimSpace(key) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.Ignored == nil {
+		return
+	}
+	delete(m.store.Ignored, key)
+	m.flush()
+}
+
+// IsTicketIgnored returns true when the daemon should skip this key.
+// Used both by the daemon's pickNextTicket filter and by the web UI
+// to render the muted/ignored badge on each row.
+func (m *Memory) IsTicketIgnored(key string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.Ignored == nil {
+		return false
+	}
+	_, ok := m.store.Ignored[key]
+	return ok
+}
+
+// IgnoredTickets returns a copy of the current ignore-set keys.
+// Useful for the daemon to filter a fetched ticket list in O(1)
+// per key without holding the memory lock for the whole iteration.
+func (m *Memory) IgnoredTickets() map[string]time.Time {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.store.Ignored) == 0 {
+		return nil
+	}
+	out := make(map[string]time.Time, len(m.store.Ignored))
+	for k, v := range m.store.Ignored {
+		out[k] = v
+	}
+	return out
 }
 
 // pruneOldestTickets evicts entries with the oldest LastSeen until the

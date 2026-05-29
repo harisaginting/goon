@@ -155,8 +155,14 @@ func (r *Runner) reviewKey(repo string, number int) string {
 	return fmt.Sprintf("%s:%s#%d", r.HostName(), repo, number)
 }
 
-// draftReview asks the model for a tight, phone-readable review.
-func (r *Runner) draftReview(ctx context.Context, title, url, author, body, diff string) (string, error) {
+// DraftReview asks the LLM for a tight, phone-readable review of
+// (pr, diff). Exposed so callers that want a one-shot review without
+// constructing a Runner — e.g. the chat agent's pr_review tool — can
+// reuse the prompt shape.
+func DraftReview(ctx context.Context, prov llm.Provider, pr githost.PR, diff string) (string, error) {
+	if prov == nil {
+		return "", fmt.Errorf("review: no LLM provider")
+	}
 	prompt := fmt.Sprintf(`Review this pull request and surface the highest-leverage feedback.
 Format your reply as plain prose with these sections (skip a section if you have nothing to say):
 SUMMARY — 1-2 sentences on what the PR does
@@ -174,9 +180,9 @@ body:
 %s
 
 DIFF (unified):
-%s`, title, url, author, snippet(body, 1000), trimDiff(diff, maxDiffBytes))
+%s`, pr.Title, pr.URL, pr.Author, snippet(pr.Body, 1000), trimDiffSmart(diff, maxDiffBytes))
 
-	out, err := r.llm.Generate(ctx, []llm.Message{
+	out, err := prov.Generate(ctx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
 	}, llm.Options{Temperature: 0.2, MaxTokens: 4096})
 	if err != nil {
@@ -187,6 +193,12 @@ DIFF (unified):
 		return "", fmt.Errorf("model produced no review")
 	}
 	return out, nil
+}
+
+// draftReview delegates to DraftReview, keeping the per-field signature
+// the Runner's callers already use.
+func (r *Runner) draftReview(ctx context.Context, title, url, author, body, diff string) (string, error) {
+	return DraftReview(ctx, r.llm, githost.PR{Title: title, URL: url, Author: author, Body: body}, diff)
 }
 
 // Notifications lists the review-request + mention notifications goon
@@ -335,7 +347,8 @@ func snippet(s string, n int) string {
 	return s[:cut] + "…"
 }
 
-// trimDiff caps a diff at max bytes, cutting on a line boundary.
+// trimDiff caps a diff at max bytes, cutting on a line boundary. Used
+// as the fallback when smart trimming can't parse a file structure.
 func trimDiff(diff string, max int) string {
 	if len(diff) <= max {
 		return diff
@@ -345,4 +358,131 @@ func trimDiff(diff string, max int) string {
 		cut = max
 	}
 	return diff[:cut] + fmt.Sprintf("\n…(diff truncated; full size %d bytes)", len(diff))
+}
+
+// trimDiffSmart compresses a unified diff for the LLM. Small diffs
+// (≤ max) pass through unchanged. Large diffs are parsed into per-file
+// chunks and re-emitted as a "diff digest": every file gets +/- stats,
+// then fairly-budgeted head excerpts. The LLM sees the SHAPE of the
+// whole PR instead of a deep dive on the first file alone — which is
+// what a naïve byte-trim of a 784 KB diff produces.
+func trimDiffSmart(diff string, max int) string {
+	if len(diff) <= max {
+		return diff
+	}
+	files := splitDiffByFile(diff)
+	if len(files) == 0 {
+		// Couldn't parse the diff structure — fall back to plain
+		// line-boundary trim so the model still sees something.
+		return trimDiff(diff, max)
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "DIFF DIGEST (full diff is %d bytes across %d files; per-file excerpts trimmed):\n\n",
+		len(diff), len(files))
+	sb.WriteString("Files changed:\n")
+	for _, f := range files {
+		adds, dels := countAddsDels(f.body)
+		fmt.Fprintf(&sb, "  %s  +%d -%d\n", f.path, adds, dels)
+	}
+	sb.WriteString("\n")
+
+	// Per-file excerpts, fairly budgeted across all files.
+	overhead := sb.Len() + 200 // leave headroom for the closer / file headers
+	if overhead >= max {
+		return sb.String() + "(file list only — diff too large for any per-file excerpts; review from the stats above)\n"
+	}
+	perFile := (max - overhead) / len(files)
+	if perFile < 400 {
+		perFile = 400 // minimum useful excerpt
+	}
+
+	for _, f := range files {
+		if sb.Len()+200 >= max {
+			sb.WriteString("\n…(remaining files omitted for size)\n")
+			break
+		}
+		fmt.Fprintf(&sb, "── %s ──\n", f.path)
+		excerpt := f.body
+		if len(excerpt) > perFile {
+			cut := strings.LastIndex(excerpt[:perFile], "\n")
+			if cut <= 0 {
+				cut = perFile
+			}
+			excerpt = excerpt[:cut] + "\n…(file truncated)\n"
+		}
+		sb.WriteString(excerpt)
+		sb.WriteString("\n")
+	}
+	return sb.String()
+}
+
+// diffFile is one file's chunk in a unified diff.
+type diffFile struct {
+	path string
+	body string
+}
+
+// splitDiffByFile splits a unified diff at "diff --git a/X b/Y"
+// boundaries. Each file's body includes its diff header, ---/+++
+// lines, and all hunks. Returns nil for diffs with no recognisable
+// per-file markers (e.g. plain patches without the `diff --git`
+// header) so the caller can fall back to plain trimming.
+func splitDiffByFile(diff string) []diffFile {
+	if !strings.Contains(diff, "diff --git ") {
+		return nil
+	}
+	lines := strings.Split(diff, "\n")
+	var out []diffFile
+	cur := diffFile{}
+	body := strings.Builder{}
+	for _, line := range lines {
+		if strings.HasPrefix(line, "diff --git ") {
+			if cur.path != "" {
+				cur.body = body.String()
+				out = append(out, cur)
+			}
+			cur = diffFile{path: extractDiffPath(line)}
+			body.Reset()
+		}
+		body.WriteString(line)
+		body.WriteByte('\n')
+	}
+	if cur.path != "" {
+		cur.body = body.String()
+		out = append(out, cur)
+	}
+	return out
+}
+
+// extractDiffPath grabs the "b/<path>" target from a "diff --git" line,
+// falling back to the last whitespace-separated token.
+func extractDiffPath(line string) string {
+	for _, p := range strings.Fields(line) {
+		if strings.HasPrefix(p, "b/") {
+			return strings.TrimPrefix(p, "b/")
+		}
+	}
+	parts := strings.Fields(line)
+	if len(parts) > 0 {
+		return parts[len(parts)-1]
+	}
+	return ""
+}
+
+// countAddsDels counts + and - lines in a unified diff body, skipping
+// the --- / +++ file headers.
+func countAddsDels(body string) (int, int) {
+	adds, dels := 0, 0
+	for _, line := range strings.Split(body, "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+			// file headers, not counts
+		case strings.HasPrefix(line, "+"):
+			adds++
+		case strings.HasPrefix(line, "-"):
+			dels++
+		}
+	}
+	return adds, dels
 }

@@ -11,16 +11,25 @@ import (
 	"time"
 )
 
+// Reviewer is one person on a PR's review list, with their latest
+// review state when the host reports it.
+type Reviewer struct {
+	Name     string `json:"name"`
+	State    string `json:"state,omitempty"` // "approved" | "changes_requested" | "commented" | "pending"
+	Approved bool   `json:"approved,omitempty"`
+}
+
 // PR is the canonical pull-request descriptor used by goon's workflow.
 type PR struct {
-	Number int    `json:"number"`
-	URL    string `json:"url"`
-	Title  string `json:"title"`
-	Branch string `json:"branch"`
-	Author string `json:"author,omitempty"`
-	State  string `json:"state,omitempty"`  // "open" | "closed" | "merged"
-	Body   string `json:"body,omitempty"`
-	Repo   string `json:"repo,omitempty"`   // "owner/repo"
+	Number    int        `json:"number"`
+	URL       string     `json:"url"`
+	Title     string     `json:"title"`
+	Branch    string     `json:"branch"`
+	Author    string     `json:"author,omitempty"`
+	State     string     `json:"state,omitempty"` // "open" | "closed" | "merged"
+	Body      string     `json:"body,omitempty"`
+	Repo      string     `json:"repo,omitempty"`      // "owner/repo"
+	Reviewers []Reviewer `json:"reviewers,omitempty"` // populated by GetPRDetails
 }
 
 // CreateOptions holds the inputs to OpenPR.

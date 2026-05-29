@@ -90,12 +90,28 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 		// them later; web handlers read via s.opts.LLM / s.opts.Board
 		// at request time.
 		llmProv, snapBoard, snapHost := d.Snapshot()
+		// Read the active workflow config so the web UI's Workflows
+		// tab can show "what pipeline am I running?" and the new
+		// editor surface (/api/workflow/save) has something to load.
+		// LoadConfig falls back to the built-in default when no
+		// workflow.json exists, and returns the resolved source path
+		// (empty when no file was found).
+		wfCfg, wfSource, wfErr := workflow.LoadConfig("")
+		if wfErr != nil {
+			fmt.Fprintf(stderr, "workflow.json load failed (web UI editor will be read-only): %v\n", wfErr)
+		}
+		// LoadConfig returns the value (with built-in defaults on
+		// "no file found"), but web.Options.Workflow is a *pointer*
+		// so the handler can use nil to signal "completely unavailable".
+		// Take the address so the header always has something to render.
 		srv = web.NewServer(web.Options{
 			Addr: *webAddr, Memory: mem,
-			LLM:    llmProv,
-			Board:  snapBoard,
-			Host:   snapHost,
-			Daemon: d, Stdout: stdout, Stderr: stderr,
+			LLM:          llmProv,
+			Board:        snapBoard,
+			Host:         snapHost,
+			Workflow:     &wfCfg,
+			WorkflowPath: wfSource,
+			Daemon:       d, Stdout: stdout, Stderr: stderr,
 		})
 		go func() {
 			// recover() so a panic deep inside an htmx handler can never
@@ -168,6 +184,10 @@ func startTelegramBot(parent context.Context, d *daemon.Daemon,
 	if token == "" || secret == "" {
 		if token != "" || secret != "" {
 			fmt.Fprintln(stderr, "telegram bot: need BOTH TELEGRAM_BOT_TOKEN and GOON_TELEGRAM_SECRET — bot disabled")
+		}
+		if os.Getenv("GOON_AUTO_REVIEW") != "" || os.Getenv("GOON_AUTO_NOTIFY") != "" {
+			fmt.Fprintln(stderr, "telegram bot: GOON_AUTO_REVIEW / GOON_AUTO_NOTIFY deliver through the Telegram bot — "+
+				"set TELEGRAM_BOT_TOKEN + GOON_TELEGRAM_SECRET, or run `goon review-prs` / `goon notifications` directly")
 		}
 		return nil
 	}

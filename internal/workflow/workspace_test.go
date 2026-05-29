@@ -71,7 +71,9 @@ func TestBuildRepoGateQuestion_WithMenu(t *testing.T) {
 		{Label: "gamma", Value: "/ws/gamma"},
 		{Label: "owner/remote-svc", Value: "owner/remote-svc", IsRemote: true},
 	}
-	q := buildRepoGateQuestion(ticket, "/ws/beta", repos)
+	// 4th arg (preselected) is the multi-repo set from triage — nil
+	// here because the legacy test predates that signature.
+	q := buildRepoGateQuestion(ticket, "/ws/beta", repos, nil)
 	if !strings.Contains(q, "1. alpha") {
 		t.Errorf("missing alpha entry: %s", q)
 	}
@@ -84,7 +86,11 @@ func TestBuildRepoGateQuestion_WithMenu(t *testing.T) {
 	if !strings.Contains(q, "4. owner/remote-svc (remote)") {
 		t.Errorf("missing remote tag: %s", q)
 	}
-	if !strings.Contains(q, "<n>") {
+	// Reply hint shortened after UX pass — web users have buttons, so
+	// the verbose "<n> or <n>,<n>,<n> ... change=<path> ..." prose is
+	// gone. CLI/Telegram users still get the simpler "Reply with a
+	// number, `yes`, or `no`." line.
+	if !strings.Contains(q, "Reply with a number") {
 		t.Errorf("missing reply hint: %s", q)
 	}
 }
@@ -93,7 +99,7 @@ func TestBuildRepoGateQuestion_WithMenu(t *testing.T) {
 // when no candidates are configured.
 func TestBuildRepoGateQuestion_NoMenu(t *testing.T) {
 	ticket := boards.Ticket{Key: "ENG-1", Title: "fix flaky test"}
-	q := buildRepoGateQuestion(ticket, "/some/path", nil)
+	q := buildRepoGateQuestion(ticket, "/some/path", nil, nil)
 	if strings.Contains(q, "Available repos:") {
 		t.Errorf("expected no menu, got: %s", q)
 	}

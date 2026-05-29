@@ -220,21 +220,22 @@ func (j *Jira) Comment(ctx context.Context, id, body string) error {
 	return err
 }
 
-// Transition moves a ticket to a goon-known Status by finding the
-// best-matching workflow transition for the project. Two-step:
-//  1. GET /issue/{key}/transitions to list available transitions
-//     (these are workflow-defined — names like "Start Progress",
-//     "In Review", "Done" depend on the project's Jira workflow).
-//  2. POST /issue/{key}/transitions with the chosen transition id.
-//
-// We pick the transition whose Name fuzzy-matches the target Status
-// via MapStatus. If no match is found we return an error listing the
-// available transitions so the caller can surface that to the user.
-func (j *Jira) Transition(ctx context.Context, id string, s Status) error {
+// jiraTransition is one workflow transition currently available for an
+// issue.
+type jiraTransition struct {
+	ID     string // transition id, used in the POST
+	Name   string // the transition's own name ("Start Progress")
+	ToName string // the status it moves the issue TO ("In Progress")
+}
+
+// fetchTransitions GETs the workflow transitions currently available
+// for an issue. The set is workflow-defined and depends on the issue's
+// current status.
+func (j *Jira) fetchTransitions(ctx context.Context, id string) ([]jiraTransition, error) {
 	u := j.BaseURL + "/rest/api/3/issue/" + url.PathEscape(id) + "/transitions"
 	body, err := j.do(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return fmt.Errorf("jira list transitions %s: %w", id, err)
+		return nil, fmt.Errorf("jira list transitions %s: %w", id, err)
 	}
 	var resp struct {
 		Transitions []struct {
@@ -246,52 +247,154 @@ func (j *Jira) Transition(ctx context.Context, id string, s Status) error {
 		} `json:"transitions"`
 	}
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return fmt.Errorf("jira transitions decode: %w", err)
+		return nil, fmt.Errorf("jira transitions decode: %w", err)
 	}
-	if len(resp.Transitions) == 0 {
+	out := make([]jiraTransition, 0, len(resp.Transitions))
+	for _, t := range resp.Transitions {
+		out = append(out, jiraTransition{ID: t.ID, Name: t.Name, ToName: t.To.Name})
+	}
+	return out, nil
+}
+
+// applyTransition POSTs the chosen transition id to move the issue.
+func (j *Jira) applyTransition(ctx context.Context, id, transitionID string) error {
+	u := j.BaseURL + "/rest/api/3/issue/" + url.PathEscape(id) + "/transitions"
+	buf, _ := json.Marshal(map[string]any{
+		"transition": map[string]any{"id": transitionID},
+	})
+	_, err := j.do(ctx, http.MethodPost, u, bytes.NewReader(buf))
+	return err
+}
+
+// Transition moves a ticket to a goon-canonical Status — used by the
+// daemon's workflow, which thinks in the five-value lifecycle. It picks
+// the transition whose target state (or own name) maps to s via
+// MapStatus. The chat agent uses the richer TransitionByName instead,
+// which matches the board's real status names.
+func (j *Jira) Transition(ctx context.Context, id string, s Status) error {
+	trs, err := j.fetchTransitions(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(trs) == 0 {
 		return fmt.Errorf("jira: no transitions available for %s", id)
 	}
-
-	// Best match: prefer a transition whose "to" state maps to the
-	// target Status; fall back to matching the transition's own name.
-	pickID := ""
-	pickName := ""
-	for _, t := range resp.Transitions {
-		if MapStatus(t.To.Name) == s {
-			pickID = t.ID
-			pickName = t.Name
+	pick, found := jiraTransition{}, false
+	for _, t := range trs {
+		if MapStatus(t.ToName) == s {
+			pick, found = t, true
 			break
 		}
 	}
-	if pickID == "" {
-		for _, t := range resp.Transitions {
+	if !found {
+		for _, t := range trs {
 			if MapStatus(t.Name) == s {
-				pickID = t.ID
-				pickName = t.Name
+				pick, found = t, true
 				break
 			}
 		}
 	}
-	if pickID == "" {
-		// Report what was available — the LLM (or user) can pick
-		// from the list on the next turn.
+	if !found {
 		var avail []string
-		for _, t := range resp.Transitions {
-			avail = append(avail, fmt.Sprintf("%q → %q", t.Name, t.To.Name))
+		for _, t := range trs {
+			avail = append(avail, fmt.Sprintf("%q → %q", t.Name, t.ToName))
 		}
 		return fmt.Errorf("jira: no transition on %s maps to status %q (available: %s)",
 			id, s, strings.Join(avail, ", "))
 	}
-
-	postURL := u
-	payload := map[string]any{
-		"transition": map[string]any{"id": pickID},
-	}
-	buf, _ := json.Marshal(payload)
-	if _, err := j.do(ctx, http.MethodPost, postURL, bytes.NewReader(buf)); err != nil {
-		return fmt.Errorf("jira transition %s via %q: %w", id, pickName, err)
+	if err := j.applyTransition(ctx, id, pick.ID); err != nil {
+		return fmt.Errorf("jira transition %s via %q: %w", id, pick.Name, err)
 	}
 	return nil
+}
+
+// ListTransitions implements TransitionResolver — the real status names
+// this issue can move to right now, exactly as Jira names them.
+func (j *Jira) ListTransitions(ctx context.Context, id string) ([]string, error) {
+	trs, err := j.fetchTransitions(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(trs))
+	for _, t := range trs {
+		out = append(out, t.ToName)
+	}
+	return out, nil
+}
+
+// TransitionByName implements TransitionResolver — moves the issue to
+// the status whose name best matches `name`, against the project's
+// actual workflow. No MapStatus bucketing, so "Ready to Test" resolves
+// to the real "Ready to Test" status instead of collapsing to "open".
+// Returns the real target status name that was applied.
+func (j *Jira) TransitionByName(ctx context.Context, id, name string) (string, error) {
+	trs, err := j.fetchTransitions(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	if len(trs) == 0 {
+		return "", fmt.Errorf("jira: %s has no available transitions (it may be in a terminal status)", id)
+	}
+	pick, ok := matchTransition(trs, name)
+	if !ok {
+		avail := make([]string, 0, len(trs))
+		for _, t := range trs {
+			avail = append(avail, t.ToName)
+		}
+		return "", fmt.Errorf("no status on %s matches %q — available statuses: %s",
+			id, name, strings.Join(avail, ", "))
+	}
+	if err := j.applyTransition(ctx, id, pick.ID); err != nil {
+		return "", fmt.Errorf("jira transition %s via %q: %w", id, pick.Name, err)
+	}
+	return pick.ToName, nil
+}
+
+// matchTransition picks the transition that best matches a user-typed
+// status name. Order: exact match on the target status name, exact on
+// the transition name, then containment either way — all after
+// normalising to lowercase alphanumerics, so "ready to test",
+// "Ready To Test" and "ready-to-test" are equivalent.
+func matchTransition(trs []jiraTransition, want string) (jiraTransition, bool) {
+	w := normStatus(want)
+	if w == "" {
+		return jiraTransition{}, false
+	}
+	for _, t := range trs {
+		if normStatus(t.ToName) == w {
+			return t, true
+		}
+	}
+	for _, t := range trs {
+		if normStatus(t.Name) == w {
+			return t, true
+		}
+	}
+	for _, t := range trs {
+		n := normStatus(t.ToName)
+		if n != "" && (strings.Contains(n, w) || strings.Contains(w, n)) {
+			return t, true
+		}
+	}
+	for _, t := range trs {
+		n := normStatus(t.Name)
+		if n != "" && (strings.Contains(n, w) || strings.Contains(w, n)) {
+			return t, true
+		}
+	}
+	return jiraTransition{}, false
+}
+
+// normStatus lowercases s and strips everything but [a-z0-9], so status
+// names compare without caring about spaces, case or punctuation.
+func normStatus(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // Update edits a ticket's mutable fields. Only fields whose pointer

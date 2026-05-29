@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/review"
@@ -161,7 +162,7 @@ func (b *Bot) autoNotifyPass(ctx context.Context, runner *review.Runner) {
 	}
 	text := "🔔 " + review.FormatNotifText(batch)
 	if len(text) > 3900 {
-		text = text[:3900] + "\n…(truncated)"
+		text = clampUTF8(text, 3900) + "\n…(truncated)"
 	}
 	chats := b.opts.Memory.AuthorizedChats()
 	if len(chats) == 0 {
@@ -197,7 +198,7 @@ func (b *Bot) sendReviewDraft(ctx context.Context, chatID int64, d review.Draft)
 	// limit) so the fence and the button stay attached to the text.
 	const bodyCap = 3400
 	if len(body) > bodyCap {
-		body = body[:bodyCap] + "\n…(truncated)"
+		body = clampUTF8(body, bodyCap) + "\n…(truncated)"
 	}
 	text := header + "\n\n" + reviewFence + "\n" + body + "\n" + reviewFence +
 		"\n\nTap ✅ to post this review as a comment on the PR."
@@ -288,6 +289,19 @@ func (b *Bot) callbackHandleReview(ctx context.Context, q *CallbackQuery) bool {
 			fmt.Sprintf("✓ review posted as a comment on %s#%d", repo, number))
 	}
 	return true
+}
+
+// clampUTF8 truncates s to at most max bytes without splitting a rune —
+// Telegram rejects messages that aren't valid UTF-8.
+func clampUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut]
 }
 
 // extractFenced returns the text between the two reviewFence lines.
