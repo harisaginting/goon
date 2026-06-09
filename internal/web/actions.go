@@ -25,6 +25,7 @@ import (
 	"github.com/harisaginting/goon/internal/repository"
 	"github.com/harisaginting/goon/internal/review"
 	"github.com/harisaginting/goon/internal/safety"
+	"github.com/harisaginting/goon/internal/usage"
 	"github.com/harisaginting/goon/internal/util"
 )
 
@@ -204,6 +205,21 @@ func (s *Server) handleTicketUnignore(w http.ResponseWriter, r *http.Request) {
 	fragOK(w, key+" claimed back — daemon will consider it on the next poll")
 }
 
+// handleTicketsClear wipes the cached ticket inventory so the table
+// reflects the user's current board filter on the next poll, instead of
+// showing stale rows from a previous, broader JQL. Workflows + questions
+// are untouched.
+func (s *Server) handleTicketsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	n := s.opts.Memory.ClearTickets()
+	w.Header().Set("HX-Trigger", "ticketsChanged")
+	s.events.Publish("ticketsChanged")
+	fragOK(w, fmt.Sprintf("cleared %d cached ticket%s — next poll repopulates from your current filter", n, pluralS(n)))
+}
+
 // handleTicketEdit updates one of title / description / labels.
 // Form: key, field, value.
 func (s *Server) handleTicketEdit(w http.ResponseWriter, r *http.Request) {
@@ -316,8 +332,8 @@ func (s *Server) handlePRList(w http.ResponseWriter, r *http.Request) {
 			<div class="mt-1 text-xs text-gray-500">Nothing to review right now in the repos goon is following.</div>
 		</div>`))
 		if !embedded {
-			w.Write([]byte(`<details class="mt-3 rounded-lg border border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40">
-				<summary class="px-4 py-2 cursor-pointer text-xs text-gray-600 dark:text-gray-400 hover:text-accent transition">
+			w.Write([]byte(`<details class="mt-3 rounded-lg border border-surface-border/60 bg-surface-raised/30 hover:border-accent/40">
+				<summary class="px-4 py-2 cursor-pointer text-xs text-gray-600 dark:text-gray-400 hover:text-accent transition rounded-lg bg-surface-raised/30 hover:bg-surface-raised border border-surface-border/60 hover:border-accent/40">
 					⚙ manage which repos goon follows
 				</summary>
 				<div class="px-4 pb-4 pt-2"
@@ -334,8 +350,8 @@ func (s *Server) handlePRList(w http.ResponseWriter, r *http.Request) {
 	// the global view); the per-repo detail panel gets a clean PR
 	// list without this tab-level control.
 	if !embedded {
-		fmt.Fprint(w, `<details class="mb-3 rounded-lg border border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40">
-			<summary class="px-4 py-2 cursor-pointer text-xs text-gray-600 dark:text-gray-400 hover:text-accent transition">
+		fmt.Fprint(w, `<details class="mb-3 rounded-lg border border-surface-border/60 bg-surface-raised/30 hover:border-accent/40">
+			<summary class="px-4 py-2 cursor-pointer text-xs text-gray-600 dark:text-gray-400 hover:text-accent transition rounded-lg bg-surface-raised/30 hover:bg-surface-raised border border-surface-border/60 hover:border-accent/40">
 				⚙ manage which repos goon follows
 			</summary>
 			<div class="px-4 pb-4 pt-2"
@@ -344,7 +360,7 @@ func (s *Server) handlePRList(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</details>`)
 	}
-	fmt.Fprintf(w, `<div class="space-y-2">`)
+	fmt.Fprintf(w, `<div class="space-y-2" id="pr-list-rows">`)
 	for _, pr := range prs {
 		actionID := fmt.Sprintf("pr-actions-%s-%d", strings.ReplaceAll(pr.Repo, "/", "-"), pr.Number)
 		title := pr.Title
@@ -355,79 +371,75 @@ func (s *Server) handlePRList(w http.ResponseWriter, r *http.Request) {
 		if author == "" {
 			author = "—"
 		}
-		fmt.Fprintf(w, `<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4">
+		// Branch badges: head → base
+		branchBadge := ""
+		if pr.Branch != "" || pr.Base != "" {
+			head := pr.Branch
+			if head == "" {
+				head = "?"
+			}
+			if pr.Base != "" {
+				branchBadge = fmt.Sprintf(
+					`<span class="inline-flex items-center gap-1 font-mono text-[10px] text-muted/80">`+
+						`<span class="text-accent/80">%s</span>`+
+						`<span class="text-muted/50">→</span>`+
+						`<span class="text-emerald-500/80">%s</span>`+
+						`</span>`,
+					html.EscapeString(head), html.EscapeString(pr.Base))
+			} else {
+				branchBadge = fmt.Sprintf(
+					`<span class="font-mono text-[10px] text-muted/60">%s</span>`,
+					html.EscapeString(head))
+			}
+		}
+		baseBranch := pr.Base
+		fmt.Fprintf(w, `<div class="rounded-xl border border-surface-border bg-surface-raised p-4" data-base="%s" data-author="%s">
 			<div class="flex items-start justify-between gap-3 mb-2">
 				<div class="min-w-0 flex-1">
-					<a href="%s" target="_blank" rel="noopener" class="font-mono text-xs text-accent hover:underline">%s #%d</a>
-					<div class="mt-0.5 text-sm text-gray-800 dark:text-gray-200 truncate" title="%s">%s</div>
-					<div class="mt-1 text-[11px] text-gray-500">by @%s</div>
+					<div class="flex items-center gap-2 flex-wrap mb-0.5">
+						<a href="%s" target="_blank" rel="noopener" class="font-mono text-xs text-accent hover:underline">%s #%d</a>
+						%s
+					</div>
+					<div class="text-sm text-gray-200 truncate" title="%s">%s</div>
+					<div class="mt-1 text-[11px] text-muted">by @%s</div>
 				</div>
-			</div>
-			<!-- Top row: ONE-CLICK approve + TWO TOGGLES that disclose
-			     comment/request-changes forms below. The chevron flips
-			     when open so the user can tell at a glance whether
-			     they're looking at a closed toggle or an open form. -->
-			<div class="flex flex-wrap gap-2">
-				<button type="button" onclick="goonPRRowToggle(this,'%s')"
-					class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2 py-1 hover:border-accent hover:text-accent transition inline-flex items-center gap-1"
-					data-disclose="closed">
-					<span data-disclose-icon>▸</span> write comment
-				</button>
-				<form hx-post="/api/pr/approve" hx-target="#%s-result" hx-swap="innerHTML" class="m-0 inline-flex">
-					<input type="hidden" name="repo" value="%s">
-					<input type="hidden" name="number" value="%d">
-					<button type="submit" class="text-xs rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-700 dark:text-emerald-400 px-2 py-1 font-medium hover:bg-emerald-500/25 transition">✓ approve</button>
-				</form>
-				<button type="button" onclick="goonPRRowToggle(this,'%s-rc')"
-					class="text-xs rounded-md border border-rose-500/40 text-rose-700 dark:text-rose-400 px-2 py-1 hover:bg-rose-500/10 transition inline-flex items-center gap-1"
-					data-disclose="closed">
-					<span data-disclose-icon>▸</span> block (request changes)
-				</button>
-				<span class="text-xs text-gray-400 ml-auto self-center" id="%s-result"></span>
-			</div>
-			<form hx-post="/api/pr/comment" hx-target="#%s-result" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful){this.reset();document.getElementById('%s').classList.add('hidden');}"
-				class="mt-2 hidden" id="%s">
-				<input type="hidden" name="repo" value="%s">
-				<input type="hidden" name="number" value="%d">
-				<textarea name="body" id="%s-body" rows="3" required placeholder="leave a comment, or click ✨ Draft with AI to have goon read the diff and write one for you…"
-					class="w-full font-mono text-xs rounded-md border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-2 py-1 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none"></textarea>
-				<div class="flex items-center gap-2 mt-1">
-					<button type="button"
-						hx-get="/api/pr/draft-review?repo=%s&number=%d"
-						hx-target="#%s-body"
-						hx-swap="innerHTML"
-						hx-indicator="#%s-spin"
-						class="inline-flex items-center gap-1 text-xs rounded-md border border-accent/40 text-accent px-2.5 py-1 hover:bg-accent/10 transition">✨ Draft with AI</button>
-					<span id="%s-spin" class="htmx-indicator text-xs text-gray-500">drafting…</span>
-					<div class="flex-1"></div>
-					<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1 font-semibold hover:brightness-110 transition">send →</button>
-				</div>
-			</form>
-			<form hx-post="/api/pr/request-changes" hx-target="#%s-result" hx-swap="innerHTML" hx-on::after-request="if(event.detail.successful){this.reset();document.getElementById('%s-rc').classList.add('hidden');}"
-				class="mt-2 hidden" id="%s-rc">
-				<input type="hidden" name="repo" value="%s">
-				<input type="hidden" name="number" value="%d">
-				<textarea name="body" rows="2" required placeholder="why changes are needed…"
-					class="w-full font-mono text-xs rounded-md border border-rose-300 dark:border-rose-700 bg-white dark:bg-surface px-2 py-1 focus:border-rose-500 focus:ring-1 focus:ring-rose-500/30 focus:outline-none"></textarea>
-				<div class="flex justify-end mt-1"><button type="submit" class="text-xs rounded-md bg-rose-500 text-white px-3 py-1 font-semibold hover:bg-rose-600 transition">send →</button></div>
-			</form>
-		</div>`,
+			</div>`,
+			html.EscapeString(baseBranch),
+			html.EscapeString(strings.ToLower(author)),
 			html.EscapeString(pr.URL),
 			html.EscapeString(pr.Repo), pr.Number,
+			branchBadge,
 			html.EscapeString(title), html.EscapeString(title),
 			html.EscapeString(author),
-			actionID,
-			actionID,
+		)
+		// Action buttons. "write comment" and "request changes" open the
+		// shared modal editor (defined once in index.html via goonPRModal)
+		// so the writing surface is roomy. Approve stays an inline form —
+		// it needs no body. jsStr-escaped args keep slugs with quotes safe.
+		repoJS := jsStr(pr.Repo)
+		titleJS := jsStr(title)
+		fmt.Fprintf(w,
+			`<div class="flex flex-wrap gap-2">
+				<button type="button" onclick="goonPRModal('comment',%s,%d,%s)"
+					class="text-xs rounded-md border border-surface-border px-2 py-1 hover:border-accent hover:text-accent transition inline-flex items-center gap-1">
+					✎ write comment
+				</button>
+				<form hx-post="/api/pr/approve" hx-target="this" hx-swap="outerHTML" hx-disabled-elt="find button" class="m-0 inline-flex">
+					<input type="hidden" name="repo" value="%s">
+					<input type="hidden" name="number" value="%d">
+					<button type="submit" class="text-xs rounded-md bg-emerald-500/15 border border-emerald-500/40 text-emerald-700 dark:text-emerald-400 px-2 py-1 font-medium hover:bg-emerald-500/25 transition disabled:opacity-50 disabled:cursor-wait">✓ approve</button>
+				</form>
+				<button type="button" onclick="goonPRModal('request-changes',%s,%d,%s)"
+					class="text-xs rounded-md border border-rose-500/40 text-rose-700 dark:text-rose-400 px-2 py-1 hover:bg-rose-500/10 transition inline-flex items-center gap-1">
+					✗ request changes
+				</button>
+				<span class="text-xs text-muted ml-auto self-center" id="%s-result"></span>
+			</div>
+			</div>`,
+			repoJS, pr.Number, titleJS,
 			html.EscapeString(pr.Repo), pr.Number,
+			repoJS, pr.Number, titleJS,
 			actionID,
-			actionID,
-			actionID, actionID, actionID,
-			html.EscapeString(pr.Repo), pr.Number,
-			actionID,
-			html.EscapeString(pr.Repo), pr.Number,
-			actionID, actionID, actionID,
-			actionID, actionID, actionID,
-			html.EscapeString(pr.Repo), pr.Number,
 		)
 	}
 	fmt.Fprint(w, `</div>`)
@@ -487,6 +499,9 @@ func (s *Server) handlePRDraftReview(w http.ResponseWriter, r *http.Request) {
 	// the chat pr_review budget so users have a consistent ceiling.
 	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
 	defer cancel()
+	// Label the model call so it shows up meaningfully on the dashboard's
+	// live-sessions card.
+	ctx = usage.WithLabel(ctx, fmt.Sprintf("PR review draft · %s#%d", repo, num))
 	pr, diff, err := rev.GetPRDetails(ctx, repo, num)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -563,9 +578,12 @@ func (s *Server) prAction(w http.ResponseWriter, r *http.Request, label string,
 		fragErr(w, label+" failed: "+err.Error())
 		return
 	}
-	w.Header().Set("HX-Trigger", "prsChanged")
-	s.events.Publish("prsChanged")
-	fragOK(w, label+" recorded")
+	// Deliberately do NOT fire prsChanged here — that reloaded the whole
+	// PR list on every click (jarring "page reload", and it reset the
+	// approve button so it looked un-clicked). The caller's form swaps
+	// itself to a "done" state instead; the list refreshes on the next
+	// natural poll / manual reload.
+	fragOK(w, "✓ "+label+" submitted")
 }
 
 // --- Repositories tab (repo-centric view) --------------------------------
@@ -676,7 +694,7 @@ func (s *Server) handleRepositoryList(w http.ResponseWriter, r *http.Request) {
 	if len(rows) == 0 {
 		// Genuine empty state — no REPOSITORY.md and no host PRs.
 		w.Write([]byte(`<div class="rounded-xl border border-dashed border-accent/30 bg-surface-raised/40 p-8 text-center">
-			<div class="text-sm font-semibold text-white">No repositories yet</div>
+			<div class="text-sm font-semibold text-ink">No repositories yet</div>
 			<div class="mt-1 text-xs text-muted max-w-md mx-auto">
 				Add one via <code class="font-mono text-accent">goon repo add &lt;remote&gt; &lt;local&gt;</code> or set <code class="font-mono text-accent">GOON_GIT_HOST</code> on the Setup tab so goon can list your repos.
 			</div>
@@ -690,8 +708,8 @@ func (s *Server) handleRepositoryList(w http.ResponseWriter, r *http.Request) {
 	// — same reason the search bar lives above the rows, not inside
 	// one of them. Collapsed by default so the row list dominates.
 	if hostHasPRReviewer {
-		fmt.Fprint(w, `<details class="mb-3 rounded-lg border border-surface-border bg-surface-raised/40">
-			<summary class="px-4 py-2 cursor-pointer text-xs text-muted hover:text-accent transition flex items-center gap-2">
+		fmt.Fprint(w, `<details class="mb-3 rounded-lg border border-surface-border/60 bg-surface-raised/30 hover:border-accent/40">
+			<summary class="px-4 py-2 cursor-pointer text-xs text-muted hover:text-accent transition flex items-center gap-2 rounded-lg bg-surface-raised/30 hover:bg-surface-raised border border-surface-border/60 hover:border-accent/40">
 				<span>⚙</span>
 				<span>manage which repos goon follows</span>
 				<span class="text-[10px] text-muted/70">(global · sets GOON_REVIEW_REPOS)</span>
@@ -715,13 +733,46 @@ func (s *Server) handleRepositoryList(w http.ResponseWriter, r *http.Request) {
 			totalCloned++
 		}
 	}
-	fmt.Fprintf(w, `<div class="flex flex-wrap items-center gap-3 mb-4 text-xs text-muted">
-		<span><span class="text-white font-semibold">%d</span> tracked</span>
-		<span>·</span>
-		<span><span class="text-accent font-semibold">%d</span> open PR%s</span>
-		<span>·</span>
-		<span><span class="text-emerald-400 font-semibold">%d</span> cloned locally</span>
+	fmt.Fprintf(w, `<div class="flex flex-wrap items-center gap-2 mb-4">
+		<span class="inline-flex items-center gap-1.5 rounded-full bg-surface-raised border border-surface-border px-2.5 py-1 text-xs">
+			<span class="text-ink font-semibold">%d</span>
+			<span class="text-muted">tracked</span>
+		</span>
+		<span class="inline-flex items-center gap-1.5 rounded-full bg-surface-raised border border-surface-border px-2.5 py-1 text-xs">
+			<span class="text-accent font-semibold">%d</span>
+			<span class="text-muted">open PR%s</span>
+		</span>
+		<span class="inline-flex items-center gap-1.5 rounded-full bg-surface-raised border border-surface-border px-2.5 py-1 text-xs">
+			<span class="text-emerald-700 dark:text-emerald-400 font-semibold">%d</span>
+			<span class="text-muted">cloned locally</span>
+		</span>
 	</div>`, totalTracked, totalPRs, pluralS(totalPRs), totalCloned)
+
+	// Remembered project→repo rules (from the confirm_repo "remember for
+	// this project" opt-in). Surface them so a wrong rule that silently
+	// auto-routes a project's tickets is visible and undoable.
+	if rules := s.opts.Memory.RepoChoices(); len(rules) > 0 {
+		keys := make([]string, 0, len(rules))
+		for k := range rules {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Fprint(w, `<details class="mb-3 rounded-lg border border-accent/30 bg-accent/5">
+			<summary class="px-4 py-2 cursor-pointer text-xs text-muted hover:text-accent transition">⚙ remembered project → repo rules (auto-confirm)</summary>
+			<div class="px-4 pb-3 pt-1 space-y-1.5">`)
+		for _, k := range keys {
+			fmt.Fprintf(w, `<div class="flex items-center gap-2 text-xs">
+				<span class="font-mono text-muted/80 w-20 shrink-0 truncate">%s</span>
+				<span class="text-muted">→</span>
+				<span class="font-mono text-ink flex-1 truncate">%s</span>
+				<form hx-post="/api/repo/forget-rule" hx-target="this" hx-swap="outerHTML" class="m-0">
+					<input type="hidden" name="project" value="%s">
+					<button type="submit" class="text-[11px] rounded-md border border-surface-border px-2 py-0.5 text-muted hover:border-rose-400 hover:text-rose-400 transition">forget</button>
+				</form>
+			</div>`, html.EscapeString(k), html.EscapeString(rules[k]), html.EscapeString(k))
+		}
+		fmt.Fprint(w, `</div></details>`)
+	}
 
 	// Typeahead filter — same pattern as the question-card picker.
 	if len(rows) > 8 {
@@ -735,7 +786,10 @@ func (s *Server) handleRepositoryList(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		// Divider between Tracked and Detected sections.
 		if prevTracked && !row.Tracked {
-			fmt.Fprint(w, `<div class="pt-3 pb-1 text-[11px] uppercase tracking-wider text-muted/70">Detected · not tracked in REPOSITORY.md</div>`)
+			fmt.Fprint(w, `<div class="pt-4 pb-1 flex items-center gap-2">
+				<span class="text-[11px] uppercase tracking-wider text-muted/60 font-semibold">Your Repo</span>
+				<span class="text-[10px] text-muted/40">— detected on your git host but not yet in your tracked list</span>
+			</div>`)
 			prevTracked = false
 		}
 		renderRepoRow(w, row, hostHasPRReviewer)
@@ -781,7 +835,7 @@ func renderRepoRow(w http.ResponseWriter, row repoSummary, hostHasPRReviewer boo
 	localBadge := ""
 	switch {
 	case !row.Tracked:
-		localBadge = `<span class="text-[11px] text-muted/70">untracked</span>`
+		localBadge = `<span class="inline-flex items-center rounded-full bg-gray-500/10 border border-gray-500/30 text-muted px-2 py-0.5 text-[11px]">untracked</span>`
 	case row.Local == "":
 		localBadge = `<span class="inline-flex items-center gap-1 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/40 px-2 py-0.5 text-[11px]">⚠ no local path</span>`
 	case row.Cloned:
@@ -800,7 +854,7 @@ func renderRepoRow(w http.ResponseWriter, row repoSummary, hostHasPRReviewer boo
 			<svg class="h-4 w-4 mt-0.5 text-muted group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
 			<div class="min-w-0 flex-1">
 				<div class="flex items-center gap-2 flex-wrap">
-					<span class="font-mono text-sm text-white group-open:text-accent group-open:font-semibold">%s</span>
+					<span class="font-mono text-sm text-ink group-open:text-accent group-open:font-semibold">%s</span>
 					%s
 					%s
 				</div>
@@ -832,6 +886,10 @@ func (s *Server) handleRepoDetail(w http.ResponseWriter, r *http.Request) {
 		fragErr(w, "slug required")
 		return
 	}
+	// did is the selector-safe form of the slug. Slugs are "owner/repo";
+	// the raw "/" makes invalid CSS ids/selectors, which silently broke
+	// the map/clone result swaps and the branch filter.
+	did := domID(slug)
 
 	// Re-read REPOSITORY.md every time (cheap; ensures we reflect
 	// edits made elsewhere — CLI, file editor, etc.)
@@ -868,17 +926,22 @@ func (s *Server) handleRepoDetail(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `<div class="rounded-lg border border-surface-border bg-surface p-3">
 		<div class="text-[11px] uppercase tracking-wider text-muted mb-2">Local workspace mapping</div>
 		<form hx-post="/api/repo/map" hx-target="#repo-detail-result-%s" hx-swap="innerHTML"
+			hx-indicator="#repo-map-spin-%s"
+			hx-disabled-elt="find button"
 			class="flex flex-col sm:flex-row gap-2 items-stretch">
 			<input type="hidden" name="remote" value="%s">
 			<input type="text" name="local" value="%s" placeholder="/absolute/path/to/local/checkout"
-				class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-white px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
-			<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">save mapping</button>
+				class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+			<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition disabled:opacity-50 disabled:cursor-wait">save mapping</button>
+			<span id="repo-map-spin-%s" class="htmx-indicator self-center text-[11px] text-muted">saving…</span>
 		</form>
 		<div class="mt-1 text-[11px] text-muted">Saves to REPOSITORY.md so goon knows which folder to operate in. Tilde and <code>$HOME</code> are expanded.</div>
 	</div>`,
-		html.EscapeString(slug),
+		did,
+		did,
 		html.EscapeString(slug),
 		html.EscapeString(defaultLocal),
+		did,
 	)
 
 	// --- Clone button (only when not cloned) --------------------------------
@@ -900,25 +963,30 @@ func (s *Server) handleRepoDetail(w http.ResponseWriter, r *http.Request) {
 				class="space-y-2">
 				<input type="hidden" name="remote" value="%s">
 				<div class="flex flex-col sm:flex-row gap-2">
-					<input type="text" name="url" value="%s" placeholder="https://… or git@…"
-						class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-white px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+					<div class="flex flex-1 items-center gap-1">
+						<input type="text" name="url" value="%s" placeholder="https://… or git@…"
+							class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+						<button type="button" onclick="navigator.clipboard.writeText(this.previousElementSibling.value)"
+							class="shrink-0 text-xs rounded-md border border-surface-border px-2 py-1.5 hover:border-accent hover:text-accent transition"
+							title="Copy URL">⎘</button>
+					</div>
 					<input type="text" name="target" value="%s" placeholder="local target dir"
-						class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-white px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
+						class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">
 				</div>
 				<div class="flex items-center gap-2">
-					<button type="submit" class="rounded-md bg-amber-500 text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">git clone</button>
+					<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">git clone</button>
 					<span id="repo-clone-spin-%s" class="htmx-indicator text-[11px] text-muted">cloning…</span>
 					<span class="flex-1"></span>
 					<span class="text-[11px] text-muted">Uses your existing SSH / HTTPS auth. goon won't ask for credentials.</span>
 				</div>
 			</form>
 		</div>`,
-			html.EscapeString(slug),
-			html.EscapeString(slug),
+			did,
+			did,
 			html.EscapeString(slug),
 			html.EscapeString(cloneURL),
 			html.EscapeString(defaultLocal),
-			html.EscapeString(slug),
+			did,
 		)
 	}
 
@@ -928,17 +996,48 @@ func (s *Server) handleRepoDetail(w http.ResponseWriter, r *http.Request) {
 	// in-sync between the legacy flat view and this new per-repo view.
 	if s.opts.Host != nil {
 		if _, ok := s.opts.Host.(githost.PRReviewer); ok {
-			fmt.Fprintf(w, `<div class="rounded-lg border border-surface-border bg-surface p-3">
-				<div class="text-[11px] uppercase tracking-wider text-muted mb-2">Open pull requests</div>
-				<div hx-get="/fragments/prs?repo=%s" hx-trigger="load, prsChanged from:body" hx-swap="innerHTML">
+			fmt.Fprintf(w, `<div class="rounded-lg border border-surface-border bg-surface p-3 space-y-2">
+				<div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+					<div class="text-[11px] uppercase tracking-wider text-muted">Open pull requests</div>
+					<div class="flex items-center gap-2">
+						<input type="text" id="pr-branch-filter-%s" placeholder="target branch…" autocomplete="off"
+							oninput="goonPRFilter('%s')"
+							class="w-32 rounded-md border border-surface-border bg-surface px-2 py-1 text-xs focus:border-accent focus:outline-none">
+						<input type="text" id="pr-author-filter-%s" placeholder="author…" autocomplete="off"
+							oninput="goonPRFilter('%s')"
+							class="w-28 rounded-md border border-surface-border bg-surface px-2 py-1 text-xs focus:border-accent focus:outline-none">
+					</div>
+				</div>
+				<div id="pr-rows-%s" hx-get="/fragments/prs?repo=%s" hx-trigger="load, prsChanged from:body" hx-swap="innerHTML">
 					<div class="text-xs text-muted">Loading PRs…</div>
 				</div>
-			</div>`, html.EscapeString(slug))
+			</div>
+			<script>
+				window.goonPRFilter = window.goonPRFilter || function(did){
+					var bEl = document.getElementById('pr-branch-filter-'+did);
+					var aEl = document.getElementById('pr-author-filter-'+did);
+					var b = (bEl && bEl.value || '').toLowerCase().trim();
+					var a = (aEl && aEl.value || '').toLowerCase().trim();
+					var rows = document.querySelectorAll('#pr-rows-'+did+' [data-base]');
+					rows.forEach(function(el){
+						var base = (el.dataset.base||'').toLowerCase();
+						var auth = (el.dataset.author||'').toLowerCase();
+						var ok = (!b || base.indexOf(b)>=0) && (!a || auth.indexOf(a)>=0);
+						el.style.display = ok ? '' : 'none';
+					});
+				};
+			</script>`,
+				did,
+				did,
+				did,
+				did,
+				did,
+				html.EscapeString(slug))
 		}
 	}
 
 	// Result slot for map / clone POST responses.
-	fmt.Fprintf(w, `<div id="repo-detail-result-%s" class="text-xs"></div>`, html.EscapeString(slug))
+	fmt.Fprintf(w, `<div id="repo-detail-result-%s" class="text-xs mt-1"></div>`, did)
 	fmt.Fprint(w, `</div>`)
 }
 
@@ -991,8 +1090,9 @@ func (s *Server) handleRepoMap(w http.ResponseWriter, r *http.Request) {
 		fragErr(w, "save failed: "+err.Error())
 		return
 	}
-	w.Header().Set("HX-Trigger", "repositoriesChanged")
-	s.events.Publish("repositoriesChanged")
+	// No repositoriesChanged fire — that reloaded the whole repo list and
+	// collapsed the panel the user was working in. The inline result below
+	// confirms success; the row reflects it on the next natural refresh.
 	if local == "" {
 		fragOK(w, "mapping cleared for "+remote)
 	} else {
@@ -1068,9 +1168,9 @@ func (s *Server) handleRepoClone(w http.ResponseWriter, r *http.Request) {
 	if remote != "" {
 		_, _ = repository.Add(repository.Entry{Remote: remote, Local: target})
 	}
-	w.Header().Set("HX-Trigger", "repositoriesChanged")
-	s.events.Publish("repositoriesChanged")
-	fragOK(w, "cloned to "+target)
+	// No global reload (it collapsed the open panel). The result confirms
+	// success; the "✓ cloned" badge updates on the next natural refresh.
+	fragOK(w, "✓ cloned to "+target)
 }
 
 // shellQuote single-quotes a shell argument so spaces / metacharacters
@@ -1078,6 +1178,85 @@ func (s *Server) handleRepoClone(w http.ResponseWriter, r *http.Request) {
 // the POSIX way ('"'"').
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
+}
+
+// handleWorkflowDiff shows what goon changed in a workflow's local repo —
+// the trust surface for reviewing before a PR is approved. Read-only git
+// (log + working-tree diff + last-commit patch) via the safety validator;
+// degrades gracefully when there's no local checkout or no changes yet.
+func (s *Server) handleWorkflowDiff(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	info := func(msg string) {
+		fmt.Fprintf(w, `<div class="rounded-md border border-surface-border bg-surface px-3 py-2 text-xs text-muted">%s</div>`, html.EscapeString(msg))
+	}
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	if id == "" {
+		info("workflow id required")
+		return
+	}
+	wf, ok := s.opts.Memory.GetWorkflow(id)
+	if !ok {
+		info("workflow not found")
+		return
+	}
+	repo := strings.TrimSpace(wf.Repo)
+	if repo == "" {
+		info("No repo selected yet — pick a repo first; the diff appears after goon makes changes.")
+		return
+	}
+	if strings.HasPrefix(repo, "~") {
+		if home, err := os.UserHomeDir(); err == nil {
+			repo = filepath.Join(home, strings.TrimPrefix(repo, "~"))
+		}
+	}
+	if st, err := os.Stat(filepath.Join(repo, ".git")); err != nil || !st.IsDir() {
+		info("No local checkout yet — goon clones the repo when the plan is approved. The diff shows once it has made changes.")
+		return
+	}
+	// Read-only git: recent commits, working-tree diff, and the latest
+	// commit's patch. No base-branch guessing (robust across repos).
+	q := shellQuote(repo)
+	cmdStr := fmt.Sprintf(
+		"git -C %s --no-pager log --oneline -n 12 2>/dev/null; echo '___GOON_SECTION___'; "+
+			"git -C %s --no-pager diff 2>/dev/null; echo '___GOON_SECTION___'; "+
+			"git -C %s --no-pager show --stat --patch HEAD 2>/dev/null",
+		q, q, q)
+	if err := safety.Default().Validate(cmdStr); err != nil {
+		info("cannot run git here: " + err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	out, _ := safety.ShellCommand(ctx, cmdStr).CombinedOutput()
+	parts := strings.SplitN(string(out), "___GOON_SECTION___", 3)
+	section := func(title, body string) {
+		body = strings.TrimSpace(body)
+		if body == "" {
+			return
+		}
+		if len(body) > 16000 {
+			body = body[:16000] + "\n… (truncated — view the full diff in the PR)"
+		}
+		fmt.Fprintf(w, `<div class="mb-2"><div class="text-[11px] uppercase tracking-wider text-muted mb-1">%s</div>`+
+			`<pre class="overflow-x-auto rounded-md border border-surface-border bg-surface p-2 text-[11px] leading-relaxed font-mono whitespace-pre">%s</pre></div>`,
+			html.EscapeString(title), html.EscapeString(body))
+	}
+	any := false
+	if len(parts) > 0 && strings.TrimSpace(parts[0]) != "" {
+		section("recent commits", parts[0])
+		any = true
+	}
+	if len(parts) > 1 && strings.TrimSpace(parts[1]) != "" {
+		section("uncommitted changes", parts[1])
+		any = true
+	}
+	if len(parts) > 2 && strings.TrimSpace(parts[2]) != "" {
+		section("latest commit", parts[2])
+		any = true
+	}
+	if !any {
+		info("No changes recorded in this checkout yet.")
+	}
 }
 
 // --- Repo picker (review-list management) ---------------------------------
@@ -1118,11 +1297,15 @@ func (s *Server) handleReposPicker(w http.ResponseWriter, r *http.Request) {
 			current[githost.NormalizeRepoSlug(slug)] = true
 		}
 	}
-	fmt.Fprintf(w, `<form hx-post="/api/repos/save" hx-target="#repos-save-result" hx-swap="innerHTML" class="space-y-3">
-		<div class="text-xs text-gray-500">
-			%d repo(s) visible to your token. Tick the ones goon should follow — the daemon will list PRs across these in <code class="font-mono">/prs</code> and the dashboard's Pull-requests section. Leave all unchecked to fall back to the auto-discovery default.
+	fmt.Fprintf(w, `<form hx-post="/api/repos/save" hx-target="#repos-save-result" hx-swap="innerHTML" class="space-y-2">
+		<div class="text-xs text-muted">
+			%d repo(s) visible. Check the ones goon should follow for PRs. Leave all unchecked to use auto-discovery.
 		</div>
-		<div class="rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised divide-y divide-gray-100 dark:divide-surface-border/60 max-h-[420px] overflow-y-auto scrollbar-thin">`, len(repos))
+		<input type="text" placeholder="Search repos…" autocomplete="off"
+			oninput="(function(q){document.querySelectorAll('.rp-row').forEach(function(l){l.style.display=l.dataset.slug.indexOf(q.toLowerCase())>=0?'':'none'});})(this.value)"
+			class="w-full rounded-md border border-surface-border bg-surface px-3 py-1.5 text-sm focus:border-accent focus:outline-none">
+		<div class="rounded-lg border border-surface-border bg-surface-raised divide-y divide-surface-border/60 max-h-[380px] overflow-y-auto">`,
+		len(repos))
 	for _, repo := range repos {
 		checked := ""
 		if current[repo.Slug] {
@@ -1130,29 +1313,30 @@ func (s *Server) handleReposPicker(w http.ResponseWriter, r *http.Request) {
 		}
 		priv := ""
 		if repo.Private {
-			priv = ` <span class="text-[10px] uppercase tracking-wider text-gray-400">private</span>`
+			priv = ` <span class="text-[10px] text-muted/60">private</span>`
 		}
 		desc := ""
 		if d := strings.TrimSpace(repo.Description); d != "" {
-			desc = fmt.Sprintf(`<div class="text-[11px] text-gray-500 truncate" title="%s">%s</div>`,
-				html.EscapeString(d), html.EscapeString(util.Truncate(d, 140)))
+			desc = fmt.Sprintf(`<div class="text-[11px] text-muted truncate" title="%s">%s</div>`,
+				html.EscapeString(d), html.EscapeString(util.Truncate(d, 100)))
 		}
-		fmt.Fprintf(w, `<label class="flex items-center gap-3 px-4 py-2.5 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 cursor-pointer transition">
+		fmt.Fprintf(w, `<label class="rp-row flex items-center gap-3 px-4 py-2.5 hover:bg-surface-sunken/40 cursor-pointer transition" data-slug="%s">
 			<input type="checkbox" name="slugs" value="%s"%s class="h-4 w-4 accent-accent shrink-0">
 			<div class="min-w-0 flex-1">
 				<div class="font-mono text-sm flex items-center gap-2">%s%s</div>
 				%s
 			</div>
-		</label>`, html.EscapeString(repo.Slug), checked,
+		</label>`, html.EscapeString(strings.ToLower(repo.Slug)),
+			html.EscapeString(repo.Slug), checked,
 			html.EscapeString(repo.Slug), priv, desc)
 	}
 	fmt.Fprint(w, `</div>
 		<div class="flex items-center gap-2 flex-wrap">
-			<button type="button" onclick="this.closest('form').querySelectorAll('input[name=slugs]').forEach(x=>x.checked=true)" class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1 hover:border-accent hover:text-accent transition">select all</button>
-			<button type="button" onclick="this.closest('form').querySelectorAll('input[name=slugs]').forEach(x=>x.checked=false)" class="text-xs rounded-md border border-gray-300 dark:border-surface-border px-2.5 py-1 hover:border-accent hover:text-accent transition">clear</button>
+			<button type="button" onclick="this.closest('form').querySelectorAll('input[name=slugs]').forEach(x=>x.checked=true)" class="text-xs rounded-md border border-surface-border px-2.5 py-1 hover:border-accent hover:text-accent transition">select all</button>
+			<button type="button" onclick="this.closest('form').querySelectorAll('input[name=slugs]').forEach(x=>x.checked=false)" class="text-xs rounded-md border border-surface-border px-2.5 py-1 hover:border-accent hover:text-accent transition">clear</button>
 			<div class="flex-1"></div>
 			<div id="repos-save-result" class="text-xs"></div>
-			<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1.5 font-semibold hover:brightness-110 transition">save selection</button>
+			<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1.5 font-semibold hover:brightness-110 transition">save</button>
 		</div>
 	</form>`)
 }
@@ -1267,6 +1451,37 @@ func (s *Server) handlePlanSave(w http.ResponseWriter, r *http.Request) {
 	s.events.Publish("workflowsChanged")
 	s.events.Publish("workflowDetailRefresh")
 	fragOK(w, fmt.Sprintf("plan updated (%d step%s) — daemon resuming", len(steps), pluralS(len(steps))))
+}
+
+// domID sanitizes an arbitrary string (e.g. an "owner/repo" slug) into
+// something safe to use as an HTML id AND as a CSS/querySelector target.
+// The original code interpolated slugs containing "/" straight into both
+// id="…" and hx-target="#…", producing invalid selectors like
+// `#repo-detail-result-owner/repo` — htmx silently dropped the swap, so
+// "save mapping" appeared to do nothing. Replacing every non-alphanumeric
+// rune with "-" keeps ids stable and selectors valid.
+func domID(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteByte('-')
+		}
+	}
+	return b.String()
+}
+
+// jsStr renders a Go string as a single-quoted JS string literal that is
+// also safe to embed inside a double-quoted HTML on* attribute. We first
+// JS-escape (backslash, quote, newlines) then HTML-escape the whole
+// literal so the browser decodes the attribute back into valid JS.
+func jsStr(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `'`, `\'`)
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	return html.EscapeString("'" + s + "'")
 }
 
 // pluralS returns "s" unless n == 1. Local helper so we don't depend

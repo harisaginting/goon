@@ -131,6 +131,13 @@ func runStart(ctx context.Context, args []string, stdout, stderr io.Writer, stdi
 			strings.TrimPrefix(*webAddr, ":"))
 	}
 
+	// GOON_DAEMON_AUTO_START=false starts the daemon paused so the operator
+	// can review config from the web UI before any polling begins.
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_DAEMON_AUTO_START"))); v == "false" || v == "0" {
+		mem.SetPaused(true)
+		fmt.Fprintln(stdout, "→ daemon started paused (GOON_DAEMON_AUTO_START=false) — use the web UI or `goon resume` to start polling")
+	}
+
 	// Now announce the active workflow. Doing this AFTER the web URL
 	// keeps the most-actionable line at the top of stdout so a user
 	// running `goon start --web=:8080` doesn't have to scroll past

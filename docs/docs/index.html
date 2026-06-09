@@ -354,7 +354,6 @@ goon config path         # print the config file path</code></pre>
     <tr><td><code>GOON_AUTO_APPROVE</code></td><td><code>1</code> to skip the approval gates (fully unattended)</td></tr>
     <tr><td><code>GOON_POLL_SECONDS</code></td><td>poll interval, default <code>300</code> (5 min)</td></tr>
     <tr><td><code>GOON_VERIFY_RUNS</code></td><td>extra verify passes before PR, default <code>3</code></td></tr>
-    <tr><td><code>GOON_REPO_MAP</code></td><td>map board project to local clone, e.g. <code>ENG=/repos/eng,*=/repos/default</code></td></tr>
   </table>
 
   <h3>Atlassian (Jira board + Confluence tool)</h3>
@@ -715,7 +714,7 @@ goon uninstall --yes --purge   # also removes the binary</code></pre>
   <p>Yes — use Ollama for local models, or the <code>mock</code> provider for offline testing. Both are zero-cost.</p>
 
   <h4>How does goon decide which repo to work on?</h4>
-  <p>By <code>GOON_REPO_MAP</code> (mapping board project keys to local paths) or by the ticket's project field. The <code>confirm_repo</code> gate gives you a chance to override before any code is written.</p>
+  <p>Per ticket: goon's triage step reads <code>REPOSITORY.md</code> (your remote→local repo map) and proposes the right repo(s), defaulting to the ticket's project field. The <code>confirm_repo</code> gate lets you override before any code is written.</p>
 
   <h4>What does goon write to memory.json that I should know about?</h4>
   <p>Tickets seen, workflow records (state + plan + approvals + PR URL), the question queue, daemon status snapshot, and authorized Telegram chat IDs. No source code, no secrets — secrets stay in <code>.env</code>, never in <code>memory.json</code>.</p>

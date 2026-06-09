@@ -12,6 +12,7 @@ type Mock struct {
 	Replies  []string // pop from front each call
 	Calls    int
 	LastMsgs []Message
+	AllMsgs  [][]Message // one entry per Generate call, in order
 }
 
 // NewMock creates a Mock pre-loaded with replies.
@@ -28,6 +29,7 @@ func (m *Mock) Generate(_ context.Context, messages []Message, _ Options) (strin
 	defer m.mu.Unlock()
 	m.Calls++
 	m.LastMsgs = append([]Message(nil), messages...)
+	m.AllMsgs = append(m.AllMsgs, append([]Message(nil), messages...))
 	if len(m.Replies) == 0 {
 		return "", errors.New("mock: no replies queued")
 	}

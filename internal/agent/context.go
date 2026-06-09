@@ -16,11 +16,18 @@ type ShellContext struct {
 }
 
 // Snapshot captures the current shell context. It NEVER returns an error —
-// missing data is logged into the snapshot itself for transparency.
-func Snapshot(lastOutput string, frequent []string) ShellContext {
-	cwd, err := os.Getwd()
-	if err != nil {
-		cwd = "(unavailable: " + err.Error() + ")"
+// missing data is logged into the snapshot itself for transparency. When
+// workDir is non-empty it overrides the process cwd, so the snapshot the
+// LLM sees matches the directory where its commands actually run (the
+// selected repo).
+func Snapshot(workDir, lastOutput string, frequent []string) ShellContext {
+	cwd := strings.TrimSpace(workDir)
+	if cwd == "" {
+		var err error
+		cwd, err = os.Getwd()
+		if err != nil {
+			cwd = "(unavailable: " + err.Error() + ")"
+		}
 	}
 	files := listFilesLimited(cwd, 20)
 	return ShellContext{

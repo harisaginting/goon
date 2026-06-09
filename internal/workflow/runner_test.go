@@ -88,9 +88,11 @@ func TestStageRunner_LLMThenAgent(t *testing.T) {
 	if first["title"] != "add OAuth handler" {
 		t.Errorf("first step title = %v", first["title"])
 	}
-	// agent stage stored nil
-	if v, hit := state.Stages["execute"]; !hit || v != nil {
-		t.Errorf("execute stage state = %v / hit=%v", v, hit)
+	// agent stage stores the rendered task string
+	if v, hit := state.Stages["execute"]; !hit {
+		t.Errorf("execute stage not found in state")
+	} else if _, ok := v.(string); !ok {
+		t.Errorf("execute stage state = %T (want string)", v)
 	}
 
 	// Verify the agent task was rendered with the prior stage output.
@@ -171,9 +173,9 @@ func TestStageRunner_OnErrorContinue(t *testing.T) {
 // TestValidateStages catches schema problems before any LLM call.
 func TestValidateStages(t *testing.T) {
 	cases := map[string][]StageConfig{
-		"missing name":     {{Type: StageTypeLLM, Prompt: "p"}},
-		"duplicate name":   {{Name: "x", Type: StageTypeLLM, Prompt: "p"}, {Name: "x", Type: StageTypeAgent, Task: "t"}},
-		"unknown type":     {{Name: "x", Type: "wat"}},
+		"missing name":       {{Type: StageTypeLLM, Prompt: "p"}},
+		"duplicate name":     {{Name: "x", Type: StageTypeLLM, Prompt: "p"}, {Name: "x", Type: StageTypeAgent, Task: "t"}},
+		"unknown type":       {{Name: "x", Type: "wat"}},
 		"llm without prompt": {{Name: "x", Type: StageTypeLLM}},
 		"agent without task": {{Name: "x", Type: StageTypeAgent}},
 	}

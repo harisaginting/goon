@@ -31,8 +31,8 @@ func TestDiscoverWorkspaceRepos(t *testing.T) {
 
 	r1 := mustRepo("alpha-app")
 	r2 := mustRepo("beta-svc")
-	mustDir("not-a-repo")     // no .git → ignored
-	mustDir(".hidden")        // hidden → ignored
+	mustDir("not-a-repo") // no .git → ignored
+	mustDir(".hidden")    // hidden → ignored
 	if err := os.WriteFile(filepath.Join(dir, "stray.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	} // not a dir → ignored
@@ -152,12 +152,12 @@ func TestPickWorkspaceReposMulti(t *testing.T) {
 		{"1,3", []string{"/a", "/c"}, true},
 		{"1 3", []string{"/a", "/c"}, true},
 		{"1+2+3", []string{"/a", "/b", "/c"}, true},
-		{"4,1", []string{"/d", "/a"}, true},     // order preserved
-		{"1,1,2", []string{"/a", "/b"}, true},    // dedup
-		{"0", nil, false},                        // out of range
-		{"1,5", nil, false},                      // one out of range fails the whole answer
-		{"yes", nil, false},                      // non-numeric
-		{"1,abc", nil, false},                    // mixed
+		{"4,1", []string{"/d", "/a"}, true},   // order preserved
+		{"1,1,2", []string{"/a", "/b"}, true}, // dedup
+		{"0", nil, false},                     // out of range
+		{"1,5", nil, false},                   // one out of range fails the whole answer
+		{"yes", nil, false},                   // non-numeric
+		{"1,abc", nil, false},                 // mixed
 		{"", nil, false},
 	}
 	for _, c := range cases {

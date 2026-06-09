@@ -36,7 +36,41 @@ type TriageResult struct {
 // Backwards-compat: a reply with only `steps` + `repo` still works
 // and is treated as needs_repo=true (the historical default before
 // this classification existed).
+// looksLikeProviderError returns a short reason when raw is clearly a
+// provider/transport error body rather than a model reply (it contains no
+// JSON object and matches a known error shape, or is empty). Returns ""
+// when raw might be a real reply (has a "{") so the JSON parser runs.
+func looksLikeProviderError(raw string) string {
+	t := strings.TrimSpace(raw)
+	if t == "" {
+		return "empty response"
+	}
+	if strings.Contains(t, "{") {
+		return "" // looks like it has JSON — let the parser try
+	}
+	s := strings.ToLower(t)
+	switch {
+	case strings.Contains(s, "authenticate"), strings.Contains(s, "unauthorized"),
+		strings.Contains(s, "api key"), strings.Contains(s, "invalid_api_key"),
+		strings.Contains(s, "forbidden"):
+		return "authentication failed"
+	case strings.Contains(s, "rate limit"), strings.Contains(s, "quota"),
+		strings.Contains(s, "too many requests"):
+		return "rate limited / quota exceeded"
+	}
+	if len(t) > 80 {
+		t = t[:80] + "…"
+	}
+	return "non-JSON response: " + t
+}
+
 func parseTriage(raw string) (TriageResult, error) {
+	// Catch the common case where the "LLM response" is actually a
+	// provider error body (auth failure, rate limit, HTML error page).
+	// Without this it fell through to a confusing "steps array is empty".
+	if msg := looksLikeProviderError(raw); msg != "" {
+		return TriageResult{}, fmt.Errorf("LLM returned no plan — %s (check your provider / API key / proxy)", msg)
+	}
 	chunk, err := extractJSONObject(raw)
 	if err != nil {
 		return TriageResult{}, err

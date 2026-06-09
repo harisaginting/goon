@@ -1,1 +1,12 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-label="goon"><path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" aria-label="goon">
+  <!-- smile -->
+  <path d="M3.5 11.5 C3.5 20 20.5 20 20.5 11.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  <!-- left eye -->
+  <circle cx="7.5" cy="9" r="2.4" fill="currentColor"/>
+  <circle cx="7.5" cy="9" r="1.1" fill="white"/>
+  <circle cx="7.85" cy="9" r="0.48" fill="currentColor"/>
+  <!-- right eye -->
+  <circle cx="16.5" cy="9" r="2.4" fill="currentColor"/>
+  <circle cx="16.5" cy="9" r="1.1" fill="white"/>
+  <circle cx="16.15" cy="9" r="0.48" fill="currentColor"/>
+</svg>

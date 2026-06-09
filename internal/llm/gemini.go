@@ -11,9 +11,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/usage"
 )
 
 // GeminiConfig configures the Google Gemini provider against the
@@ -44,7 +44,7 @@ type Gemini struct {
 func NewGemini(cfg GeminiConfig) *Gemini {
 	hc := cfg.HTTP
 	if hc == nil {
-		hc = logx.InstrumentClient("gemini", &http.Client{Timeout: 60 * time.Second})
+		hc = logx.InstrumentClient("gemini", &http.Client{Timeout: httpTimeout()})
 	}
 	return &Gemini{cfg: cfg, http: hc}
 }
@@ -143,10 +143,18 @@ type geminiResponse struct {
 		Message string `json:"message"`
 		Status  string `json:"status"`
 	} `json:"error,omitempty"`
+	// UsageMetadata carries token counts for the request + response.
+	UsageMetadata *struct {
+		PromptTokenCount     int `json:"promptTokenCount"`
+		CandidatesTokenCount int `json:"candidatesTokenCount"`
+		TotalTokenCount      int `json:"totalTokenCount"`
+	} `json:"usageMetadata,omitempty"`
 }
 
 // Generate sends one non-streaming request to generateContent.
 func (g *Gemini) Generate(ctx context.Context, messages []Message, opts Options) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), g.cfg.Model)
+	defer usage.EndActivity(actID)
 	body, err := g.buildRequest(messages, opts)
 	if err != nil {
 		return "", err
@@ -181,6 +189,9 @@ func (g *Gemini) Generate(ctx context.Context, messages []Message, opts Options)
 	}
 	if out.Error != nil {
 		return "", fmt.Errorf("gemini error %s: %s", out.Error.Status, out.Error.Message)
+	}
+	if out.UsageMetadata != nil {
+		usage.Global().Record(g.cfg.Model, out.UsageMetadata.PromptTokenCount, out.UsageMetadata.CandidatesTokenCount)
 	}
 	text := geminiCollectText(out)
 	// Surface common "empty response with a reason" failures as
@@ -237,6 +248,8 @@ func (g *Gemini) Generate(ctx context.Context, messages []Message, opts Options)
 // Like the Anthropic adapter we do NOT wrap streaming in doWithRetry —
 // replaying a partial stream would double-emit chunks.
 func (g *Gemini) Stream(ctx context.Context, messages []Message, opts Options, onChunk func(string)) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), g.cfg.Model)
+	defer usage.EndActivity(actID)
 	body, err := g.buildRequest(messages, opts)
 	if err != nil {
 		return "", err
@@ -264,7 +277,11 @@ func (g *Gemini) Stream(ctx context.Context, messages []Message, opts Options, o
 		raw, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("gemini stream http %d: %s", resp.StatusCode, string(raw))
 	}
-	return parseGeminiSSE(resp.Body, onChunk)
+	text, promptTok, compTok, perr := parseGeminiSSE(resp.Body, onChunk)
+	if promptTok > 0 || compTok > 0 {
+		usage.Global().Record(g.cfg.Model, promptTok, compTok)
+	}
+	return text, perr
 }
 
 // endpoint builds the request URL for the configured model and method.
@@ -396,11 +413,11 @@ func geminiCollectText(out geminiResponse) string {
 //
 // Split out so it's unit-testable against an io.Reader without a live
 // HTTP server.
-func parseGeminiSSE(r io.Reader, onChunk func(string)) (string, error) {
+func parseGeminiSSE(r io.Reader, onChunk func(string)) (text string, promptTokens, completionTokens int, err error) {
 	br := bufio.NewReader(r)
 	var full strings.Builder
 	for {
-		line, err := br.ReadString('\n')
+		line, rerr := br.ReadString('\n')
 		if len(line) > 0 {
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
@@ -418,7 +435,13 @@ func parseGeminiSSE(r io.Reader, onChunk func(string)) (string, error) {
 				continue
 			}
 			if evt.Error != nil {
-				return full.String(), fmt.Errorf("gemini stream error %s: %s", evt.Error.Status, evt.Error.Message)
+				return full.String(), promptTokens, completionTokens, fmt.Errorf("gemini stream error %s: %s", evt.Error.Status, evt.Error.Message)
+			}
+			// usageMetadata appears on chunks (cumulative); the final chunk
+			// carries the totals.
+			if evt.UsageMetadata != nil {
+				promptTokens = evt.UsageMetadata.PromptTokenCount
+				completionTokens = evt.UsageMetadata.CandidatesTokenCount
 			}
 			chunk := geminiCollectText(evt)
 			if chunk != "" {
@@ -428,11 +451,11 @@ func parseGeminiSSE(r io.Reader, onChunk func(string)) (string, error) {
 				}
 			}
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return full.String(), nil
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return full.String(), promptTokens, completionTokens, nil
 			}
-			return full.String(), err
+			return full.String(), promptTokens, completionTokens, rerr
 		}
 	}
 }

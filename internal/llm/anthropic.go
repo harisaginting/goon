@@ -10,9 +10,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/usage"
 )
 
 // AnthropicConfig configures the Anthropic Messages API client.
@@ -33,7 +33,7 @@ type Anthropic struct {
 func NewAnthropic(cfg AnthropicConfig) *Anthropic {
 	hc := cfg.HTTP
 	if hc == nil {
-		hc = logx.InstrumentClient("anthropic", &http.Client{Timeout: 30 * time.Second})
+		hc = logx.InstrumentClient("anthropic", &http.Client{Timeout: httpTimeout()})
 	}
 	return &Anthropic{cfg: cfg, http: hc}
 }
@@ -59,6 +59,10 @@ type anthropicMessageResponse struct {
 		Type string `json:"type"`
 		Text string `json:"text"`
 	} `json:"content"`
+	Usage struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Type    string `json:"type"`
 		Message string `json:"message"`
@@ -67,6 +71,8 @@ type anthropicMessageResponse struct {
 
 // Generate calls /messages with retry and timeout.
 func (a *Anthropic) Generate(ctx context.Context, messages []Message, opts Options) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), a.cfg.Model)
+	defer usage.EndActivity(actID)
 	system, msgs := splitSystem(messages)
 	body := anthropicMessageRequest{
 		Model:       a.cfg.Model,
@@ -115,6 +121,7 @@ func (a *Anthropic) Generate(ctx context.Context, messages []Message, opts Optio
 			b.WriteString(c.Text)
 		}
 	}
+	usage.Global().Record(a.cfg.Model, out.Usage.InputTokens, out.Usage.OutputTokens)
 	return b.String(), nil
 }
 
@@ -138,6 +145,8 @@ func (a *Anthropic) Generate(ctx context.Context, messages []Message, opts Optio
 // partially-emitted stream would double-emit chunks to onChunk. Generate
 // has retry; if you need resilience, prefer it.
 func (a *Anthropic) Stream(ctx context.Context, messages []Message, opts Options, onChunk func(string)) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), a.cfg.Model)
+	defer usage.EndActivity(actID)
 	system, msgs := splitSystem(messages)
 	body := struct {
 		Model       string             `json:"model"`
@@ -175,17 +184,25 @@ func (a *Anthropic) Stream(ctx context.Context, messages []Message, opts Options
 		raw, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("anthropic stream http %d: %s", resp.StatusCode, string(raw))
 	}
-	return parseAnthropicSSE(resp.Body, onChunk)
+	text, inTok, outTok, perr := parseAnthropicSSE(resp.Body, onChunk)
+	// Record whatever token counts the stream reported, even on a partial
+	// error — usage seen so far is still real spend.
+	if inTok > 0 || outTok > 0 {
+		usage.Global().Record(a.cfg.Model, inTok, outTok)
+	}
+	return text, perr
 }
 
 // parseAnthropicSSE consumes lines from an Anthropic stream body and
-// extracts content_block_delta text. Split out so it's unit-testable
-// without a live HTTP server (any io.Reader works).
-func parseAnthropicSSE(r io.Reader, onChunk func(string)) (string, error) {
+// extracts content_block_delta text. It also returns the input/output token
+// counts the stream reports (message_start carries input_tokens; the final
+// message_delta carries the cumulative output_tokens). Split out so it's
+// unit-testable without a live HTTP server (any io.Reader works).
+func parseAnthropicSSE(r io.Reader, onChunk func(string)) (text string, inputTokens, outputTokens int, err error) {
 	br := bufio.NewReader(r)
 	var full strings.Builder
 	for {
-		line, err := br.ReadString('\n')
+		line, rerr := br.ReadString('\n')
 		if len(line) > 0 {
 			line = strings.TrimRight(line, "\r\n")
 			if line == "" {
@@ -204,6 +221,15 @@ func parseAnthropicSSE(r io.Reader, onChunk func(string)) (string, error) {
 					Type string `json:"type"`
 					Text string `json:"text"`
 				} `json:"delta"`
+				Message struct {
+					Usage struct {
+						InputTokens  int `json:"input_tokens"`
+						OutputTokens int `json:"output_tokens"`
+					} `json:"usage"`
+				} `json:"message"`
+				Usage struct {
+					OutputTokens int `json:"output_tokens"`
+				} `json:"usage"`
 				Error *struct {
 					Type    string `json:"type"`
 					Message string `json:"message"`
@@ -213,7 +239,18 @@ func parseAnthropicSSE(r io.Reader, onChunk func(string)) (string, error) {
 				continue // tolerate garbage events
 			}
 			if evt.Error != nil {
-				return full.String(), fmt.Errorf("anthropic stream error: %s", evt.Error.Message)
+				return full.String(), inputTokens, outputTokens, fmt.Errorf("anthropic stream error: %s", evt.Error.Message)
+			}
+			// message_start carries the prompt token count (and an initial
+			// output_tokens); message_delta updates the cumulative output.
+			if evt.Message.Usage.InputTokens > 0 {
+				inputTokens = evt.Message.Usage.InputTokens
+			}
+			if evt.Message.Usage.OutputTokens > 0 {
+				outputTokens = evt.Message.Usage.OutputTokens
+			}
+			if evt.Usage.OutputTokens > 0 {
+				outputTokens = evt.Usage.OutputTokens
 			}
 			if evt.Type == "content_block_delta" && evt.Delta.Type == "text_delta" && evt.Delta.Text != "" {
 				full.WriteString(evt.Delta.Text)
@@ -222,11 +259,11 @@ func parseAnthropicSSE(r io.Reader, onChunk func(string)) (string, error) {
 				}
 			}
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return full.String(), nil
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return full.String(), inputTokens, outputTokens, nil
 			}
-			return full.String(), err
+			return full.String(), inputTokens, outputTokens, rerr
 		}
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"syscall"
 
 	"github.com/harisaginting/goon/internal/agent"
+	"github.com/harisaginting/goon/internal/envstore"
 	"github.com/harisaginting/goon/internal/executor"
 	"github.com/harisaginting/goon/internal/learnings"
 	"github.com/harisaginting/goon/internal/llm"
@@ -39,12 +40,11 @@ func Execute() error {
 }
 
 func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
-	// Load .env from multiple candidate locations, first match wins per key.
-	// CWD takes precedence so a project-local .env can override globals.
-	loadDotEnv(".env")
-	if home, err := os.UserHomeDir(); err == nil {
-		loadDotEnv(home + "/.config/goon/.env")
-		loadDotEnv(home + "/.goon/.env")
+	// Load config.json into the process environment. Keys already set in the
+	// environment (e.g. by a test harness or CI override) are never clobbered.
+	// Empty-string values in config.json are skipped (treated as unset).
+	if err := envstore.LoadIntoEnv(); err != nil {
+		fmt.Fprintf(stderr, "warning: %v — fix config.json or run `goon config set KEY VALUE`\n", err)
 	}
 
 	// Initialize the structured logger as early as possible so even early
@@ -130,6 +130,8 @@ func run(argv []string, stdout, stderr io.Writer, stdin io.Reader) error {
 			return runPause(ctx, sargs, stdout, stderr)
 		case "resume":
 			return runResume(ctx, sargs, stdout, stderr)
+		case "google":
+			return runGoogle(ctx, sargs, stdout, stderr)
 		case "help":
 			printUsage(stdout)
 			return nil
@@ -295,14 +297,14 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  goon review-prs [--watch] [--telegram] [--all]      draft AI reviews for PRs awaiting you")
 	fmt.Fprintln(w, "  goon notifications [--watch] [--telegram] [--all]   forward git review-requests + mentions")
 	fmt.Fprintln(w, "  goon logs [--tail=N|--follow|--clear|--path]        browse the structured log file")
-	fmt.Fprintln(w, "  goon config <show|get|set|unset|path|edit>          ~/.config/goon/.env")
+	fmt.Fprintln(w, "  goon config <show|get|set|unset|path|edit>          ./config.json")
 	fmt.Fprintln(w, "  goon update [<ref>]                                 rebuild from upstream (needs git + go)")
 	fmt.Fprintln(w, "  goon uninstall [--yes] [--purge]                    remove the binary (+ optional state)")
 	fmt.Fprintln(w, "  goon help | --help | -h                             show this help")
 	fmt.Fprintln(w, "  goon version | --version | -v                       show version + build info")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "Quick start:")
-	fmt.Fprintln(w, "  cp .env.example .env && edit it, then `goon doctor` to verify, then `goon start --web=:8080`")
+	fmt.Fprintln(w, "  goon start --web=:8080   # open http://localhost:8080 → Settings to configure, then goon doctor to verify")
 	fmt.Fprintln(w, "  Full docs at http://localhost:8080/docs once the daemon is running")
 }
 
@@ -330,7 +332,7 @@ func splitSubcommand(argv []string) (string, []string) {
 		return "", nil
 	}
 	switch first {
-	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory", "repo", "pause", "resume", "review-prs", "notifications":
+	case "update", "uninstall", "config", "start", "stop", "status", "train", "doctor", "workflow", "logs", "memory", "repo", "pause", "resume", "review-prs", "notifications", "google":
 		return first, argv[1:]
 	}
 	return "", nil
@@ -373,83 +375,6 @@ func splitFlagsAndPositional(argv []string) (flags, positional []string) {
 // All current flags are bool, so this returns false. Kept for future use.
 func isKnownNonBoolFlag(string) bool { return false }
 
-// loadDotEnv loads "KEY=VALUE" pairs from path into os.Environ if not already set.
-// It is intentionally tiny — no quoting, no export. Comments start with '#'.
-func loadDotEnv(path string) {
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 1024)
-	for {
-		n, err := f.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-		}
-		if err != nil {
-			break
-		}
-	}
-	for _, line := range strings.Split(string(buf), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		k := strings.TrimSpace(line[:eq])
-		v := strings.TrimSpace(line[eq+1:])
-		v = stripInlineComment(v)
-		v = strings.Trim(v, `"'`)
-		if _, exists := os.LookupEnv(k); !exists {
-			_ = os.Setenv(k, v)
-		}
-	}
-}
-
-// stripInlineComment removes a trailing "# comment" from a value
-// unless the # is inside quotes. Without this, a user copying
-//
-//	BITBUCKET_API_URL=                # default https://api.bitbucket.org/2.0
-//
-// verbatim from .env.example ended up with the API URL literally
-// being "# default https://api.bitbucket.org/2.0", which then
-// produced HTTP 400s with cryptic "unsupported protocol scheme ''"
-// errors deep in the host adapter.
-//
-// Rules:
-//   - leading and trailing whitespace already trimmed by the caller
-//   - a quoted value (starts with ' or ") is returned untouched —
-//     we let the caller strip the quotes
-//   - otherwise: the first '#' that is preceded by whitespace OR is
-//     at position 0 marks the start of a comment; everything from
-//     there to the end is dropped, and the surviving prefix is
-//     re-trimmed
-func stripInlineComment(v string) string {
-	if v == "" {
-		return v
-	}
-	// Quoted values: keep as-is.
-	if v[0] == '"' || v[0] == '\'' {
-		return v
-	}
-	// Walk forward looking for a comment marker.
-	for i := 0; i < len(v); i++ {
-		if v[i] != '#' {
-			continue
-		}
-		// Position 0 OR preceded by whitespace counts as a comment.
-		if i == 0 || v[i-1] == ' ' || v[i-1] == '\t' {
-			return strings.TrimRight(v[:i], " \t")
-		}
-	}
-	return v
-}
-
 // onboardingError wraps an llm.NewFromEnv failure with a copy-pasteable
 // hint for new users. Hits on the most common first-run failure: no API
 // key set anywhere.
@@ -458,16 +383,17 @@ func onboardingError(cause error) error {
 	hint := ""
 	switch {
 	case strings.Contains(msg, "OPENAI_API_KEY"):
-		hint = "\n\nFirst run? Pick one:\n" +
-			"  1. Use OpenAI:    export OPENAI_API_KEY=sk-... (or `goon config set OPENAI_API_KEY sk-...`)\n" +
-			"  2. Use Anthropic: export GOON_LLM_PROVIDER=anthropic ANTHROPIC_API_KEY=sk-...\n" +
-			"  3. Use a local model via Ollama: export GOON_LLM_PROVIDER=ollama (then `ollama serve`)\n" +
-			"  4. Just try it offline: export GOON_LLM_PROVIDER=mock GOON_MOCK_REPLIES='{\"tool\":\"finish\",\"args\":{\"message\":\"hi\"}}'\n" +
-			"\nFull config reference: copy .env.example to ~/.config/goon/.env and edit. Run `goon doctor` to verify."
+		hint = "\n\nFirst run? Configure via the web UI:\n" +
+			"  goon start --web=:8080   # open http://localhost:8080 → Settings\n" +
+			"\nOr set directly:\n" +
+			"  goon config set GOON_LLM_PROVIDER openai\n" +
+			"  goon config set OPENAI_API_KEY sk-...\n" +
+			"\nRun `goon doctor` to verify. Config is stored in ./config.json"
 	case strings.Contains(msg, "ANTHROPIC_API_KEY"):
-		hint = "\n\nSet it with: `export ANTHROPIC_API_KEY=sk-...` or `goon config set ANTHROPIC_API_KEY sk-...`"
+		hint = "\n\nSet it with: `goon config set ANTHROPIC_API_KEY sk-...`"
 	case strings.Contains(msg, "unknown GOON_LLM_PROVIDER"):
-		hint = "\n\nValid values: openai, anthropic, ollama, mock"
+		hint = "\n\nValid values: openai, anthropic, ollama, mock\n" +
+			"Set with: `goon config set GOON_LLM_PROVIDER <value>`"
 	}
 	return fmt.Errorf("%w%s", cause, hint)
 }

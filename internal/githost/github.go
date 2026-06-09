@@ -204,7 +204,7 @@ func (g *GitHub) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 				Number: it.Number,
 				URL:    it.HTMLURL,
 				Title:  it.Title,
-				Branch: it.Head.Ref,
+				Branch: it.Head.Ref, Base: it.Base.Ref,
 				Author: it.User.Login,
 				State:  it.State,
 				Body:   it.Body,
@@ -382,7 +382,7 @@ func (g *GitHub) GetPRDetails(ctx context.Context, repo string, number int) (PR,
 	}
 	pr := PR{
 		Number: meta.Number, URL: meta.HTMLURL, Title: meta.Title,
-		Branch: meta.Head.Ref, Author: meta.User.Login, State: meta.State,
+		Branch: meta.Head.Ref, Base: meta.Base.Ref, Author: meta.User.Login, State: meta.State,
 		Body: meta.Body, Repo: repo,
 		Reviewers: g.collectReviewers(ctx, repo, number, meta.RequestedReviewers),
 	}
@@ -462,6 +462,9 @@ type ghPRListItem struct {
 	Head    struct {
 		Ref string `json:"ref"`
 	} `json:"head"`
+	Base struct {
+		Ref string `json:"ref"`
+	} `json:"base"`
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`

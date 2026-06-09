@@ -7,8 +7,25 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// httpTimeout is the per-request HTTP timeout shared by every LLM adapter.
+// Large coding prompts on slow models/proxies routinely take longer than
+// 30s to even return response headers (the cause of "context deadline
+// exceeded while awaiting headers"), so the default is generous. Override
+// with GOON_LLM_HTTP_TIMEOUT_SEC (seconds, 1–600).
+func httpTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("GOON_LLM_HTTP_TIMEOUT_SEC")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 600 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 120 * time.Second
+}
 
 // retryDefaults centralises the exponential-backoff parameters every LLM
 // adapter uses. Keep them in one place so we can tune resilience uniformly.

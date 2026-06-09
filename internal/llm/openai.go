@@ -10,9 +10,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/usage"
 )
 
 // OpenAIConfig configures the OpenAI Chat Completions client.
@@ -33,7 +33,7 @@ type OpenAI struct {
 func NewOpenAI(cfg OpenAIConfig) *OpenAI {
 	hc := cfg.HTTP
 	if hc == nil {
-		hc = logx.InstrumentClient("openai", &http.Client{Timeout: 30 * time.Second})
+		hc = logx.InstrumentClient("openai", &http.Client{Timeout: httpTimeout()})
 	}
 	return &OpenAI{cfg: cfg, http: hc}
 }
@@ -47,13 +47,24 @@ type openAIChatRequest struct {
 	Temperature float64         `json:"temperature,omitempty"`
 	MaxTokens   int             `json:"max_tokens,omitempty"`
 	Stream      bool            `json:"stream,omitempty"`
+	StreamOpts  *streamOptions  `json:"stream_options,omitempty"`
 	ResponseFmt *map[string]any `json:"response_format,omitempty"`
+}
+
+// streamOptions asks the API to emit a final usage chunk on streamed
+// responses (otherwise streaming returns no token counts).
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openAIChatResponse struct {
 	Choices []struct {
 		Message Message `json:"message"`
 	} `json:"choices"`
+	Usage struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
@@ -66,6 +77,10 @@ type openAIStreamChunk struct {
 			Content string `json:"content"`
 		} `json:"delta"`
 	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
@@ -73,6 +88,8 @@ type openAIStreamChunk struct {
 
 // Generate calls /chat/completions with retry and timeout.
 func (o *OpenAI) Generate(ctx context.Context, messages []Message, opts Options) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), o.cfg.Model)
+	defer usage.EndActivity(actID)
 	body := openAIChatRequest{
 		Model:       o.cfg.Model,
 		Messages:    messages,
@@ -121,18 +138,22 @@ func (o *OpenAI) Generate(ctx context.Context, messages []Message, opts Options)
 	if len(cr.Choices) == 0 {
 		return "", errors.New("openai: no choices in response")
 	}
+	usage.Global().Record(o.cfg.Model, cr.Usage.PromptTokens, cr.Usage.CompletionTokens)
 	return cr.Choices[0].Message.Content, nil
 }
 
 // Stream calls /chat/completions with stream=true and writes incremental
 // content to onChunk. The full assembled string is also returned.
 func (o *OpenAI) Stream(ctx context.Context, messages []Message, opts Options, onChunk func(string)) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), o.cfg.Model)
+	defer usage.EndActivity(actID)
 	body := openAIChatRequest{
 		Model:       o.cfg.Model,
 		Messages:    messages,
 		Temperature: opts.Temperature,
 		MaxTokens:   opts.MaxTokens,
 		Stream:      true,
+		StreamOpts:  &streamOptions{IncludeUsage: true},
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -175,6 +196,11 @@ func (o *OpenAI) Stream(ctx context.Context, messages []Message, opts Options, o
 		}
 		if ch.Error != nil {
 			return assembled.String(), fmt.Errorf("openai stream: %s", ch.Error.Message)
+		}
+		// The final chunk (with stream_options.include_usage) carries token
+		// counts and an empty choices array.
+		if ch.Usage != nil {
+			usage.Global().Record(o.cfg.Model, ch.Usage.PromptTokens, ch.Usage.CompletionTokens)
 		}
 		for _, c := range ch.Choices {
 			if c.Delta.Content == "" {

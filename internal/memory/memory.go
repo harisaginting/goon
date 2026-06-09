@@ -9,10 +9,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/harisaginting/goon/internal/notes"
 	"github.com/harisaginting/goon/internal/storage"
 )
 
@@ -26,17 +28,37 @@ type Interaction struct {
 	Output   string    `json:"output,omitempty"`
 }
 
-// Question is something the agent decided it cannot proceed without and is
-// asking the user to answer via `goon train`.
+// Question kinds. Kind distinguishes a workflow approval gate (blocks a
+// ticket; surfaced in the Workflows tab) from a self-learning question goon
+// raised while reflecting on standby (surfaced in the Questions tab). An
+// empty Kind is treated as a gate for backwards-compat with older
+// memory.json files written before this field existed.
+const (
+	QuestionKindGate     = "gate"
+	QuestionKindLearning = "learning"
+)
+
+// Question is something goon is asking the user to answer via `goon train`,
+// the web UI, or Telegram. Two flavours, distinguished by Kind:
+//   - gate     — a workflow can't proceed without an answer (confirm_repo,
+//     approve_plan, or an agent that called ask_user mid-ticket).
+//   - learning — goon's daily standby reflection wants to understand
+//     something about the project/itself; answers are saved to LEARNED.md.
 type Question struct {
 	ID         string    `json:"id"` // stable id (e.g. "q-1730000000-1")
 	When       time.Time `json:"when"`
+	Kind       string    `json:"kind,omitempty"` // "gate" (default) | "learning"
 	TicketID   string    `json:"ticket_id,omitempty"`
 	WorkflowID string    `json:"workflow_id,omitempty"`
 	Question   string    `json:"question"`
 	Answer     string    `json:"answer,omitempty"`
 	AnsweredAt time.Time `json:"answered_at,omitempty"`
 }
+
+// IsLearning reports whether this is a self-learning question (Kind explicitly
+// "learning"). Everything else — including the empty/legacy Kind — counts as
+// a workflow gate.
+func (q Question) IsLearning() bool { return q.Kind == QuestionKindLearning }
 
 // Pending reports whether the question is still awaiting an answer.
 func (q Question) Pending() bool { return q.Answer == "" }
@@ -193,6 +215,22 @@ type DaemonStatus struct {
 	HostName       string    `json:"host_name,omitempty"`
 	PID            int       `json:"pid,omitempty"`
 	WebAddr        string    `json:"web_addr,omitempty"`
+	// LastError records the most recent poll-level failure (provider or
+	// board unreachable / misconfigured) so the UI can show one clear
+	// banner instead of leaving the user to guess why nothing moves.
+	// Cleared on the next successful poll.
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitempty"`
+	// Circuit-breaker state. ConsecutiveFails counts back-to-back
+	// infrastructural poll failures; NextRetryAt is the backoff window's
+	// end; ErrorClass is the last failure's class (network/auth/
+	// rate_limit/model/config/other); AutoPaused is set when the daemon
+	// paused *itself* (vs a user pause) so the UI can say so and a manual
+	// resume can clear the breaker.
+	ConsecutiveFails int       `json:"consecutive_fails,omitempty"`
+	NextRetryAt      time.Time `json:"next_retry_at,omitempty"`
+	ErrorClass       string    `json:"error_class,omitempty"`
+	AutoPaused       bool      `json:"auto_paused,omitempty"`
 }
 
 // Memory is the persistent store on disk + a slice of recent in-memory items.
@@ -213,14 +251,17 @@ type storeFile struct {
 	NextQID      int64                     `json:"next_qid,omitempty"`
 	TelegramAuth []ChatAuth                `json:"telegram_auth,omitempty"`
 
-	// RepoChoices remembers the resolved repo path per project key
-	// (Jira project, GitHub "owner/repo"). Populated when the
-	// confirm_repo gate succeeds — the next ticket from the same
-	// project skips the gate's "where do I work?" branch and uses
-	// the learned path. Env GOON_REPO_MAP exact matches still win
-	// over learned values; learned wins over the "*" wildcard
-	// fallback so a single explicit confirmation overrides a vague
-	// default.
+	// LastReflectAt is when the daemon last ran its standby self-learning
+	// reflection. Used to throttle reflection to roughly once per
+	// ReflectInterval (default daily) while idle. Persisted so a restart
+	// doesn't trigger an immediate extra reflection.
+	LastReflectAt time.Time `json:"last_reflect_at,omitempty"`
+
+	// RepoChoices is a legacy per-project repo cache kept only for
+	// backwards-compat with old memory.json files. It is no longer
+	// consulted for repo selection — that's driven per-ticket by triage +
+	// REPOSITORY.md + the confirm_repo gate. Safe to ignore; retained so
+	// unmarshalling an existing memory.json doesn't drop the field.
 	RepoChoices map[string]string `json:"repo_choices,omitempty"`
 
 	// ReviewSeen / NotifSeen back the PR-review and notification dedup
@@ -239,6 +280,27 @@ type storeFile struct {
 	// "ignored at" — useful for showing the user when they last
 	// opted out + for any future "auto-unclaim after N days" policy.
 	Ignored map[string]time.Time `json:"ignored,omitempty"`
+
+	// LocalTickets are user-created tickets stored entirely in memory.json
+	// (source="goon"). They participate in the daemon poll loop alongside
+	// Jira/GitHub tickets but never require an external connection. The
+	// NextLocalID counter monotonically increments so IDs are stable.
+	LocalTickets []LocalTicket `json:"local_tickets,omitempty"`
+	NextLocalID  int           `json:"next_local_id,omitempty"`
+}
+
+// LocalTicket is a user-created ticket stored locally in memory.json.
+// Fields mirror boards.Ticket so it can be fed to the workflow engine
+// as source="goon" without any external board connection.
+type LocalTicket struct {
+	ID          string    `json:"id"`          // e.g. "GOON-3"
+	Title       string    `json:"title"`
+	Description string    `json:"description,omitempty"`
+	Status      string    `json:"status"`      // open | in_progress | in_review | blocked | done
+	Labels      []string  `json:"labels,omitempty"`
+	Priority    string    `json:"priority,omitempty"` // high | medium | low
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // New opens (or creates) the memory file. If path is empty it defaults to
@@ -459,6 +521,51 @@ func (m *Memory) PendingQuestions() []Question {
 	return out
 }
 
+// PendingLearningQuestions returns pending self-learning questions only —
+// what the Questions tab shows ("goon's questions for you").
+func (m *Memory) PendingLearningQuestions() []Question {
+	out := []Question{}
+	for _, q := range m.PendingQuestions() {
+		if q.IsLearning() {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// PendingGateQuestions returns pending workflow-gate questions only — what
+// the Workflows tab surfaces (confirm_repo / approve_plan / agent ask_user).
+func (m *Memory) PendingGateQuestions() []Question {
+	out := []Question{}
+	for _, q := range m.PendingQuestions() {
+		if !q.IsLearning() {
+			out = append(out, q)
+		}
+	}
+	return out
+}
+
+// LastReflect returns when standby self-learning last ran (zero if never).
+func (m *Memory) LastReflect() time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.store.LastReflectAt
+}
+
+// SetLastReflect records the standby-reflection timestamp and flushes.
+func (m *Memory) SetLastReflect(t time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store.LastReflectAt = t
+	m.flush()
+}
+
 // AllQuestions returns the full question log (most recent first).
 func (m *Memory) AllQuestions() []Question {
 	if m == nil {
@@ -482,16 +589,44 @@ func (m *Memory) AnswerQuestion(id, answer string) bool {
 		return false
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	var learned *Question
+	ok := false
 	for i := range m.store.Questions {
 		if m.store.Questions[i].ID == id && m.store.Questions[i].Pending() {
 			m.store.Questions[i].Answer = answer
 			m.store.Questions[i].AnsweredAt = time.Now()
 			m.flush()
-			return true
+			if m.store.Questions[i].IsLearning() {
+				q := m.store.Questions[i]
+				learned = &q
+			}
+			ok = true
+			break
 		}
 	}
-	return false
+	m.mu.Unlock()
+	// Persist answered learning questions into LEARNED.md so the knowledge
+	// is durable and the agent sees it on future runs. Done outside the lock
+	// (file I/O) and best-effort — a notes hiccup must not fail the answer.
+	if learned != nil {
+		persistLearnedAnswer(*learned)
+	}
+	return ok
+}
+
+// persistLearnedAnswer appends an answered learning question to LEARNED.md.
+// Best-effort: errors are swallowed (the answer is already recorded in
+// memory.json regardless).
+func persistLearnedAnswer(q Question) {
+	store, err := notes.New("")
+	if err != nil {
+		return
+	}
+	entry := fmt.Sprintf("\n### %s\nQ: %s\nA: %s\n",
+		time.Now().Format("2006-01-02 15:04"),
+		strings.TrimSpace(q.Question),
+		strings.TrimSpace(q.Answer))
+	_ = store.Append(notes.LearnedFilename, entry)
 }
 
 // FindAnswer looks up an answer for a previously-asked question with the
@@ -755,6 +890,67 @@ func (m *Memory) SeenTicket(s TicketSnapshot) {
 		pruneOldestTickets(m.store.Tickets, maxTicketSnapshots)
 	}
 	m.flush()
+}
+
+// ReconcileTickets removes cached ticket snapshots for one board source
+// that the latest poll no longer returns — so tightening JIRA_JQL /
+// GITHUB_* immediately clears tickets that fell out of the filter, instead
+// of leaving stale ones (e.g. assigned to someone else) lingering in the
+// UI and chat context until they age out of the 500-snapshot cap.
+//
+// Safety: only the named source is touched (other boards + local tickets
+// are left alone), and any ticket that still has a workflow on record is
+// kept so an in-flight or resumable run is never orphaned. Returns the
+// number of snapshots removed.
+func (m *Memory) ReconcileTickets(source string, keepIDs []string) int {
+	if m == nil || strings.TrimSpace(source) == "" {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.store.Tickets) == 0 {
+		return 0
+	}
+	keep := make(map[string]bool, len(keepIDs))
+	for _, id := range keepIDs {
+		keep[id] = true
+	}
+	hasWF := make(map[string]bool)
+	for _, w := range m.store.Workflows {
+		if w.TicketID != "" {
+			hasWF[w.TicketID] = true
+		}
+	}
+	removed := 0
+	for id, t := range m.store.Tickets {
+		if t.Source != source || keep[id] || hasWF[id] {
+			continue
+		}
+		delete(m.store.Tickets, id)
+		removed++
+	}
+	if removed > 0 {
+		m.flush()
+	}
+	return removed
+}
+
+// ClearTickets wipes the entire cached ticket inventory (all sources). The
+// next poll repopulates it from the live board using the current filter.
+// Workflows, questions and other state are untouched. A manual "reset to
+// my current filter" escape hatch for the web UI. Returns the count removed.
+func (m *Memory) ClearTickets() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := len(m.store.Tickets)
+	if n > 0 {
+		m.store.Tickets = map[string]TicketSnapshot{}
+		m.flush()
+	}
+	return n
 }
 
 // IgnoreTicket marks a ticket key as opted-out of the daemon
@@ -1222,6 +1418,18 @@ func (m *Memory) SetPaused(paused bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.store.Status.Paused = paused
+	// Resuming (paused=false) always clears the circuit breaker so a
+	// manual resume actually takes effect immediately — otherwise a
+	// lingering NextRetryAt backoff window or AutoPaused flag would make
+	// the daemon ignore the resume until the window elapsed.
+	if !paused {
+		m.store.Status.AutoPaused = false
+		m.store.Status.ConsecutiveFails = 0
+		m.store.Status.NextRetryAt = time.Time{}
+		m.store.Status.ErrorClass = ""
+		m.store.Status.LastError = ""
+		m.store.Status.LastErrorAt = time.Time{}
+	}
 	m.flush()
 }
 
@@ -1305,6 +1513,25 @@ func (m *Memory) RepoChoices() map[string]string {
 		out[k] = v
 	}
 	return out
+}
+
+// RepoChoiceFor returns the repo a user explicitly chose to REMEMBER for
+// a project (via the confirm_repo "remember for this project" opt-in), if
+// any. Distinct from the removed auto-learn behaviour: this map is only
+// written on an explicit user opt-in, so it never silently forces tickets
+// down the same path.
+func (m *Memory) RepoChoiceFor(project string) (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.store.RepoChoices[project]
+	return v, ok && strings.TrimSpace(v) != ""
 }
 
 // flush writes the in-memory store to disk. Before writing, it merges any
@@ -1420,6 +1647,12 @@ func mergeStores(disk, mem storeFile) storeFile {
 
 	if disk.NextQID > out.NextQID {
 		out.NextQID = disk.NextQID
+	}
+
+	// LastReflectAt — prefer the more recent so a concurrent CLI flush
+	// doesn't roll back the daemon's standby-reflection throttle.
+	if disk.LastReflectAt.After(out.LastReflectAt) {
+		out.LastReflectAt = disk.LastReflectAt
 	}
 
 	// Workflows: merge by id, prefer newer UpdatedAt. Without this,
@@ -1576,4 +1809,76 @@ func (m *Memory) Reload() {
 	m.store = mergeStores(disk, m.store)
 	// Snapshot RepoChoices from disk after the merge — see fn doc.
 	m.store.RepoChoices = disk.RepoChoices
+}
+
+// ─── local tickets ────────────────────────────────────────────────────────────
+
+// AddLocalTicket creates a new local-only ticket, assigns the next GOON-N ID,
+// persists to memory.json, and returns the created ticket.
+func (m *Memory) AddLocalTicket(title, description, priority string, labels []string) (LocalTicket, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.store.NextLocalID++
+	now := time.Now().UTC()
+	t := LocalTicket{
+		ID:          fmt.Sprintf("GOON-%d", m.store.NextLocalID),
+		Title:       title,
+		Description: description,
+		Status:      "open",
+		Labels:      labels,
+		Priority:    priority,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	m.store.LocalTickets = append(m.store.LocalTickets, t)
+	m.flush()
+	return t, nil
+}
+
+// ListLocalTickets returns a copy of all local tickets, most-recently-updated first.
+func (m *Memory) ListLocalTickets() []LocalTicket {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]LocalTicket, len(m.store.LocalTickets))
+	copy(out, m.store.LocalTickets)
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].UpdatedAt.After(out[j].UpdatedAt)
+	})
+	return out
+}
+
+// UpdateLocalTicketStatus sets the status of the ticket with the given ID and flushes.
+func (m *Memory) UpdateLocalTicketStatus(id, status string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.store.LocalTickets {
+		if m.store.LocalTickets[i].ID == id {
+			m.store.LocalTickets[i].Status = status
+			m.store.LocalTickets[i].UpdatedAt = time.Now().UTC()
+			m.flush()
+			return nil
+		}
+	}
+	return fmt.Errorf("local ticket %q not found", id)
+}
+
+// DeleteLocalTicket removes the local ticket with the given ID and flushes.
+func (m *Memory) DeleteLocalTicket(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tks := m.store.LocalTickets[:0]
+	found := false
+	for _, t := range m.store.LocalTickets {
+		if t.ID == id {
+			found = true
+			continue
+		}
+		tks = append(tks, t)
+	}
+	if !found {
+		return fmt.Errorf("local ticket %q not found", id)
+	}
+	m.store.LocalTickets = tks
+	m.flush()
+	return nil
 }

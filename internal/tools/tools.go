@@ -132,6 +132,8 @@ func DefaultRegistry() *Registry {
 	// extracted symbol index for fast "where is X defined" answers.
 	r.Register(&SearchCode{})
 	RegisterMemoryTools(r)
+	RegisterObsidianTools(r)
+	RegisterAgentTools(r)
 	return r
 }
 

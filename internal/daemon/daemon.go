@@ -26,10 +26,12 @@ import (
 	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/executor"
 	"github.com/harisaginting/goon/internal/githost"
+	"github.com/harisaginting/goon/internal/learnings"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/tools"
+	"github.com/harisaginting/goon/internal/usage"
 	"github.com/harisaginting/goon/internal/workflow"
 )
 
@@ -108,6 +110,168 @@ func (d *Daemon) Wake() {
 	default:
 		// already a pending wake — fine, the next tick handles it
 	}
+}
+
+// Circuit-breaker tuning. Kept conservative: a handful of failures
+// before self-pausing, backoff that starts gentle and caps well under an
+// hour so a recovered provider is retried reasonably soon.
+const (
+	maxConsecutiveFails = 5
+	baseBackoff         = 30 * time.Second
+	maxBackoff          = 15 * time.Minute
+)
+
+// reconcileMaxList guards the post-poll ticket reconciliation: if a board
+// returns at least this many tickets the page may be truncated (the Jira
+// adapter caps at 50), so we skip reconciling to avoid dropping matches
+// that simply didn't fit on the first page.
+const reconcileMaxList = 50
+
+// backoffDelay returns the wait before the next retry given how many
+// consecutive failures we've seen: exponential (base·2^(n-1)) capped at
+// maxBackoff. fails<=0 yields 0.
+func backoffDelay(fails int) time.Duration {
+	if fails <= 0 {
+		return 0
+	}
+	d := baseBackoff
+	for i := 1; i < fails; i++ {
+		d *= 2
+		if d >= maxBackoff {
+			return maxBackoff
+		}
+	}
+	if d > maxBackoff {
+		d = maxBackoff
+	}
+	return d
+}
+
+// classifyProviderError buckets an error into a human class and reports
+// whether it's *infrastructural* — i.e. a provider/board/network problem
+// that should trip the circuit breaker. Code/test failures of a single
+// ticket are NOT infrastructural and must not pause the whole daemon.
+func classifyProviderError(err error) (class string, infra bool) {
+	if err == nil {
+		return "", false
+	}
+	s := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(s, "connection refused"), strings.Contains(s, "no such host"),
+		strings.Contains(s, "dial tcp"), strings.Contains(s, "i/o timeout"),
+		strings.Contains(s, "timeout"), strings.Contains(s, "connection reset"),
+		strings.Contains(s, "eof"), strings.Contains(s, "network is unreachable"):
+		return "network", true
+	case strings.Contains(s, "401"), strings.Contains(s, "unauthorized"),
+		strings.Contains(s, "invalid api key"), strings.Contains(s, "invalid_api_key"),
+		strings.Contains(s, "403"), strings.Contains(s, "forbidden"),
+		strings.Contains(s, "authentication"):
+		return "auth", true
+	case strings.Contains(s, "429"), strings.Contains(s, "rate limit"),
+		strings.Contains(s, "rate_limit"), strings.Contains(s, "quota"),
+		strings.Contains(s, "insufficient_quota"):
+		return "rate_limit", true
+	case strings.Contains(s, "500"), strings.Contains(s, "502"),
+		strings.Contains(s, "503"), strings.Contains(s, "overloaded"),
+		strings.Contains(s, "service unavailable"):
+		return "model", true
+	}
+	return "other", false
+}
+
+// errorClassHint maps a class to a plain-English fix the UI can show.
+func errorClassHint(class string) string {
+	switch class {
+	case "network":
+		return "Can't reach the provider/board — check the URL is right and the service (or proxy) is running."
+	case "auth":
+		return "Authentication failed — the API key or token looks wrong or expired. Update it in Setup."
+	case "rate_limit":
+		return "Rate limit or quota hit — goon will retry with backoff; check your plan limits if it persists."
+	case "model":
+		return "The provider returned a server error — usually transient; goon will retry."
+	case "config":
+		return "A required provider/board isn't configured yet — finish Setup."
+	default:
+		return ""
+	}
+}
+
+// recordFail registers an infrastructural poll failure: bumps the
+// consecutive counter, records class + message, schedules the next retry
+// via exponential backoff, and self-pauses the daemon once the failures
+// cross maxConsecutiveFails (marking AutoPaused so the UI explains it and
+// a manual resume clears it).
+func (d *Daemon) recordFail(class, msg string) {
+	if d == nil || d.opts.Memory == nil {
+		return
+	}
+	st := d.opts.Memory.GetStatus()
+	st.ConsecutiveFails++
+	st.LastError = msg
+	st.LastErrorAt = time.Now()
+	st.ErrorClass = class
+	st.NextRetryAt = time.Now().Add(backoffDelay(st.ConsecutiveFails))
+	// Self-pause only on genuine infrastructural classes. A "config"
+	// failure (provider/board not set up yet) must NOT auto-pause — the
+	// user is mid-onboarding, and a forced wake after they save config
+	// has to be able to proceed (a paused daemon would bail before it
+	// ever re-checks the now-valid config).
+	infra := class == "network" || class == "auth" || class == "rate_limit" || class == "model"
+	if infra && st.ConsecutiveFails >= maxConsecutiveFails {
+		st.Paused = true
+		st.AutoPaused = true
+	}
+	d.opts.Memory.SetStatus(st)
+}
+
+// recordSuccess clears the breaker once a poll completes without an
+// infrastructural failure. Leaves the pause flags alone (a user pause
+// stays a user pause). No-op when nothing was set.
+func (d *Daemon) recordSuccess() {
+	if d == nil || d.opts.Memory == nil {
+		return
+	}
+	st := d.opts.Memory.GetStatus()
+	if st.ConsecutiveFails == 0 && st.LastError == "" && st.NextRetryAt.IsZero() && st.ErrorClass == "" {
+		return
+	}
+	st.ConsecutiveFails = 0
+	st.LastError = ""
+	st.LastErrorAt = time.Time{}
+	st.ErrorClass = ""
+	st.NextRetryAt = time.Time{}
+	d.opts.Memory.SetStatus(st)
+}
+
+// afterRun records breaker state from a workflow run outcome: a clean run
+// (or a non-infrastructural ticket failure) means the provider/board are
+// healthy → clear; an infrastructural error (provider down mid-run) →
+// trip the breaker.
+func (d *Daemon) afterRun(runErr error) {
+	if runErr == nil {
+		d.recordSuccess()
+		return
+	}
+	if class, infra := classifyProviderError(runErr); infra {
+		d.recordFail(class, "workflow failed: "+runErr.Error())
+		return
+	}
+	// Single ticket failed for non-infra reasons (code/test) — infra is
+	// fine, so don't trip the breaker; the failure shows on the workflow.
+	d.recordSuccess()
+}
+
+// humanizeUntil renders a short "in 30s" / "in 4m" for a future time.
+func humanizeUntil(t time.Time) string {
+	d := time.Until(t)
+	if d <= 0 {
+		return "now"
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("in %ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("in %dm", int(d.Minutes())+1)
 }
 
 // Reconfigure rebuilds the LLM provider, Board, and Host from environment
@@ -194,7 +358,9 @@ func (d *Daemon) RunOnce(ctx context.Context) error {
 	}
 	d.start()
 	defer d.stop()
-	d.pollAndRun(ctx)
+	// Single explicit cycle (cron / --once) — force through any backoff
+	// window so an invoked run always attempts work.
+	d.pollAndRun(ctx, true)
 	return nil
 }
 
@@ -208,7 +374,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.start()
 	defer d.stop()
 
-	d.pollAndRun(ctx)
+	// Initial poll is forced (ignore any persisted backoff window) so a
+	// freshly-started daemon always attempts work immediately.
+	d.pollAndRun(ctx, true)
 
 	t := time.NewTicker(d.opts.PollInterval)
 	defer t.Stop()
@@ -217,12 +385,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-t.C:
-			d.pollAndRun(ctx)
+			// Scheduled tick respects the circuit-breaker backoff window.
+			d.pollAndRun(ctx, false)
 		case <-d.wakeCh:
-			// User just answered a gate question, or some other
-			// nudge — run immediately instead of waiting up to
-			// d.opts.PollInterval for the next scheduled tick.
-			d.pollAndRun(ctx)
+			// User just answered a gate question, saved config, or
+			// resumed — run immediately, bypassing the backoff window,
+			// because an explicit nudge means "try now".
+			d.pollAndRun(ctx, true)
 		}
 	}
 }
@@ -270,7 +439,7 @@ func (d *Daemon) stop() {
 	fmt.Fprintln(d.opts.Stdout, "→ goon daemon stopped")
 }
 
-func (d *Daemon) pollAndRun(ctx context.Context) {
+func (d *Daemon) pollAndRun(ctx context.Context, forced bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	pollStart := time.Now()
@@ -294,13 +463,31 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 		return
 	}
 
+	// Circuit-breaker backoff window. After a run of infrastructural
+	// failures (provider/board unreachable) we space out retries instead
+	// of hammering a dead endpoint every tick. A scheduled tick inside
+	// the window is skipped; a forced poll (startup, wake on config save
+	// / answer / resume) ignores the window and tries now.
+	if !forced {
+		if st := d.opts.Memory.GetStatus(); !st.NextRetryAt.IsZero() && time.Now().Before(st.NextRetryAt) {
+			fmt.Fprintf(d.opts.Stdout, "[poll] backing off after %d failure(s) — next retry %s\n",
+				st.ConsecutiveFails, humanizeUntil(st.NextRetryAt))
+			return
+		}
+	}
+
 	now := time.Now()
 	st := d.opts.Memory.GetStatus()
 	st.LastPoll = now
 	d.opts.Memory.SetStatus(st)
 
 	prov, board, host := d.Snapshot()
-	if prov == nil || board == nil {
+	// Local tickets (created in the UI, no external board) are first-class
+	// work items. A user with just an LLM provider can create one and goon
+	// runs it — the lowest-friction path to first value. So a board is NOT
+	// required when local tickets exist.
+	local := d.opts.Memory.ListLocalTickets()
+	if prov == nil || (board == nil && len(local) == 0) {
 		// Tell the user what to do, regardless of whether --web is on. The
 		// web UI link is one option; `goon doctor` also surfaces missing
 		// providers + the exact env vars to set.
@@ -309,6 +496,13 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 		if st.WebAddr != "" {
 			fix = "open http://" + strings.TrimPrefix(st.WebAddr, ":") + " or run `goon doctor`"
 		}
+		missing := "LLM provider"
+		if prov != nil && board == nil {
+			missing = "a board, or create a local ticket on the Tickets tab"
+		} else if prov == nil && board == nil {
+			missing = "LLM provider (and a board or a local ticket)"
+		}
+		d.recordFail("config", missing+" not configured — check Setup ("+fix+")")
 		fmt.Fprintf(d.opts.Stdout, "[poll] waiting for config — %s\n", fix)
 		return
 	}
@@ -324,7 +518,7 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 	// now answered takes priority over picking up new tickets. We process at
 	// most one workflow per tick to keep the daemon's behaviour predictable.
 	if wf, ok := d.opts.Memory.ResumableWorkflow(); ok {
-		t, err := board.Get(ctx, wf.TicketID)
+		t, err := d.resolveTicket(ctx, board, wf.TicketID)
 		if err != nil {
 			fmt.Fprintf(d.opts.Stderr, "[poll] cannot resume %s: %v\n", wf.ID, err)
 		} else {
@@ -333,43 +527,90 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 			st.LastTicket = wf.TicketID
 			st.ActiveWorkflow = wf.ID
 			d.opts.Memory.SetStatus(st)
-			resumed, runErr := eng.Run(ctx, t)
+			resumed, runErr := eng.Run(usage.WithLabel(ctx, "workflow "+wf.TicketKey), t)
 			st = d.opts.Memory.GetStatus()
 			st.ActiveWorkflow = resumed.ID
 			d.opts.Memory.SetStatus(st)
 			if runErr != nil {
 				fmt.Fprintf(d.opts.Stderr, "[poll] workflow %s failed: %v\n", resumed.ID, runErr)
 			}
+			// Update the circuit breaker from this run's outcome (an
+			// infrastructural failure trips it; a clean run or a non-infra
+			// ticket failure clears it).
+			d.afterRun(runErr)
+			// Drain the backlog fast: if more answered workflows are ready,
+			// schedule another poll immediately instead of waiting a full
+			// PollInterval. One workflow per tick keeps each tick bounded
+			// and the mutex short-held, but a bulk-approve still flows
+			// through quickly.
+			if _, more := d.opts.Memory.ResumableWorkflow(); more {
+				d.Wake()
+			}
 			return
 		}
 	}
 
-	tickets, err := board.List(ctx)
-	if err != nil {
-		fmt.Fprintf(d.opts.Stderr, "[poll] error: %v\n", err)
-		return
+	var tickets []boards.Ticket
+	if board != nil {
+		bt, lerr := board.List(ctx)
+		if lerr != nil {
+			class, _ := classifyProviderError(lerr)
+			d.recordFail(class, "board "+board.Name()+" unreachable: "+lerr.Error())
+			fmt.Fprintf(d.opts.Stderr, "[poll] error: %v\n", lerr)
+			return
+		}
+		tickets = bt
+		logx.Info("daemon.tickets_listed", "count", len(tickets))
+		for _, t := range tickets {
+			// Copy every field that chat / web UI / /tickets can render —
+			// dropping Assignee/Labels/Project caused "assigned to me"
+			// queries to fall apart because memory had nothing to filter
+			// on. boards.Ticket already carries these from Jira/GitHub.
+			d.opts.Memory.SeenTicket(memory.TicketSnapshot{
+				ID: t.ID, Source: t.Source, Key: t.Key,
+				Title: t.Title, URL: t.URL, Status: string(t.Status),
+				Assignee:  t.Assignee,
+				Labels:    t.Labels,
+				Project:   t.Project,
+				UpdatedAt: t.UpdatedAt, LastSeen: now,
+			})
+		}
+		// Reconcile the cached inventory to the live filter: drop snapshots
+		// for THIS board that the current JQL/query no longer returns, so a
+		// tightened filter (e.g. assignee=currentUser) stops showing stale,
+		// now-excluded tickets. Skip when the page looks truncated (>= the
+		// board page size) to avoid dropping legitimate page-2 matches.
+		if len(bt) < reconcileMaxList {
+			ids := make([]string, 0, len(bt))
+			for _, t := range bt {
+				ids = append(ids, t.ID)
+			}
+			if n := d.opts.Memory.ReconcileTickets(board.Name(), ids); n > 0 {
+				logx.Info("daemon.tickets_reconciled", "source", board.Name(), "removed", n)
+			}
+		}
 	}
-	logx.Info("daemon.tickets_listed", "count", len(tickets))
-	for _, t := range tickets {
-		// Copy every field that chat / web UI / /tickets can render —
-		// dropping Assignee/Labels/Project caused "assigned to me"
-		// queries to fall apart because memory had nothing to filter
-		// on. boards.Ticket already carries these from Jira/GitHub.
-		d.opts.Memory.SeenTicket(memory.TicketSnapshot{
-			ID: t.ID, Source: t.Source, Key: t.Key,
-			Title: t.Title, URL: t.URL, Status: string(t.Status),
-			Assignee:  t.Assignee,
-			Labels:    t.Labels,
-			Project:   t.Project,
-			UpdatedAt: t.UpdatedAt, LastSeen: now,
-		})
+	// Merge user-created local tickets — these need no external board, so a
+	// fresh user gets value from just an LLM provider + one local ticket.
+	for _, lt := range local {
+		tickets = append(tickets, localToTicket(lt))
 	}
 	pick := d.nextTicket(tickets)
 	if pick == nil {
+		// Board listed fine and nothing to do — infra is demonstrably
+		// healthy, so clear the breaker here. (We deliberately do NOT
+		// clear right after board.List when a workflow is about to run:
+		// otherwise a provider that's down *during* the run would have
+		// its failure count reset every tick and never trip the breaker.)
+		d.recordSuccess()
 		fmt.Fprintf(d.opts.Stdout, "[poll] %d ticket(s); none actionable\n", len(tickets))
+		// Idle — spend the lull learning about the project + itself.
+		d.maybeReflect(ctx, prov)
 		return
 	}
 	if d.hasUnansweredQuestion(pick.ID) {
+		// Board healthy, just nothing runnable this tick — clear breaker.
+		d.recordSuccess()
 		fmt.Fprintf(d.opts.Stdout, "[poll] %s blocked on user question; skipping\n", pick.Key)
 		return
 	}
@@ -380,24 +621,139 @@ func (d *Daemon) pollAndRun(ctx context.Context) {
 	st.LastTicket = pick.ID
 	d.opts.Memory.SetStatus(st)
 
-	wf, runErr := eng.Run(ctx, *pick)
+	wf, runErr := eng.Run(usage.WithLabel(ctx, "workflow "+pick.Key), *pick)
 	st = d.opts.Memory.GetStatus()
 	st.ActiveWorkflow = wf.ID
 	d.opts.Memory.SetStatus(st)
 	if runErr != nil {
 		fmt.Fprintf(d.opts.Stderr, "[poll] workflow %s failed: %v\n", wf.ID, runErr)
 	}
+	// Update the circuit breaker from this run's outcome.
+	d.afterRun(runErr)
 }
 
-// nextTicket picks the most-recently-updated Open ticket that doesn't already
-// have an in-flight workflow. Ignored tickets (set via the web Tickets-tab
-// "🚫 ignore" toggle or the CLI) are filtered out so they never get picked,
-// even if they're the freshest thing on the board.
+// maxOpenLearningQuestions caps how many unanswered learning questions
+// standby reflection will let accumulate. Past this, reflection still runs
+// (and can write notes) but is told not to ask anything new — so the
+// Questions tab never becomes a flood the user tunes out.
+const maxOpenLearningQuestions = 5
+
+// reflectTimeout bounds a single standby-reflection agent run so a stuck
+// model call can't wedge the poll loop indefinitely.
+const reflectTimeout = 5 * time.Minute
+
+// maybeReflect runs goon's standby self-learning pass while the daemon is
+// idle, throttled to once per learnings.ReflectInterval (default daily). It
+// holds the poll mutex (caller already does), which is fine because the
+// daemon has nothing else to do while idle. Best-effort: never returns an
+// error, never blocks longer than reflectTimeout.
+func (d *Daemon) maybeReflect(ctx context.Context, prov llm.Provider) {
+	if !learnings.ReflectEnabled() {
+		return
+	}
+	if prov == nil || d.opts.Tools == nil || d.opts.Executor == nil {
+		return
+	}
+	last := d.opts.Memory.LastReflect()
+	if !last.IsZero() && time.Since(last) < learnings.ReflectInterval() {
+		return
+	}
+	// If the user is already behind on answering learning questions, don't
+	// reflect (and don't burn the throttle) until they catch up — keeps the
+	// Questions tab from becoming noise.
+	open := len(d.opts.Memory.PendingLearningQuestions())
+	if open >= maxOpenLearningQuestions {
+		return
+	}
+	// Record the timestamp BEFORE running so a long/failed pass doesn't loop
+	// on every poll until it finally succeeds.
+	d.opts.Memory.SetLastReflect(time.Now())
+	fmt.Fprintln(d.opts.Stdout, "[learn] standby — reflecting on recent changes…")
+	rctx, cancel := context.WithTimeout(ctx, reflectTimeout)
+	defer cancel()
+	_ = learnings.Reflect(rctx, learnings.ReflectOptions{
+		LLM:                   prov,
+		Tools:                 d.opts.Tools,
+		Executor:              d.opts.Executor,
+		Memory:                d.opts.Memory,
+		Stdout:                d.opts.Stdout,
+		Stderr:                d.opts.Stderr,
+		Debug:                 d.opts.Debug,
+		OpenLearningQuestions: open,
+	})
+}
+
+// allowedTicketStatuses returns the set of Status values that nextTicket
+// should consider. Configurable via GOON_TICKET_STATUSES (comma-separated
+// canonical goon status names: open, in_progress, in_review, blocked, done).
+// Defaults to open,in_progress when the env var is unset or empty.
+// StatusUnknown is always implicitly included regardless of configuration —
+// many boards return it for custom statuses that MapStatus cannot map, and
+// silently dropping those tickets would cause confusing gaps in the queue.
+func allowedTicketStatuses() map[boards.Status]bool {
+	raw := strings.TrimSpace(os.Getenv("GOON_TICKET_STATUSES"))
+	if raw == "" {
+		return map[boards.Status]bool{
+			boards.StatusOpen:       true,
+			boards.StatusInProgress: true,
+			boards.StatusUnknown:    true,
+		}
+	}
+	out := map[boards.Status]bool{
+		boards.StatusUnknown: true, // always included; see docstring above
+	}
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(strings.ToLower(part))
+		switch boards.Status(part) {
+		case boards.StatusOpen, boards.StatusInProgress, boards.StatusInReview,
+			boards.StatusBlocked, boards.StatusDone, boards.StatusUnknown:
+			out[boards.Status(part)] = true
+		}
+	}
+	return out
+}
+
+// nextTicket picks the most-recently-updated ticket whose status is in the
+// configured allowed set (GOON_TICKET_STATUSES) and doesn't already have an
+// in-flight workflow. Ignored tickets (set via the web Tickets-tab "🚫 ignore"
+// toggle or the CLI) are filtered out so they never get picked, even if they're
+// the freshest thing on the board.
+// localToTicket converts a user-created local ticket into a boards.Ticket
+// so the same workflow engine runs it. Source "local" marks its origin;
+// Project is empty so triage / the confirm_repo gate decide the repo.
+func localToTicket(lt memory.LocalTicket) boards.Ticket {
+	return boards.Ticket{
+		ID:          lt.ID,
+		Source:      "local",
+		Key:         lt.ID,
+		Title:       lt.Title,
+		Description: lt.Description,
+		Status:      boards.Status(lt.Status),
+		Labels:      lt.Labels,
+		UpdatedAt:   lt.UpdatedAt,
+	}
+}
+
+// resolveTicket fetches a ticket by id, checking local tickets first (so
+// resume works with no board configured) and falling back to the board.
+func (d *Daemon) resolveTicket(ctx context.Context, board boards.Board, id string) (boards.Ticket, error) {
+	for _, lt := range d.opts.Memory.ListLocalTickets() {
+		if lt.ID == id {
+			return localToTicket(lt), nil
+		}
+	}
+	if board == nil {
+		return boards.Ticket{}, fmt.Errorf("ticket %s not found (no board configured)", id)
+	}
+	return board.Get(ctx, id)
+}
+
 func (d *Daemon) nextTicket(tickets []boards.Ticket) *boards.Ticket {
+	allowed := allowedTicketStatuses()
 	var best *boards.Ticket
 	for i := range tickets {
 		t := &tickets[i]
-		if t.Status != boards.StatusOpen && t.Status != boards.StatusUnknown && t.Status != boards.StatusInProgress {
+		if !allowed[t.Status] {
 			continue
 		}
 		if d.opts.Memory.HasOpenWorkflowFor(t.ID) {

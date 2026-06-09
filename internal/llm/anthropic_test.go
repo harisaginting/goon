@@ -216,7 +216,7 @@ func TestParseAnthropicSSE(t *testing.T) {
 		``,
 	}, "\n")
 	var chunks []string
-	full, err := parseAnthropicSSE(strings.NewReader(body), func(s string) {
+	full, _, _, err := parseAnthropicSSE(strings.NewReader(body), func(s string) {
 		chunks = append(chunks, s)
 	})
 	if err != nil {
@@ -243,7 +243,7 @@ func TestParseAnthropicSSE_Error(t *testing.T) {
 		`data: {"type":"error","error":{"type":"overloaded_error","message":"capacity"}}`,
 		``,
 	}, "\n")
-	full, err := parseAnthropicSSE(strings.NewReader(body), nil)
+	full, _, _, err := parseAnthropicSSE(strings.NewReader(body), nil)
 	if err == nil {
 		t.Fatal("expected error from error event")
 	}
@@ -252,5 +252,32 @@ func TestParseAnthropicSSE_Error(t *testing.T) {
 	}
 	if full != "partial" {
 		t.Errorf("full = %q, want \"partial\"", full)
+	}
+}
+
+// TestParseAnthropicSSE_Usage verifies token counts are extracted from the
+// message_start (input) and message_delta (cumulative output) events so
+// streaming chat tokens land on the dashboard.
+func TestParseAnthropicSSE_Usage(t *testing.T) {
+	body := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"id":"x","usage":{"input_tokens":42,"output_tokens":1}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":17}}`,
+		``,
+	}, "\n")
+	full, in, out, err := parseAnthropicSSE(strings.NewReader(body), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if full != "hi" {
+		t.Errorf("text = %q", full)
+	}
+	if in != 42 || out != 17 {
+		t.Errorf("usage = (in=%d,out=%d), want (42,17)", in, out)
 	}
 }

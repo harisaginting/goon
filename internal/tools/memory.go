@@ -135,6 +135,20 @@ func (m *MemoryWrite) Run(_ context.Context, args map[string]string) (Result, er
 	if content == "" {
 		return Result{ToolName: "memory_write"}, errors.New("memory_write: \"content\" is required (use memory_delete to remove a note)")
 	}
+	// Block direct agent writes to SOUL.md / PINNED.md (the system-prompt
+	// file). An agent that can freely overwrite its own system prompt is a
+	// prompt-injection target: a poisoned ticket could instruct the agent to
+	// write malicious instructions into SOUL.md, making them persistent.
+	// Agents should write observations to topic notes (e.g.
+	// "learnings/topic.md") which the user can review; SOUL.md is
+	// user-maintained. Set GOON_ALLOW_SOUL_WRITE=1 to opt out (e.g. when
+	// running goon trust as an admin to update its own context).
+	if isSoulFile(name) && !allowSoulWrite() {
+		e := fmt.Errorf("memory_write: writing directly to %s is restricted — "+
+			"write observations to a topic note (e.g. learnings/topic.md) instead. "+
+			"Set GOON_ALLOW_SOUL_WRITE=1 to override", name)
+		return Result{ToolName: "memory_write", Err: e}, e
+	}
 	if err := m.store.Write(name, content); err != nil {
 		return Result{ToolName: "memory_write", Err: err}, err
 	}
@@ -164,6 +178,14 @@ func (m *MemoryAppend) Run(_ context.Context, args map[string]string) (Result, e
 	content := args["content"]
 	if content == "" {
 		return Result{ToolName: "memory_append"}, errors.New("memory_append: \"content\" is required")
+	}
+	// Same protection as memory_write — appending to SOUL.md is also blocked
+	// because a sequence of small appends is equally effective for injection.
+	if isSoulFile(name) && !allowSoulWrite() {
+		e := fmt.Errorf("memory_append: appending to %s is restricted — "+
+			"write observations to a topic note (e.g. learnings/topic.md) instead. "+
+			"Set GOON_ALLOW_SOUL_WRITE=1 to override", name)
+		return Result{ToolName: "memory_append", Err: e}, e
 	}
 	if err := m.store.Append(name, content); err != nil {
 		return Result{ToolName: "memory_append", Err: err}, err
@@ -200,6 +222,21 @@ func (m *MemorySearch) Run(_ context.Context, args map[string]string) (Result, e
 		fmt.Fprintf(&b, "%s:%d: %s\n", h.Name, h.Line, h.Text)
 	}
 	return Result{ToolName: "memory_search", Stdout: b.String()}, nil
+}
+
+// isSoulFile reports whether name resolves to SOUL.md or the legacy PINNED.md.
+// Path normalisation strips leading slashes and a single trailing ".md" so
+// the check catches "SOUL", "SOUL.md", "soul.md", etc.
+func isSoulFile(name string) bool {
+	base := strings.ToUpper(strings.TrimSuffix(strings.TrimSpace(name), ".md"))
+	return base == "SOUL" || base == "PINNED"
+}
+
+// allowSoulWrite reports whether the GOON_ALLOW_SOUL_WRITE env var is set to
+// a truthy value, letting operators (not the agent) bypass the SOUL.md guard.
+func allowSoulWrite() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("GOON_ALLOW_SOUL_WRITE")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 // RegisterMemoryTools attaches the five memory_* tools to a registry,

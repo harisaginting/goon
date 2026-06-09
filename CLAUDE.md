@@ -1,985 +1,255 @@
 # CLAUDE.md — context for future me
 
-You're Claude, picking up work on **goon** with Harisa. Read this before
-touching code. It captures project context, conventions, and the
-not-immediately-obvious things that have already cost time to learn.
+You're Claude, picking up work on **goon** with Harisa. Read this before touching code.
 
 ---
 
 ## What goon is
 
-A Go CLI for autonomous engineering work. Two operating modes:
+Go CLI for autonomous engineering work. Two modes:
+1. **One-shot agent** — `goon "task"` runs LLM↔tool loop until `finish`.
+2. **Daemon** — `goon start` polls a board (Jira/GitHub Issues), picks one ticket per tick, runs the workflow pipeline, opens a PR, notifies via Telegram.
 
-1. **One-shot agent** — `goon "do this thing"` runs a single agent loop
-   (LLM picks tools, executor runs them, repeat until `finish`).
-2. **Daemon** — `goon start` polls a board (Jira / GitHub Issues), picks
-   one ticket per tick, runs the workflow pipeline against it, opens a
-   PR, notifies via Telegram.
-
-Workflows are JSON-configurable. A single `workflow.json` can override
-the built-in pipeline with arbitrary `stages` (typed: `llm` or `agent`),
-hooks (sh commands at phase boundaries), branch prefix, PR templates.
-Designed so the same binary works for engineering, marketing, sales,
-ops — not just code.
+Workflows are JSON-configurable (`workflow.json`): arbitrary `stages` (type `llm`/`agent`), hooks, branch prefix, PR templates. Same binary works for engineering, marketing, sales, ops.
 
 ## Module + build
 
-- Module path: `github.com/harisaginting/goon`
-- Go 1.21+. No external dependencies — only stdlib + internal packages.
-  When touching code, **don't add deps**. We deliberately ship zero.
+- Module: `github.com/harisaginting/goon`; Go 1.21+; **zero external deps** — stdlib only, always.
 - Build: `go build ./...`. Tests: `go test ./...`. Race: `go test -race ./...`.
 - Smoke test: `GOON_LLM_PROVIDER=mock GOON_MOCK_REPLIES='{"tool":"finish","args":{"message":"hi"}}' go run . "test"`
 
-## Package map (rough)
+## Package map
 
 ```
-cmd/                CLI entry points + subcommand handlers
-  root.go           Execute() → run() → flag parse + subcommand dispatch
-  start.go          `goon start` — daemon launcher
-  workflow.go       `goon workflow show/path/init/edit/hooks`
-  memory.go         `goon memory list/read/write/...` (active markdown notes)
-  logs.go           `goon logs [--tail|--follow|--clear]`
-  config.go         `goon config get/set/...` against ~/.config/goon/.env (legacy ~/.goon/.env still loaded)
-  doctor.go         live-probe every configured provider
-  train.go          answer LLM-queued questions
-  update.go         self-update from upstream
-  pause.go          `goon pause` / `goon resume` (flips memory.json flag)
-  repo.go           `goon repo list|forget|clear` (manages learned project→repo)
-  version.go        `goon version` (resolves ldflags + debug.BuildInfo)
-  status.go, stop.go
-
-internal/agent/     LLM ↔ tool loop; SystemPrompt
+cmd/                CLI entry points (root, start, workflow, memory, logs, config,
+                    doctor, train, update, pause, repo, version, status, stop)
+internal/agent/     LLM <-> tool loop; SystemPrompt
 internal/atlassian/ shared env-var helper for Jira + Confluence
 internal/boards/    ticket-source adapters: jira, github
-internal/checkup/   `goon doctor` provider probes
-internal/codeindex/ regex symbol extractor + ripgrep/stdlib content
-                    search; backs the search_code tool
+internal/checkup/   goon doctor provider probes
+internal/codeindex/ regex symbol extractor + ripgrep/stdlib search; backs search_code
 internal/daemon/    poll loop, hot-reload via Reconfigure()
 internal/executor/  runs tool calls in {dry-run|run|auto|explain} modes
 internal/githost/   PR adapters: github, gitlab, bitbucket
 internal/llm/       provider adapters: openai, anthropic, gemini, ollama, mock
 internal/logx/      slog wrapper, log rotation, HTTP LoggingTransport
-internal/memory/    PASSIVE runtime store (JSON file: tickets, workflows, questions)
+internal/memory/    PASSIVE runtime store (JSON: tickets, workflows, questions)
 internal/notes/     ACTIVE markdown notes store (./storage/memory/*.md)
-internal/skills/    Specialist markdown store (./storage/skills/*.md)
-                    Same Store type as notes; instantiated against a
-                    different default root. Sibling of memory, NOT
-                    auto-injected like SOUL.md.
-internal/personal/  DEPRECATED. Was the single-file character store
-                    (./storage/personal.md). Character + project
-                    knowledge are now unified in SOUL.md (see
-                    internal/notes). The directory remains as a
-                    package-doc stub so external tooling that
-                    `go list`s the repo doesn't 404 — safe to
-                    `rm -rf` it locally.
-internal/repository/ Owns REPOSITORY.md — the user-maintained mapping
-                    of remote git slugs to local checkout paths. Lives
-                    at ./storage/memory/REPOSITORY.md (excluded from
-                    topic-note index). Read by workflow triage so the
-                    LLM can suggest specific repos by name; read by
-                    confirm_repo gate to build the candidate menu;
-                    write surface via `goon repo show/edit/scan/add`.
-                    Lookup() resolves an LLM-supplied name (e.g.
-                    "backend-api") back to its canonical local path.
-                    SeedDefault() writes the starter table + preamble
-                    on first boot.
-internal/learnings/ Capture(): auto-runs after every agent.Run.
-                    Appends a HISTORY.md line (timestamp · task ·
-                    outcome) and fires a short distillation pass that
-                    lets the LLM write durable knowledge to SOUL.md
-                    or topic notes via memory_* tools. Shared between
-                    the one-shot path (cmd/root.go) and the workflow
-                    update_memory phase (internal/workflow). Opt out
-                    with GOON_AUTO_LEARN=0.
-internal/review/    Host-agnostic engine for the "PRs awaiting my
-                    review" + "forward my notifications" features.
-                    Runner.PendingReviews drafts an LLM review for each
-                    review-requested PR whose diff changed; Runner.
-                    Notifications dedups + digests the inbox. Depends
-                    only on the githost companion interfaces, never on
-                    cmd/telegram. Used by cmd/review.go and the bot's
-                    autoreview.go loop.
-internal/safety/    command validator (blocks rm -rf / etc)
-internal/storage/   single source of truth for the per-project state root
-internal/telegram/  inbound bot — auth, /commands, chat, PR review (cmd/start spawns)
+internal/skills/    Specialist markdown store (./storage/skills/*.md) -- NOT auto-injected
+internal/personal/  DEPRECATED stub -- safe to rm -rf locally
+internal/repository/ Owns REPOSITORY.md (remote->local path map). Lookup(), SeedDefault()
+internal/learnings/ Capture(): appends HISTORY.md line + distillation pass after agent.Run
+internal/review/    Host-agnostic proactive PR review + notification engine
+internal/safety/    command validator (blocks rm -rf etc); ShellCommand() cross-platform
+internal/storage/   single source of truth for per-project state root
+internal/telegram/  inbound bot -- auth, /commands, chat, PR review
 internal/tools/     Tool interface + builtins + memory_* tools
-internal/util/      tiny stdlib-only helpers shared by 3+ packages
-                    (Truncate, EnvOr, ConfirmTTY). MUST stay zero-dep
-                    (no internal/* imports) so anything can pull it in.
-internal/web/       optional web UI for `goon start --web=:8080`
-internal/workflow/  Engine.Run, declarative stage runner, hooks
+internal/util/      Zero-dep helpers: Truncate, EnvOr, ConfirmTTY
+internal/web/       optional web UI (goon start --web=:8080)
+internal/workflow/  Engine.Run, declarative stage runner, hooks, templates
+internal/agentpool/ parallel child-agent pool; Spawn/SpawnAll/WaitAll/Cancel/Cleanup; global singleton via Global()
+internal/usage/     per-model token meter; Record/Snapshot/Totals; Global() singleton; persists ./storage/usage.json
+internal/google/    zero-dep Google client: OAuth2 (refresh-token) + Calendar/Tasks/Gmail. Client.getJSON/postJSON/PostJSON; NewFromEnv/Configured
+internal/gcplog/    zero-dep Google Cloud Logging (Log Explorer) read client; Search(cl,project,filter,limit) via entries:list; query.go Build()/looksLikeFilter
 ```
 
-## Where state lives (the storage layout)
+## Storage layout
 
-Goon writes everything under one per-project directory — `./storage/`
-relative to the working directory. **Don't reintroduce `~/.goon` as a
-fallback anywhere.** That used to share state across repos and
-confused everyone.
+All state under `./storage/` relative to cwd. **Never reintroduce `~/.goon` fallback.**
 
 ```
 ./storage/
-├── logs/goon.log     rotated structured log (logx)
-├── memory.json       PASSIVE runtime state (internal/memory)
-├── memory/           ACTIVE markdown notes (internal/notes — PINNED.md, etc.)
-└── goon.pid          present while daemon runs (cmd/pidfile.go)
+|-- logs/goon.log     rotated structured log
+|-- memory.json       PASSIVE runtime state
+|-- memory/           ACTIVE markdown notes (SOUL.md, HISTORY.md, REPOSITORY.md, ...)
++-- goon.pid          present while daemon runs
 ```
 
-`./workflow.json` (repo root) is the new canonical workflow location —
-also tried in legacy `<repo>/.goon/workflow.json` etc. for backwards compat.
+`./workflow.json` is canonical; legacy `.goon/workflow.json` is read-only for compat.
 
-Resolution flows through `internal/storage` (`Root()` and `Path(parts...)`).
-Every package that needs a default path delegates there. If you find
-yourself writing `os.UserHomeDir()` in a default-path function, you're
-doing it wrong — call `storage.Path(...)`.
+All paths via `storage.Root()` / `storage.Path(...)`. Never write `os.UserHomeDir()` in a default-path function.
 
-Env overrides:
-- `GOON_STORAGE_DIR` — relocate the whole tree
-- `GOON_LOG_FILE`, `GOON_MEMORY_PATH`, `GOON_MEMORY_DIR`, `GOON_PID_FILE`,
-  `GOON_WORKFLOW_FILE` — relocate individual files
+Env overrides: `GOON_STORAGE_DIR`, `GOON_LOG_FILE`, `GOON_MEMORY_PATH`, `GOON_MEMORY_DIR`, `GOON_PID_FILE`, `GOON_WORKFLOW_FILE`.
 
-> **memory vs notes — easy to confuse.** `internal/memory` holds the
-> JSON-backed runtime state (tickets the daemon processes, the question
-> queue, workflow records, status). `internal/notes` is the new
-> markdown-based persistent knowledge store the LLM reads and writes via
-> `memory_*` tools. The user-facing word is "memory" for both. When in
-> doubt about which one to touch, the test is: *does the user edit it
-> with their own hands?* If yes → notes. If no (it's just runtime
-> bookkeeping) → memory.
+> **memory vs notes:** `internal/memory` = JSON runtime bookkeeping. `internal/notes` = markdown knowledge the LLM reads/writes. If the user edits it by hand -> notes. Otherwise -> memory.
 
-## How a request flows
+## Request flows
 
-**One-shot agent (`goon "task..."`):**
+**One-shot:** `cmd.Execute -> run() -> loadDotEnv -> logx.New -> llm.NewFromEnv -> tools.DefaultRegistry -> memory.New -> safety.Default -> executor.New -> agent.New -> ag.Run`
 
-```
-cmd.Execute → run() → loadDotEnv → logx.New → strip "goon" prefix →
-splitSubcommand (none) → parse flags → llm.NewFromEnv → tools.DefaultRegistry →
-memory.New → safety.Default → executor.New → agent.New → ag.Run(ctx, task)
-```
+**Daemon:** `runStart -> workflow.Announce -> daemon.New -> d.Reconfigure -> web.NewServer -> d.Run -> tick -> pollAndRun -> memory.ResumableWorkflow? (resume) : (boards.List -> pick ticket) -> workflow.Engine.Run -> triage -> confirm_repo (gate) -> approve_plan (gate) -> execute -> test -> verify -> update_memory -> openPR -> notify`
 
-**Daemon (`goon start`):**
+Gate phases queue a question via `memory.AskQuestion`, set `wf.State=WFAwaitingApproval + wf.Stage=<gate>`, exit cleanly. Next poll tick resumes via `Memory.ResumableWorkflow()`.
 
-```
-cmd.Execute → run() → ... → splitSubcommand("start") → runStart →
-workflow.Announce(stdout) → daemon.New → d.Reconfigure → web.NewServer →
-d.Run → tick → pollAndRun → memory.ResumableWorkflow? (resume) :
-  (boards.List → pick ticket) → workflow.Engine.Run →
-  triage → confirm_repo (gate) → approve_plan (gate) → execute → test →
-  verify → update_memory → openPR → notify
-```
+## Conventions
 
-The two gate phases (`confirm_repo`, `approve_plan`) queue a question via
-`memory.AskQuestion`, set `wf.State=WFAwaitingApproval` + `wf.Stage=<gate>`,
-and exit cleanly. The next poll tick calls `Memory.ResumableWorkflow()`, which
-returns the most recently-updated paused workflow whose `PendingQuestionID`
-has been answered; the daemon re-enters `Engine.Run` with the same ticket and
-the state machine picks up at `wf.Stage`.
+1. **Zero external deps.** Stdlib only.
+2. **Wrap every `http.Client`** in `logx.InstrumentClient(component, c)`.
+3. **Structured logging:** `logx.Info/Warn/Debug/Error`. Keys snake_case. Never `log.Println`.
+4. **Errors:** `fmt.Errorf("context: %w", err)`. Never swallow.
+5. **Commands/hooks via `internal/safety` validator.** No bypasses.
+6. **Backwards-compat env vars:** per-product wins over shared fallback.
+7. **Tests without network.** Use mock LLM provider.
+8. **No files in repo root** unless asked. Homes: `examples/`, `internal/`, `cmd/`, `.github/`.
 
-## Conventions to honor
+## Key decisions (most recent first)
 
-1. **Never add a third-party Go dep.** If you reach for a package, find
-   another way. Stdlib only. Goon's value prop includes "single binary,
-   zero deps".
-2. **Wrap every `http.Client` in `logx.InstrumentClient(component, c)`.**
-   Every outbound HTTP request shows up in `./storage/logs/goon.log` with
-   method, URL, status, latency, byte counts. We did the audit — every
-   provider already does this; keep it that way.
-3. **Use structured logging via `logx.Info / Warn / Debug / Error`**,
-   never `log.Println`. Keys are snake_case (`ticket_key`, `wf_id`).
-4. **Errors: wrap with `fmt.Errorf("context: %w", err)`.** Don't
-   swallow — we paid for that lesson once with `runAgent` returning
-   `(nil, nil)`.
-5. **Commands are run through `internal/safety` validator.** Hooks too.
-   Don't bypass even for "trusted" code paths.
-6. **Backwards-compatible env vars.** When unifying (e.g. ATLASSIAN_*
-   over JIRA_*/CONFLUENCE_*), per-product wins when set; shared is the
-   fallback. Never silently break old configs.
-7. **Tests must run without network.** The `mock` LLM provider exists
-   for this. CI uses it for the smoke test.
-8. **Don't create files in the repo root** unless explicitly asked
-   (no README spam, no scratch files). `examples/`, `internal/`, `cmd/`,
-   `.github/` are the homes.
+**Stale-ticket bug: cached inventory never reconciled to the live JQL.** User tightened `JIRA_JQL` to `project="EB" AND assignee=currentUser()` but the Tickets tab kept showing tickets assigned to others. Root cause: `memory.SeenTicket` accumulates a ticket map keyed by ID, pruned ONLY by count (500) / age (LastSeen) — it was never reconciled against the current filter, so tickets from a previously-broader JQL lingered until they aged out. Fix (additive, no behaviour change when filter is unchanged): new `memory.ReconcileTickets(source, keepIDs)` drops snapshots for ONE board source not in the latest list, while keeping other sources, local tickets, and any ticket that still has a workflow (so resumes aren't orphaned); `memory.ClearTickets()` wipes the whole inventory. Daemon `pollAndRun` calls ReconcileTickets after the SeenTicket loop, guarded by `len(bt) < reconcileMaxList(=50)` so a truncated (paginated) page never drops legit page-2 matches. `agentctx.RefreshTickets` (the web "Refresh" button + Telegram /refresh) reconciles per-source the same way, so a manual refresh syncs instantly. Web: Tickets tab gained a header strip ("N cached tickets · reflects your filter after next poll") + a "Clear cached tickets" button → `/api/tickets/clear` (`handleTicketsClear`, fires ticketsChanged). The Assignee column already existed (that's how the user spotted the stale rows). Test: `memory/TestMemory_ReconcileTickets` (drops out-of-filter, keeps other source + workflow-bound + in-filter; ClearTickets empties). Gated GREEN via outputs/gocheck.py; run `go test ./internal/memory/... ./internal/daemon/... ./internal/agentctx/... ./internal/web/...`.
 
-## Recent decisions worth knowing
+**Google Workspace agent — Phase 2 (Gmail) + Phase 3 (Cloud Logging).** Completes the read-only Google agent. Ask goon in Chat: "check my email from finance last week / open it", "get the traceId for the login of username harisa", "search logs for payment failed", "when did user X register". Still zero-dep (stdlib net/http+json, no google.golang.org/api). **Gmail** (`internal/google/gmail.go`): `SearchMessages(ctx,query,limit)` (Gmail search syntax: from:/subject:/newer_than:; lists id·from·subject·snippet via N metadata GETs, limit capped 25) + `GetMessage(ctx,id)` (format=full → `extractBody` walks MIME parts, prefers text/plain else strips text/html; `decodeB64` handles base64url w/o padding; `stripHTML`/`unescapeAmp`/`collapseWS` helpers). **Cloud Logging** (`internal/gcplog`): `Search(ctx,cl,project,filter,limit)` POSTs entries:list (orderBy timestamp desc), flattens to `Entry{Timestamp,Severity,Trace,Message,LogName}` — `messageOf` prefers textPayload→jsonPayload message-ish keys→raw json; `shortTrace`/`shortLogName` trim resource paths. `query.go Build(query,trace,user,severity,hours)` composes the filter: trace→`trace:"id"` alone; else free-text (or raw passthrough if `looksLikeFilter`) + user + `severity>=` + `timestamp>=` window (default 24h). Reuses google.Client's OAuth via new exported `Client.PostJSON`. Chat wiring (`internal/agentctx/google_tools.go` + chat.go): `execGmailSearch`/`execGmailGet`/`execGCPLogSearch`; `gmail_search`/`gmail_get`/`gcp_log_search` in validActions + dispatch + manifest (gmail gated on `googleConfigured()`, logs on `gcpLogConfigured()` = Google + GOOGLE_CLOUD_PROJECT). ToolCall gained id/hours/severity/trace/user. Reads = no gates. Tests (no network): `google/gmail_test.go` (decodeB64/stripHTML/mailFromRaw), `gcplog/query_test.go` (Build paths/looksLikeFilter/messageOf/shortTrace). Gated GREEN via outputs/gocheck.py; run `go build ./... && go test ./internal/google/... ./internal/gcplog/... ./internal/agentctx/...`. Phase 4 (writes: gmail_send/calendar_create, each gated) still deferred.
 
-- **Repositories tab (`internal/web/actions.go`).** Reframed the
-  former flat "Pull requests" tab into a repo-centric list. The
-  tab's internal id stays `data-page="prs"` (so the sidebar's
-  showPage() and the keyboard shortcut `p` don't need rewiring),
-  but the user-visible label is now **Repositories** and the
-  content composer (`fragTabPRs`) lazy-loads
-  `/fragments/repositories` instead of the old `/fragments/prs`.
-  - **Source of truth**: REPOSITORY.md (the user-curated registry).
-    Every entry becomes a row, sorted alphabetically. Repos the
-    git host returned PRs for but that aren't in REPOSITORY.md
-    show up under a `Detected · not tracked in REPOSITORY.md`
-    divider at the bottom so the user can adopt them.
-  - **Per-row signals** (`renderRepoSummary`): open-PR count
-    bubble, local-mapping status (`✓ cloned` / `⚠ no local path`
-    / `⚠ path mapped · not cloned` / `untracked`), and the notes
-    column from REPOSITORY.md. data-repo-name powers a typeahead
-    filter when the row count > 8.
-  - **Click to expand**: each row is a `<details>` whose body
-    lazy-loads `/fragments/repo?slug=<slug>`. The detail panel
-    contains: (1) a **map-to-local form** that POSTs to
-    `/api/repo/map` and upserts REPOSITORY.md via
-    `repository.Add`; (2) a **clone-here form** (visible only
-    when the repo isn't cloned) that POSTs to `/api/repo/clone`
-    — composes `git clone <url> <target>`, validates via
-    `safety.Default()`, refuses to clone over a non-empty target,
-    runs via `safety.ShellCommand` with a 5-minute budget, and
-    on success auto-upserts the new mapping so the row instantly
-    flips to "✓ cloned"; (3) the per-repo **PR list**, lazy-
-    loaded from `/fragments/prs?repo=<slug>` so the existing
-    PR-row machinery (comment / approve / block + ✨ Draft with
-    AI) is reused as-is — single source of truth for the actions.
-  - **Clone safety scope**: goon does NOT manage credentials —
-    the spawned `git clone` uses whatever SSH/HTTPS auth is
-    already configured on the user's machine. Errors stream
-    back verbatim (no wrapping) so "Permission denied
-    (publickey)" or "Repository not found" reach the user
-    directly.
-  - **shellQuote helper**: tiny POSIX single-quote escaper used
-    to safely build the clone command — handles spaces and
-    metacharacters in remote URLs / target paths.
-  - **guessCloneURL**: best-effort clone-URL inference for the
-    pre-filled URL field. Tries `RepoLister.ListRepos` first,
-    falls back to host-specific defaults (`github.com`,
-    `gitlab.com`, `bitbucket.org`).
-  - **SSE event**: a new `repositoriesChanged` topic fires after
-    map / clone succeeds so the list re-renders without a
-    page reload.
-  - **New imports**: `actions.go` gained `path/filepath`,
-    `sort`, `internal/repository`, `internal/safety`. Server.go
-    registers 4 new routes (`/fragments/repositories`,
-    `/fragments/repo`, `/api/repo/map`, `/api/repo/clone`) + a
-    `/fragments/tab-repositories` alias for the consistent
-    naming convention.
-  - **Sidebar**: button label "Pull requests" → "Repositories";
-    icon changed from the fork icon to a stacked-pages
-    silhouette. The cmdk command-palette entry was renamed to
-    match.
+**Full UI makeover — light/dark complete + brand cohesion + a11y.** Finished the theme system so light mode is genuinely usable, not just dark. Sweeps (all scoped, dark-preserving): (1) `text-white` → `text-ink` ONLY for body text/inputs/hover — kept white on colored buttons + gradient avatars via a window-aware script that checks the enclosing class chunk for a saturated `bg-*`/`from-*`/`bg-gradient` (16 converted, 7 kept). (2) Bare (non-`dark:`-prefixed) dark grays → tokens: `text-gray-300`→`text-ink`, `text-gray-400`→`text-muted` (52 converted; `dark:`-paired ones skipped to keep dark intact; bg/border grays were already 0 bare). (3) Colored status text on tints (`text-amber-400` etc., 33 of them) → `text-{c}-700 dark:text-{c}-400` so they pass contrast in light while keeping the dark shade. Brand cohesion: landing.html + docs.html accent switched purple `#A855F7` → indigo `#6366F1` (+ SF font stack, indigo-tinted shadows) so site ↔ app ↔ docs are one brand. Accessibility: global `:focus-visible` accent ring (none on mouse click) + `prefers-reduced-motion` reset in index.html. Files: server.go, chat.go, actions.go, static/index.html, static/landing.html, static/docs.html. All brace-balanced; index.html inline scripts pass `node --check`. NOTE: `//go:embed` → needs `go build` + restart to appear; couldn't live-verify (sandbox has no Go toolchain and file:// is blocked in Claude-in-Chrome), so a final glance in both themes after rebuild is recommended.
 
-- **Web UX pass round 2 — May 2026.** Same-session follow-up after
-  the user reported three additional gaps. All three landed:
-  - **Pause-daemon button now flips the UI instantly
-    (`internal/web/static/index.html`).** Bug: `goonDaemonToggle` used
-    raw `fetch()` so the server's `HX-Trigger: statusChanged` header
-    was discarded (HTMX only fires events on requests made via
-    `hx-*` attributes, not on naked fetches). Fix: after a successful
-    fetch, optimistically flip the local `[data-paused]` attribute
-    AND dispatch a `CustomEvent('statusChanged')` on `body`. That
-    re-renders the status pill and re-labels the button in the same
-    paint — no waiting for the next SSE push.
-  - **Workflows tab now shows "which pipeline am I running?"
-    (`fragWorkflowConfig` in `internal/web/server.go`).** New
-    workflow-config band at the top of the Workflows tab — renders
-    `cfg.Name`, `cfg.Description`, stage count, the source path
-    (`./workflow.json` or wherever it loaded from), the branch
-    prefix, and a pill that calls out `auto_approve` vs the default
-    gated mode in plain language ("⏸ gated · asks before run" vs
-    "⚡ auto-approve · runs unattended"). Without this band the user
-    had no way to tell which `workflow.json` was loaded, and
-    couldn't tell whether goon was going to ask before running or
-    just blast through.
-  - **Workflow.json editor in the web UI (`handleWorkflowSave`).**
-    Same band has a collapsible JSON editor (textarea pre-filled
-    with the active config, marshalled from in-memory state so
-    "what you see = what's running"). Save POSTs to
-    `/api/workflow/save`, which validates JSON via `json.Unmarshal`
-    into `workflow.Config` (same schema the daemon uses), writes
-    atomically via tmp+rename, patches the in-memory snapshot, and
-    fires `workflowConfigChanged + workflowsChanged` so the header
-    re-renders with the new name and the cards reflow. Path safety:
-    the destination is allowlisted to the loaded path or
-    `workflow.DefaultConfigFilePath()` — no arbitrary writes from
-    the form. JS helper `goonWorkflowEditorToggle` flips the band
-    open/closed and re-labels the trigger button.
-  - **Plumbing.** `web.Options` gained `Workflow *workflow.Config`
-    + `WorkflowPath string`; `cmd/start.go` reads them via
-    `workflow.LoadConfig("")` before constructing the server (load
-    errors print a stderr warning + leave the editor read-only).
-    Server.go gained a `path/filepath` import for the atomic-rename
-    parent-dir step.
+**Light/dark theme system + Apple-grade tokens (`internal/web/static/index.html`).** The UI was dark-only with hardcoded hex. Reworked the theme into CSS variables that flip on `<html class="dark|light">`: Tailwind colors now map to `rgb(var(--c-x) / <alpha-value>)` (surface/raised/sunken/border, ink, muted, accent[indigo], accent-strong, highlight, success, danger), with light (soft off-white, white cards, hairlines) + dark (refined graphite) palettes in `:root`/`html.dark`. Shadows + radii are tokens too (`--shadow-card/lift`, larger Apple-ish `borderRadius`). Switched to the native SF system font stack (dropped the Inter web-font fetch). Added a no-FOUC theme bootstrap script + a header toggle (`goonCycleTheme`: system→light→dark, persisted in `localStorage['goon-theme']`, follows OS in system mode). Token-based + already-`dark:`-paired fragments (dashboard/tickets/repos) adapt automatically. **Caveat / next:** dark-only components needed conversion — the workflow editor (`fragWorkflowConfig`, lines ~1321-2078) was swept gray→token (scoped Python replace) + violet→accent. Remaining: some fragments use bare `text-white` as primary text (must become `text-ink`) BUT `text-white` on colored buttons (`bg-sky-600 text-white`) must STAY white — so the rest of the light-mode sweep must be done by eye after a rebuild, not blanket-replaced. Assets are `//go:embed` → needs `go build` + restart to see anything; verify in Claude-in-Chrome in BOTH themes.
 
-- **Web UX pass — May 2026 (`internal/web` + `internal/workflow`).**
-  Live UX audit at `http://localhost:8080/app` with 35 questions stacked
-  surfaced 12 issues; all fixed in this pass. Land in two files mostly:
-  `internal/web/server.go`, `internal/web/actions.go`, plus the static
-  template `internal/web/static/index.html` and the chat panel in
-  `internal/web/chat.go`. Highlights:
-  - **`renderRepoPickButtons` — repo pill markup.** Dropped the leading
-    integer span (it was the map-iteration index — random-looking and
-    read as a rank). Replaced the word badge `<span>suggested</span>`
-    with a `★` for the suggested pills (eye-trackable in a long list,
-    no horizontal whitespace cost). Cut `initialVisibleOthers` from
-    8 → 5 so a 100-repo org doesn't drown the user's screen in
-    alphabetical noise on first render. The selection summary now
-    shows repo names ("primary: meditap/api · others: …") instead of
-    the now-removed `#71` numeric form.
-  - **`buildRepoGateQuestion` (workflow.go) — honest "Suggested:" line.**
-    Old behavior: when `pickRepoForTicket` fell back to `t.Project`
-    (the Jira project key), the prompt read "Suggested: EB" which
-    isn't a repo. New: only render "Suggested: X" when `suggested !=
-    t.Project`; otherwise show "No specific repo suggested — pick one
-    below." Also dropped the verbose CLI hint "Reply: <n> or <n>,<n>...
-    change=<path> ... no" — web users have buttons; CLI/Telegram users
-    get the shorter "Reply with a number, `yes`, or `no`." line.
-  - **`stripRepoMenu` (server.go) — also strips Reply/Triage prose.**
-    Defensive: even if a legacy stored question still has the long
-    verbose hint, the web rendering drops it. Also drops "Triage
-    suggests N repos ..." preamble (the picker shows the same picks
-    as ★ pills).
-  - **Workflow → Question jump.** Awaiting-approval cards in the
-    Workflows tab now show two affordances: "open" (expands the
-    in-card detail) and "→ answer" (calls new `goonJumpToQuestion(qid)`
-    JS helper which switches to Questions tab, scroll-into-views the
-    matching `<form data-question-id="q-N">`, and briefly rings it
-    with `ring-2 ring-accent`).
-  - **Tickets transition uses `TransitionResolver`.** New endpoint
-    `/api/ticket/transitions?key=KEY` returns `<option>` tags lazy-
-    loaded into the Transition `<select>` via
-    `hx-trigger="toggle from:closest details once"`. On boards that
-    implement `TransitionResolver`, options are the real workflow
-    names (e.g. "Ready to Test"); on boards that don't, fallback to
-    the canonical 5-status enum so the dropdown is never empty.
-    `handleTicketTransition` now prefers `TransitionByName` over
-    `MapStatus + Transition`, killing the same enum-substring bug
-    we fixed in chat ("ready to test" → "ready" → StatusOpen →
-    Backlog).
-  - **PR row — toggles labeled to read as toggles.** The top-row
-    buttons keep their dual role (expand the form THEN click the
-    inner submit) but are now labeled "▸ write comment" / "▸ block
-    (request changes)" with a chevron that flips to ▾ when open.
-    The new `goonPRRowToggle` JS helper auto-focuses the textarea
-    on open and toggles `aria-expanded` so the disclosure is
-    keyboard- and screen-reader-friendly. Inner submit buttons
-    relabeled "send →" so they don't read as duplicates of the
-    top-row toggle.
-  - **Chat tab copy refreshed.** Subtitle: "Ask about tickets, PRs,
-    or your knowledge notes. Goon can comment on Jira tickets and
-    pull requests, move statuses, draft PR reviews, search
-    Confluence, and fetch web pages." Replaces the pre-pr_tools /
-    pre-ext_tools wording that only mentioned Jira. Prompt
-    suggestion grid now includes "→ review my open PRs" instead of
-    "summarize recent runs"; empty-state caption now says "Tools:
-    Jira · PRs · Confluence · web."
-  - **Active sidebar tab is now visually obvious.** Bumped the
-    inset left bar from 3px → 4px, the wash from `bg/0.10` →
-    `bg/0.18`, added `font-weight: 600` on the text and `color:
-    #A855F7` on the icon. Pre-pass the active row read identical
-    to hover on most monitors.
-  - **SOUL.md migration banner stripped from render only.** New
-    `stripSoulMigrationBanner(s)` in `internal/web/chat.go` strips
-    any leading `<!-- ... -->` HTML comments (plus matching blank
-    lines) before the `<pre>` renders SOUL.md. The on-disk file is
-    untouched — the migration audit trail is real, just shouldn't
-    show in the always-loaded knowledge panel.
-  - **`/fragments/tab-setup` alias added.** Every other tab is
-    `/fragments/tab-<name>` but Setup was at the bare `/fragments/setup`
-    (because the Setup section is hoisted out of the tab list and
-    reused as a top-of-page mis-configuration banner). Now both
-    URLs resolve so a dev-tools fetch on the conventional path
-    succeeds.
-  - **`⌘K` discoverability hint in sidebar.** Tiny `Press ⌘K /
-    Ctrl+K to jump to any tab.` line at the bottom of the sidebar
-    nav. The header has a Search button but most users miss it;
-    the inline hint teaches the shortcut without adding a button
-    to chase.
-  - **Pre-existing test breakage fixed as drive-by.**
-    `internal/workflow/workspace_test.go` was calling
-    `buildRepoGateQuestion` with 3 args but the function signature
-    has been 4 args since the multi-repo preselected[] addition.
-    Both calls patched to pass `nil` for the missing arg.
-  - **Tests touched:** `internal/web/repopick_test.go` (initial
-    visibility budget asserted 8 → 5 to match the new constant);
-    `internal/workflow/workspace_test.go` (reply-hint assertion
-    swapped from `"<n>"` to `"Reply with a number"`).
+**Task result is now visible (was discarded).** `agent.Run` only returned `error` — the agent's final `finish` message (the actual answer/outcome) was printed + logged to memory but never surfaced, so a non-code ticket (research/docs/summary) finished with no visible deliverable ("it ran… where's my answer?"). Fix: `Agent` gained a `result` field set in the finish branch + a `Result()` getter (Run's signature unchanged → other callers unaffected); `executeStep` now returns `(string, error)` and `phaseExecute` stores the last non-empty step result in `wf.Note`; the workflow detail renders `wf.Note` as a prominent emerald **"result"** panel (was a tiny "note" footnote). Only caller of `executeStep` is `phaseExecute`; no test references it. Gated GREEN via outputs/gocheck.py.
 
-- **Proactive PR review + notification forwarding (`internal/review`).**
-  Two user-facing features built on three new pieces:
-  - **githost companion interfaces** (`internal/githost/githost.go`):
-    `ReviewRequester{ReviewRequestedPRs(ctx)}` and
-    `Notifier{Notifications(ctx)}`, plus a `Notification` struct.
-    GitHub implements both (Search API `review-requested:@me`;
-    `/notifications` filtered to review_requested/mention/team_mention).
-    GitLab implements both AND gained the whole `PRReviewer` surface it
-    never had — `ListPRs`, `GetPRDetails` (diff reconstructed from
-    `/merge_requests/{iid}/diffs`), `CommentPR`, `ApprovePR`,
-    `RequestChangesPR` (no native "request changes" REST event — posts
-    a blocking note instead), `ReviewRequestedPRs`
-    (`merge_requests?reviewer_username=`), `Notifications` (`/todos`).
-    Bitbucket implements `ReviewRequester` (per-repo `q=reviewers.uuid`
-    over GOON_REVIEW_REPOS / discovered repos) but deliberately NOT
-    `Notifier` — Bitbucket Cloud has no notification-inbox API, so the
-    type assertion fails and callers degrade. Mock implements both.
-  - **`internal/review.Runner`** — host-agnostic. `PendingReviews`
-    drafts an LLM review (same prompt shape as telegram/pr.go) for each
-    review-requested PR whose diff fingerprint (sha256[:16]) changed
-    since last pass; `Notifications` dedups + adds an LLM digest when
-    >1 is new. Caller marks dedup state AFTER successful delivery so a
-    failed send retries.
-  - **dedup in `internal/memory`** — `ReviewSeen map[string]ReviewMark`
-    (key `host:repo#number`, stores diff hash) + `NotifSeen
-    map[string]time.Time` (key `host:id`). Caps 500/2000, pruned oldest
-    first, merged as a union in `mergeStores`.
-  Delivery: `goon review-prs` / `goon notifications` CLI subcommands
-  (both take `--watch --interval --telegram --all`, so they double as a
-  cron-free scheduler) and the Telegram bot's `autoreview.go` loop —
-  a ticker goroutine started from `Bot.Start`, gated by
-  `GOON_AUTO_REVIEW` / `GOON_AUTO_NOTIFY` (default OFF so an upgrade
-  never starts messaging existing daemon users), cadence
-  `GOON_AUTO_INTERVAL` (default 15m). The bot owns the auto loop because
-  it already holds Host+LLM+Memory+send+authorized-chat-list — daemon.go
-  was NOT touched. Review drafts go out via `SendWithButtons` with a
-  `rv:repo:number` callback; tapping "✅ Post as comment" runs
-  `callbackHandleReview` (claimed early in interactive.go's
-  `handleCallback`, mirroring `callbackHandleRepos`) which extracts the
-  fenced draft from the message text and posts it via `CommentPR` — the
-  user's one-tap approval. **Verify on real hosts:** the Bitbucket
-  `q=reviewers.uuid="..."` PR filter is the one query I couldn't test;
-  if Bitbucket rejects it the per-repo call is skipped + logged
-  (`bitbucket.review_requested_skip`) and review-request detection
-  silently returns empty for that host.
-- **Review feature — tests + cleanup follow-up.** `internal/review`,
-  the memory dedup, the githost review/notify methods, and the telegram
-  auto-loop helpers now have network-free unit tests (httptest + mock
-  LLM): `internal/review/review_test.go`,
-  `internal/memory/dedup_test.go`, `internal/githost/review_test.go`,
-  `internal/telegram/autoreview_test.go`. Same pass also: removed two
-  stray `fmt.Println` debug statements in `internal/daemon/daemon.go`
-  (the ticket-count one became `logx.Info("daemon.tickets_listed")`);
-  made the Telegram auto-loop's message truncation rune-safe
-  (`clampUTF8` in autoreview.go — a raw `s[:n]` can split a UTF-8 rune
-  and Telegram rejects invalid UTF-8); and `goon start` now prints a
-  hint when `GOON_AUTO_REVIEW`/`GOON_AUTO_NOTIFY` is set but the
-  Telegram bot isn't configured (the auto loop has nowhere to deliver).
-- **PR tools in the chat agent (`internal/agentctx/pr_tools.go`).**
-  Motivation: a user pasted a Bitbucket PR URL into Telegram chat and
-  goon correctly said it had no tool for it — the free-text chat loop
-  (`agentctx.ChatTurn`) was Jira-only. Fix: five pull-request tools
-  alongside the four jira_* ones — `pr_get` (metadata + reviewer
-  list), `pr_list` (open, or `filter:review-requested`), `pr_comment`,
-  `pr_approve`, `pr_request_changes` — thin wrappers over the githost
-  `PRReviewer` / `ReviewRequester` interfaces. `ChatTurnOptions`
-  gained `Host githost.Host` (plumbed from `b.opts.Host` /
-  `s.opts.Host`); `buildToolBlock` now takes `(board, host)`,
-  advertises the PR section when the host implements `PRReviewer`, and
-  no longer early-returns "no tools" when a host exists but a board
-  doesn't. `parseToolCall`'s salvage path is now generic (`"action":"`
-  marker + `validActions` filter) instead of a hardcoded jira-only
-  list. `parsePRReference` accepts a pasted PR URL (GitHub `/pull/`,
-  GitLab `/-/merge_requests/` incl. nested groups, Bitbucket
-  `/pull-requests/`) or `owner/repo#number`. Reviewer data is new:
-  `githost.Reviewer{Name,State,Approved}` + `PR.Reviewers`, populated
-  by every host's `GetPRDetails` — Bitbucket from the `participants`
-  array (role==REVIEWER), GitHub from `requested_reviewers` overlaid
-  with a best-effort `/pulls/{n}/reviews` call (latest settled state
-  per user; a COMMENTED review never downgrades a prior approve),
-  GitLab from `reviewers[]` overlaid with a best-effort `/approvals`
-  call. The extra per-host call is best-effort — a failure leaves the
-  pending set rather than failing GetPRDetails. Tests:
-  `internal/agentctx/pr_tools_test.go`,
-  `internal/githost/reviewers_test.go`.
-- **"Draft with AI" button on the web PR list (`internal/web/actions.go`).**
-  Each PR row's existing **comment** form gained a `✨ Draft with AI`
-  button next to **post comment**. Clicking it `hx-get`s the new
-  `/api/pr/draft-review?repo=…&number=…` endpoint, which calls
-  `review.DraftReview` (the same shared engine the chat `pr_review`
-  tool and the auto-loop use) and writes the draft straight into the
-  textarea via `hx-swap="innerHTML"`. The user previews, edits if they
-  want, and posts via the existing `/api/pr/comment` endpoint — no new
-  posting path, no risk of auto-publishing. Errors land in the
-  textarea prefixed `✗` so the user always sees what happened. Three-
-  minute budget + `errors.Is(err, context.DeadlineExceeded)` branches
-  match the chat `pr_review` ceiling for consistency. Tests:
-  `internal/web/draft_review_test.go`.
-- **Repo-pick UI for orgs with 100+ repos (`internal/web/server.go`
-  `renderRepoPickButtons`).** Two bugs from a Telegram-screenshot
-  report: (1) the menu-line parser capped at `n > 99`, silently
-  dropping items 100+ from the checkbox UI; (2) presenting 100+ flat
-  checkboxes drowned the LLM's "suggested" picks in alphabetical
-  noise. Fix in one function: cap bumped to 999; sort suggested first,
-  then alphabetical; typeahead `data-pick-filter` input (only when
-  the list is large); long tail tagged `data-overflow="1"` and hidden
-  behind a `show all N (X more) →` expander; checked overflow pills
-  auto-graduate out of overflow so a selection isn't lost when the
-  filter clears. Initial visible budget = suggested + 8 non-suggested.
-  Tests: `internal/web/repopick_test.go` — including the explicit
-  regression that items past 99 render.
-- **`pr_review` for large PRs: smart diff digest + 3-min budget
-  (`internal/review` + `agentctx/pr_tools.go`).** Bug surfaced from a
-  Telegram transcript: review of a 784 KB PR timed out at the 90-second
-  budget, and even when the fetch succeeded the old `trimDiff(diff,
-  18000)` byte-truncated alphabetically — the model only ever saw the
-  first ~2 files of a 30-file change. Fix in two parts. (1)
-  `trimDiffSmart` in `internal/review`: when a diff exceeds 18 KB, it
-  parses at `diff --git a/X b/Y` boundaries into per-file chunks and
-  emits a "DIFF DIGEST" — a top-level Files-changed list with per-file
-  +/- stats (so the model sees the SHAPE of the whole PR no matter
-  the size), then fairly-budgeted head excerpts of each file's hunks.
-  Falls back to plain line-boundary trim when the diff lacks
-  `diff --git` markers (raw patches). `DraftReview` switched from
-  `trimDiff` to `trimDiffSmart`, so both `pr_review` and the auto-loop
-  benefit. (2) `execPRReview` timeout 90 s → 3 min, with
-  `errors.Is(err, context.DeadlineExceeded)` branches emitting specific
-  TOOL ERROR messages (separately for fetch-timeout vs LLM-timeout)
-  that name the real reason and explicitly forbid the LLM from
-  recommending `/review` as a workaround — the same engine backs both,
-  so that suggestion was always a hallucination. Tests:
-  `internal/review/review_test.go` (TestTrimDiffSmart_*,
-  TestSplitDiffByFile, TestCountAddsDels).
-- **Jira transitions: chat moves tickets by REAL status name now
-  (`internal/boards` + `agentctx/chat.go`).** Bug surfaced from a
-  Telegram transcript: "change EB-4978 to ready to test" → goon
-  silently moved it to **Backlog** and reported success. Root cause:
-  `boards.MapStatus("ready to test")` matched the substring "ready"
-  → `StatusOpen` → Jira matched the "Backlog" transition (which also
-  maps to open). The chat then hallucinated "moved to Ready to Test"
-  because the ACTION OK message only carried the canonical status.
-  Fix: optional companion interface
-  `boards.TransitionResolver{ListTransitions, TransitionByName}`. Jira
-  lists the workflow transitions and matches the user's wording
-  against the REAL status names via `matchTransition` (exact on a
-  normalised lowercase+alphanumeric form, then containment, no
-  MapStatus bucketing). The chat's `jira_transition` uses
-  `TransitionByName` when the board implements it, falling back to
-  the canonical enum path for GitHub Issues. New `jira_transitions`
-  chat action lists a ticket's actual available statuses. The
-  ACTION OK message states the REAL applied status name and tells
-  the LLM to use it verbatim. A new TRUTHFULNESS bullet in the Rules
-  footer forbids the LLM from claiming an outcome the tool didn't
-  confirm or inventing missing capabilities ("I don't have REST API
-  access" was another hallucination from the same transcript). Mock
-  implements TransitionResolver. Tests:
-  `internal/boards/transition_test.go`,
-  `internal/agentctx/transition_test.go`.
-- **`pr_review` chat tool — natural review-then-comment flow
-  (`internal/agentctx/pr_tools.go`).** New chat action that does
-  what `/review` + `/comment` do, in one conversation: fetch the
-  diff, run the model (via the newly exported `review.DraftReview`),
-  hand back the draft fenced by `——— BEGIN REVIEW ———` /
-  `——— END REVIEW ———` plus explicit instructions for the assistant
-  to (1) show the user the review verbatim, (2) ask "post this as a
-  comment on the PR?", (3) on confirmation call `pr_comment` with
-  the EXACT draft body (the fences let the LLM locate the verbatim
-  text in its own previous turn). Triggers on "review pr <url>",
-  "what do you think of <url>", etc. `executeToolCall` grew an
-  `llm.Provider` parameter (passed from `ChatTurnOptions.LLM`) —
-  this is the only chat tool that runs an LLM call itself.
-  `review.DraftReview` is the exported entry point;
-  `Runner.draftReview` now delegates to it so the auto-loop and
-  chat share one prompt. Tests:
-  `internal/agentctx/pr_review_test.go`.
-- **Confluence + web tools in the chat agent (`internal/agentctx/ext_tools.go`).**
-  Casual chat (Telegram + web) gained four tools beyond the jira_* and
-  pr_* sets: `confluence_search` + `confluence_get` (wrap
-  `tools.Confluence`, advertised only when `atlassian.Confluence().Filled()`)
-  and `web_search` + `web_fetch` (wrap `tools.WebSearch` /
-  `tools.FetchURL`, always available — no config needed). `agentctx`
-  now imports `internal/tools`; no cycle (`tools` imports neither
-  `agentctx` nor `web`/`telegram`). `buildToolBlock` lost its "no
-  board → no tools" early return — web tools always exist, so there's
-  always at least one tool. Tool results are size-clamped before being
-  fed back into chat context (`clampForChat`, 8 KB cap, rune-safe) — a
-  fetched page can be 256 KB. New `ToolCall` fields: `Query`, `URL`,
-  `PageID`. Deliberately NOT added: run_command / file tools — casual
-  chat stays read-or-scoped-action; `/run` remains the path for the
-  full executor. Tests: `internal/agentctx/ext_tools_test.go`.
-- **Codebase index (`internal/codeindex` + `internal/tools/search_code.go`).**
-  First call to `search_code` builds a per-process index of the
-  current repo: regex symbol extraction (Go/Python/JS/TS/Java/Rust/
-  Ruby/PHP/Elixir/Shell) + a content searcher that prefers ripgrep
-  when on PATH and falls back to stdlib bufio. Query shape picks the
-  mode: bare word → symbol lookup + content fallback; `/pat/` →
-  regex; anything else → substring. Single shared `SearchCode` is
-  registered in `DefaultRegistry` so the index isn't rebuilt per
-  call. Files >2 MB and ignored dirs (.git, node_modules, vendor,
-  target, build, dist, .venv …) are skipped. No Tree-sitter because
-  CGo would break the "single binary, zero deps" rule — regex was
-  good enough and matches 9 langs with ~50 lines per lang.
-- **Browser tools (`internal/tools/fetch.go`).** `fetch_url`
-  retrieves a URL (HTTPS-only by default, `GOON_FETCH_ALLOW_HTTP=1`
-  unlocks plain http), 256 KB cap, strips HTML tags via a hand-
-  written stripper so the agent gets readable docs without an x/net
-  dep. `web_search` prefers Google CSE when `GOOGLE_API_KEY` +
-  `GOOGLE_CSE_ID` are set; falls back to `html.duckduckgo.com`
-  scraping (substring-based, no html.Parser). Both clients are
-  `logx.InstrumentClient("fetch", ...)` so every outbound request
-  shows up in `./storage/logs/goon.log`. Use case: the agent can
-  read error messages, library docs, and Stack Overflow answers
-  autonomously instead of guessing.
-- **Web UI file browser (`internal/web/files.go`).** New "Files"
-  sidebar entry under a "Workspace" section. Endpoints:
-  `/api/files/tree` (directory listing — JSON or HTML fragment),
-  `/api/files/read` (returns the editor pane with a textarea),
-  `/api/files/write` (atomic tmp+rename, fires
-  `HX-Trigger: filesChanged` and SSE), `/fragments/tab-files` (the
-  two-column composer). Root resolves
-  `GOON_WORKSPACE_DIR → GOON_WORKDIR → cwd`. Path safety: rejects
-  absolute paths, any literal `..` in the raw input, and resolves
-  must stay under root. 2 MB read cap; binary files (NUL byte in
-  first 8 KB) refused for editing. No execute/rename/delete from
-  this surface — the agent stays the only thing that can mutate the
-  repo in non-obvious ways. Letter shortcut `f`, also in cmd-K.
-- **Daemon wake channel.** `(*daemon.Daemon).Wake()` pushes onto a
-  buffer-1 `wakeCh` that `Run()` selects on alongside the poll ticker.
-  Used by the web `/api/answer` handler and the Telegram `/answer`
-  command so a workflow paused at an approval gate resumes in <1s
-  instead of waiting up to PollInterval (default 5 min) for the next
-  scheduled tick. Both the web and telegram packages define a local
-  `Waker` interface (just `Wake()`) and accept the daemon as that
-  interface — no import-cycle pain. Calling Wake on a daemon whose
-  wakeCh is already full is a no-op (we coalesce bursts).
-- **Gemini provider (`internal/llm/gemini.go`).** Google's
-  generativelanguage v1beta REST API, stdlib-only like every other
-  adapter. Env vars: `GEMINI_API_KEY` (or `GOOGLE_API_KEY` as
-  fallback), `GEMINI_MODEL` (default `gemini-2.5-flash`),
-  `GEMINI_BASE_URL` (default `https://generativelanguage.googleapis.com/v1beta`).
-  URL shape: `{base}/models/{model}:generateContent?key={KEY}` for
-  non-stream, `:streamGenerateContent?key={KEY}&alt=sse` for stream.
-  Auth via query param (Google's public API style) — no OAuth.
-  Roles map: system → `system_instruction.parts[*].text`, assistant
-  → "model", user/tool → "user". `Stream` parses `alt=sse` events;
-  each event carries a full `{candidates:[{content:{parts:[...]}}]}`
-  fragment, NOT a delta type like Anthropic. `probeGemini` in
-  checkup sends a 1-token generateContent ping to verify auth + model
-  in one round-trip. Wired into NewFromEnv, doctor probe,
-  cmd/config.go's known keys, web config form's groupings, README,
-  .env.example, and docs.html.
-- **Chat agent has tool use (`internal/agentctx/chat.go`).** The web
-  and Telegram chat handlers no longer call `LLM.Generate` directly —
-  they delegate to `agentctx.ChatTurn`, which runs an LLM↔tool loop
-  with up to `maxChatToolIterations=3` iterations. The LLM emits a
-  single JSON line on stdout to invoke a tool; everything else is
-  treated as the final prose answer. `parseToolCall` strips a leading
-  ```json fence if the model adds one. Tools:
-    - `jira_search` (read JQL, requires `boards.Searcher`)
-    - `jira_comment` (always available on any `boards.Board`)
-    - `jira_transition` (always available)
-    - `jira_update` (requires `boards.Updater`)
-  Read results feed back as `SEARCH RESULTS` system messages; writes
-  feed back as `ACTION OK …` or `TOOL ERROR …` so the LLM knows
-  what happened and can confirm in prose on the next turn. Search
-  hits are persisted into `Memory.SeenTicket` so the next /tickets
-  call sees them too.
-- **Two new optional board interfaces** (`internal/boards/board.go`):
-  `Searcher{Search(ctx, query, limit)}` and `Updater{Update(ctx, id,
-  TicketPatch)}`. Both are optional companions to the base `Board`
-  interface; non-implementing boards degrade gracefully (the tool
-  loop surfaces "not supported" to the LLM). `Mock` implements both
-  and records calls in `Mock.Searches` / `Mock.Updates` for tests.
-- **Jira Transition is now real** (`internal/boards/jira.go`). The
-  former stub returning `nil` is replaced with the proper two-call
-  Jira flow: GET `/rest/api/3/issue/{key}/transitions` lists the
-  project's workflow-defined transitions, then POST with the
-  best-matched transition id. Matching prefers `to.name → MapStatus`,
-  falls back to `transition.name → MapStatus`, and on no match
-  returns an error listing what WAS available so the chat agent can
-  show the user the choices.
-- **Jira Update** (`internal/boards/jira.go::(*Jira).Update`) is the
-  Updater implementation — PUT `/rest/api/3/issue/{key}` with a
-  `fields` object holding the diff. Description is wrapped in
-  minimal ADF (same shape as Comment). `TicketPatch` uses
-  pointer-to-string for Title/Description so nil = leave alone vs
-  non-nil = set; `Labels []string` uses nil-vs-empty-slice for the
-  same distinction.
-- **Pause/resume control surface.** Three drivers, one source of truth.
-  `Memory.Status.Paused bool` is flipped by `goon pause` (cmd/pause.go),
-  the web UI's POST `/api/daemon/pause` (renders the alternate
-  resume button so the htmx swap is non-destructive), and the
-  Telegram bot's `/pause` command. The daemon's `pollAndRun` checks
-  `IsPaused()` after `Reload()` every tick and skips the cycle. The
-  bot itself stays responsive while paused (it lives in the same
-  process as the daemon but on a different goroutine). `daemon.stop()`
-  clears the flag so a fresh `goon start` always starts un-paused.
-- **Per-project repo learning.** When the user confirms a repo at
-  the `confirm_repo` gate, `Memory.RecordRepoChoice(project, repo)`
-  persists it to `Memory.RepoChoices`. The next ticket from the same
-  project skips the gate via `lookupLearnedRepo` (env-explicit
-  `GOON_REPO_MAP` still wins, learned beats wildcard, raw project
-  name is last resort). `goon repo list|forget <project>|clear`
-  manages the cache. `Engine.pickRepoForTicket` is the priority-aware
-  resolver that replaces calls to the legacy `pickRepo()`.
-- **Rejected plans re-plan instead of failing.** Cycle-2/3:
-  `phaseApprovePlan` no longer returns WFFailed on a non-yes answer.
-  Instead it stores `Approvals["replan_feedback"] = ans`, sets
-  `Plan = nil`, `Stage = "triage"`, and returns errPaused. The
-  daemon's `ResumableWorkflow()` was extended to pick up workflows
-  in `WFTriaging` with `replan_feedback` set, so re-plans cycle
-  through the daemon naturally. `triageWithFeedback` weaves the
-  feedback into the next prompt under a `PREVIOUS PLAN WAS REJECTED`
-  block. The approve_plan question text includes
-  `"REVISED plan (attempt N)"` so `FindAnswer` can't auto-replay
-  the previous "no". Capped at `maxRePlans = 3` rejections before
-  the workflow gives up with WFFailed. Tests:
-  `TestEngine_RejectedPlanRePlansWithFeedback`,
-  `TestEngine_RejectedPlanGivesUpAfterMaxRePlans`.
-- **Question history cap.** `maxQuestions = 500` in
-  `internal/memory/memory.go`. `pruneQuestions` evicts oldest
-  answered first, never drops pending. Re-plan loops + months of
-  uptime would otherwise unbound the slice.
-- **`/api/config` fires both triggers.** POST returns
-  `HX-Trigger: configChanged, statusChanged` so the header status
-  pill (which polls `statusChanged`) refreshes alongside the config
-  form's success panel. `fragTabConfig` deliberately does NOT listen
-  to configChanged — it would wipe the user's verify/save output.
-- **Telegram subprocess env scrub.** `runGoonCLI` strips every key
-  whose name ends in `_TOKEN`/`_API_KEY`/`_SECRET`/`_PASSWORD` plus
-  the explicit goon/atlassian secrets, before passing env to a
-  passthrough subprocess. Without this, a misbehaving CLI subcommand
-  could dump credentials to a Telegram chat.
-- **Dry-run lets read-only tools through.** Cycle-2:
-  `internal/executor/executor.go` now only short-circuits dry-run
-  for `isMutating` tools. `read_file`, `list_dir`, `memory_read/list/search`,
-  and friends execute even in dry-run so the LLM has real data to
-  reason about. Without this, a fresh user typing `goon "summarize
-  the .go files"` got hallucinated answers.
-- **`/start` Telegram convention** is special-cased in
-  `internal/telegram/commands.go::handleCommand` — for already-auth'd
-  chats it sends a friendly greeting instead of "✗ command not
-  allowed." Tests: `TestBot_StartIsFriendlyForAuthenticated`,
-  `TestBot_StartStillRequiresAuth`.
-- **Comprehensive `goon workflow init`.** Cycle-3:
-  `internal/workflow/config.go::starterConfig()` writes a
-  self-documenting starter with every hook key + populated educational
-  echo commands. `examples/workflows/` library: minimal,
-  engineering, engineering-stages, unattended, marketing-brief,
-  sales-lead.
-- **`internal/util` shared helpers.** `Truncate`, `EnvOr`, `ConfirmTTY`
-  live in `internal/util/util.go` and replace four-or-more in-package
-  duplicates each. Rule: util has stdlib-only imports (no `internal/*`
-  deps), so it can be imported from anywhere without cycles. If you find
-  a fourth duplicate of some helper, that's the bar to add it here.
-- **`memory.json` pruning caps (`internal/memory`).** Two new bounds to
-  stop unbounded JSON growth: `maxTicketSnapshots = 500` and
-  `maxTelegramAuth = 100`. `SeenTicket` evicts the oldest by `LastSeen`,
-  `AuthorizeChat` evicts the oldest by `AuthorizedAt`. Caps are
-  re-applied inside `flush()` after the disk-merge so a fresh process
-  loading an old (unbounded) memory.json gets cleaned up on first
-  write. New helper `Memory.PruneStaleAuth(maxAge time.Duration)` is
-  exposed for future admin commands. Tests:
-  `TestMemory_TicketsPrune`, `TestMemory_AuthorizeChatPrunesOldest`,
-  `TestMemory_PruneStaleAuth`.
-- **`goon doctor` ollama probe is no longer a liar.** When the Ollama
-  server is reachable but the configured `OLLAMA_MODEL` isn't pulled,
-  `probeOllama` now returns `OK = false` with a `run: ollama pull X`
-  hint. Previously it returned `OK = true` (server-reachable was good
-  enough) and the agent loop only discovered the missing model on first
-  generate(). The `git_host` check also distinguishes "no host
-  configured" (skipped, blue dot) from "no host but a board IS
-  configured" (skipped with a yellow ⚠ hint to set `GOON_GIT_HOST`).
-  `probeOllama` test was updated to assert `!OK`.
-- **`internal/checkup.newReq` no longer hides errors.** It used to
-  return `(*http.Request, error)` but every call site did `req, _ :=
-  newReq(...)` and then `req.Header.Set(...)` — a bad URL would crash
-  with a nil-pointer panic. `newReq` now returns a placeholder
-  non-nil request on error AND every call site checks the err and
-  returns the failure as a `Result.Detail`. Defensive-but-explicit.
-- **Inbound Telegram bot (`internal/telegram`).** When both
-  `TELEGRAM_BOT_TOKEN` and `GOON_TELEGRAM_SECRET` are set,
-  `cmd/start.go::startTelegramBot` spins up a long-poll goroutine. Auth is
-  a single shared secret: users DM `/auth <secret>` once, the chat ID is
-  saved via `Memory.AuthorizeChat`, and from then on all messages from
-  that chat are accepted. `/logout` revokes. Surface: `/help /status
-  /logs /workflows /memory /queue /answer /run /whoami /logout` plus a
-  GitHub-only PR review flow (`/prs /review /approve /decline /comment`)
-  and full CLI parity for everything else (a `/<subcmd>` not in the
-  builtin/disallow lists shells out to the goon binary at
-  `os.Executable()`). Plain text → LLM chat with a 6-turn rolling history
-  per chat (in-process; lost on restart). Disallowed commands:
-  `start, stop, uninstall, update`. New schema: `memory.ChatAuth`,
-  `Memory.AuthorizeChat / IsChatAuthorized / TouchChat / RevokeChat /
-  AuthorizedChats`. Tests in `internal/telegram/bot_test.go` use a fake
-  Telegram server (`httptest`).
-- **`githost.PRReviewer` companion interface.** `internal/githost/githost.go`
-  now exposes `PRReviewer` with `ListPRs / GetPRDetails / CommentPR /
-  ApprovePR / RequestChangesPR`. GitHub implements it (added in
-  `github.go`). Mock implements it (used by bot tests). Hosts that don't
-  implement it gracefully degrade — the bot's PR commands report
-  "PR review unsupported on the configured git host". `PR` struct grew
-  `Author`, `State`, `Body`, `Repo` fields. New env var
-  `GOON_REVIEW_REPOS=owner/a,owner/b` provides the default repo set when
-  `/prs` is called without args.
-- **Approval-gated workflow as the new default.** `internal/workflow/workflow.Run`
-  is now a resumable state machine: `triage → confirm_repo → approve_plan →
-  execute → test → verify → update_memory → open_pr → notify`. The two gates
-  use `ask_user`-style questions stored via `memory.AskQuestion` and pause the
-  workflow with `wf.State=WFAwaitingApproval` + `wf.Stage=<gate>` +
-  `wf.PendingQuestionID`. The daemon's `pollAndRun` checks
-  `Memory.ResumableWorkflow()` before fetching new tickets and resumes once
-  the user replies via `goon train` or the web UI. New `update_memory` phase
-  runs an agent task that asks the LLM to distil what it learned into the
-  markdown notes store (SOUL.md / topic notes) and append a HISTORY.md
-  line via `internal/learnings.Capture` — failures here are non-fatal. Set `cfg.AutoApprove: true` in workflow.json or env
-  `GOON_AUTO_APPROVE=1` to skip both gates for unattended runs (tests use
-  `Engine.AutoApprove = true` for the same reason). New states added to
-  `internal/memory`: `WFAwaitingApproval`, `WFUpdatingMemory`. New fields
-  on `memory.Workflow`: `Stage`,
-  `PendingQuestionID`, `Approvals`. New helpers: `Memory.OpenWorkflowFor`,
-  `Memory.ResumableWorkflow`. Tests in `internal/workflow/workflow_test.go`
-  (TestEngine_PausesAtConfirmRepoGate, TestEngine_ResumesAfterApproval,
-  TestEngine_RejectedPlanFailsWorkflow) and `internal/daemon/daemon_test.go`
-  (TestDaemon_ResumesPausedWorkflow).
-- **Per-project storage at `./storage/`** replaces the old `~/.goon/`
-  global directory. Centralized in `internal/storage` (Root + Path).
-  Logs, `memory.json`, the markdown notes dir, and the PID file all
-  derive from `storage.Root()`. Workflow defaults to `./workflow.json`
-  at the repo root. Legacy paths (`~/.goon/...`, `.goon/workflow.json`)
-  are read for backwards compat but never written. Tests in
-  `internal/storage/storage_test.go`, `internal/notes/notes_test.go`
-  (TestNew_FallsBackToStorageRoot), and `internal/workflow/config_test.go`
-  (TestLoadConfig_RepoRootWins, TestDefaultConfigFilePath_RepoRoot).
-- **Workflow `name` + `description` fields** were added so `goon start`
-  prints the active workflow on its first stdout line, and every
-  per-ticket `workflow.start` log includes it. Default name is `"default"`.
-- **`workflow.Announce(repoDir, w)`** is the helper that prints +
-  logs the loaded workflow at startup. Call it from any new entry point.
-- **SOUL.md is auto-injected into `agent.SystemPrompt`.** Located at
-  `./storage/memory/SOUL.md` (or `$GOON_MEMORY_DIR/SOUL.md`).
-  Whitespace-only files are treated as absent — no empty banner.
-  Renamed from PINNED.md for clarity — `notes.Store.Soul()` still
-  reads the legacy `PINNED.md` filename transparently, and
-  `SeedSoulTemplate()` auto-renames PINNED.md → SOUL.md on first
-  call (one-shot migration). `notes.PinnedFilename` and `Store.Pinned()`
-  are kept as deprecated aliases so out-of-tree code keeps compiling.
-- **personal.md was folded into SOUL.md.** Previously goon shipped two
-  always-loaded files — `personal.md` for character/voice and `SOUL.md`
-  for project knowledge. Users found the split confusing ("which one
-  do I edit?"). SOUL.md now holds both halves in one file, with the
-  default template carrying a `## Character` section and a `## Project
-  knowledge` section side-by-side. On boot, `notes.Store.MergePersonalIntoSoul()`
-  detects a pre-existing `./storage/personal.md`, prepends its content
-  into SOUL.md under "## Character (migrated from personal.md)" behind
-  a dated banner, and renames the original to `personal.md.bak` so the
-  user can verify the migration. The `internal/personal` package is a
-  deprecated empty stub now — nothing imports it. Telegram `/personal`
-  command became a one-line redirect pointing at `/knowledge` /
-  `/memory edit SOUL.md`. Web Memory tab dropped the Personal segment;
-  Knowledge tab (SOUL.md card) covers everything that used to be there.
-  Env var `GOON_PERSONAL_FILE` removed from `.env.example`.
-- **REPOSITORY.md is the canonical "where do my repos live" file.**
-  Lives at `./storage/memory/REPOSITORY.md`. Markdown table format:
-  `| Remote | Local | Notes |`. Read by `triageWithFeedback` so the
-  LLM can suggest specific repos by name (the prompt embeds the raw
-  body verbatim). Read by `buildRepoCandidates` so the confirm_repo
-  gate's menu starts with the user's hand-curated list, then layers
-  workspace + git-host repos underneath. The new `parseTriage` schema
-  adds `needs_repo` (bool) + `repos` (array) so the LLM can:
-  (a) classify a ticket as not needing a repo at all — research/docs/
-  comms work skips confirm_repo + test + open_pr entirely; (b) pre-
-  pick one or more repos that the gate then surfaces as `→ marked`
-  recommended picks. Persisted on the workflow as `*bool NeedsRepo`
-  (nil = legacy/pre-feature → assume true). Helpers: `memory.WorkflowNeedsRepo(wf)`,
-  `repository.Lookup(name)`, `repository.RawBody()`, `repository.SeedDefault()`.
-  CLI surface: `goon repo show/edit/scan/add` for REPOSITORY.md;
-  `goon repo list/forget/clear` for the legacy learned mappings in
-  memory.json. Auto-seed runs alongside personal/SOUL on first boot.
-- **Repo selection is now strictly per-ticket.** The old
-  `Memory.RepoChoices` cache (project key → single repo, written
-  after a confirm_repo gate, read on every subsequent ticket to
-  auto-skip the gate) was the bug behind "ENG-1 and ENG-2 forced to
-  the same single repo." It's gone from the runtime hot path:
-  `phaseConfirmRepo` no longer calls `lookupLearnedRepo`, no longer
-  calls `rememberRepo` after a confirm, and `pickRepoForTicket` no
-  longer consults `Memory.LookupRepoChoice` (it's just a soft hint
-  built from `GOON_REPO_MAP` + ticket project key now). The
-  `Memory.RecordRepoChoice` / `LookupRepoChoice` / `ForgetRepoChoice`
-  methods + `memory.json` storage stay so legacy state loads cleanly
-  but nothing writes fresh entries. `goon repo list / forget / clear`
-  print a deprecation banner pointing at REPOSITORY.md and will
-  silently drop any stale legacy entries the user wants cleared.
-  The gate fires for EVERY ticket where `needs_repo=true` and
-  autoApprove is off — each ticket gets its own multi-select.
-- **Self-improvement loop (`internal/learnings`).** Every successful
-  `agent.Run` from the one-shot CLI path now goes through
-  `learnings.Capture(ctx, opts)` which (a) appends a single
-  `YYYY-MM-DD HH:MM · task · outcome` line to `./storage/memory/HISTORY.md`
-  and (b) fires a short follow-up agent task asking the LLM to distil
-  durable knowledge into SOUL.md / topic notes via the existing
-  `memory_*` tools. Same helper is called by `workflow.phaseUpdateMemory`
-  so the daemon path and the one-shot path share one rule for what
-  "remembering" means. Opt out with `GOON_AUTO_LEARN=0`. The mock LLM
-  provider auto-skips the distillation step so tests stay fast and
-  hermetic; HISTORY.md still gets the entry. The agent's system
-  prompt mentions HISTORY.md so the LLM knows to consult it before
-  re-trying something that's already been attempted.
-- **`memory_*` tools share a single `notes.Store`** via `RegisterMemoryTools()`
-  in `internal/tools/memory.go`. Don't construct stores per-call.
-- **Path safety in notes:** rejects absolute paths, any literal `..`
-  segment in the raw input (before `filepath.Clean`), and resolves
-  must end up inside the store root. Tests in `internal/notes/notes_test.go`.
-- **Atlassian env vars are unified.** `ATLASSIAN_BASE_URL` /
-  `ATLASSIAN_EMAIL` / `ATLASSIAN_API_TOKEN` cover both Jira and
-  Confluence; `JIRA_*`/`CONFLUENCE_*` per-product vars override.
-  Helper: `internal/atlassian.Jira()` and `.Confluence()`.
-- **Jira search uses `/rest/api/3/search/jql`** (Atlassian CHANGE-2046
-  removed `/rest/api/3/search`). Pagination is cursor-based via
-  `nextPageToken` / `isLast`. Don't auto-paginate — daemon picks one
-  ticket per tick anyway.
-- **`go run . goon workflow init` is fixed** — root.go strips a
-  redundant leading `"goon"` arg with a one-line hint to stderr. Tests
-  in `cmd/root_test.go`.
-- **Windows is a supported platform.** Cross-platform shells go through
-  `safety.ShellCommand(ctx, cmd)` (new helper in `internal/safety/shell.go`)
-  which picks `sh -c` on POSIX and `cmd /C` on Windows. Both
-  `internal/workflow/hooks.go::runOne` and `internal/tools/run_command.go`
-  call it instead of hard-coding `sh`. `cmd/pidfile.go::processAlive`
-  branches on `runtime.GOOS`: Unix keeps the signal-0 probe; Windows uses
-  `os.FindProcess` (which actually opens a handle on Windows and fails
-  for missing pids) plus a 24h pid-file mtime backstop against pid reuse.
-  `cmd/stop.go::stopSignal` returns `os.Interrupt` on Windows (translated
-  to `CTRL_BREAK_EVENT`) and `SIGTERM` elsewhere. `internal/memory/lock_windows.go`
-  is no longer a no-op: it implements multi-process locking using
-  `os.OpenFile(... O_CREATE|O_EXCL ...)` on a sibling `.lock` file, with
-  50ms backoff up to a 5s deadline and a 2-minute stale-lock eviction.
-  Same `lockFile(path) (release, err)` API as `lock_unix.go`.
+**Google Workspace agent — Phase 0+1 (OAuth + Calendar/Tasks chat tools).** Ask goon "what meetings today / what are my tasks". Zero-dep (stdlib net/http + encoding/json — NO google.golang.org/api, NO x/oauth2). New `internal/google`: `oauth.go` (authorize URL + code/refresh-token exchange, `ReadonlyScopes` = calendar/tasks/gmail/logging readonly), `client.go` (`Client` caches+refreshes access token, `getJSON`/`postJSON`, `NewFromEnv`/`Configured`), `calendar.go` (`EventsToday`/`EventsBetween`), `tasks.go` (`TasksList`). Auth: new `goon google auth` (`cmd/google.go`) runs a localhost:8765 OAuth callback, saves `GOOGLE_OAUTH_REFRESH_TOKEN` via `envstore.Set`; registered in root.go. Chat wiring (`internal/agentctx`): `google_tools.go` (`execCalendarToday`/`execTasksList`) + `chat.go` (`validActions` + dispatch + manifest gated on `googleConfigured()`). Config keys `GOOGLE_OAUTH_CLIENT_ID/SECRET/REFRESH_TOKEN`(sensitive) + `GOOGLE_CLOUD_PROJECT` in cmd/config.go + web. `ExchangeCode` returns `(refresh,access string,err)`. Next (GOON_AGENT_GOOGLE_PLAN.md): Gmail, then `internal/gcplog`+`gcp_log_search` (needs GOOGLE_CLOUD_PROJECT + the register/login log field shape). Gated GREEN via outputs/gocheck.py; run `go build ./... && go test ./internal/...`.
+
+**LLM HTTP timeout was 30s — too short for slow proxies (caused execute failures).** Live QA #2 with the LLM up: the pipeline ran correctly (executed in the right repo, plan steps advancing) but failed with `context deadline exceeded (Client.Timeout exceeded while awaiting headers)`. Root cause: the proxy answers a small probe fast but takes >30s to return headers on real execute-sized prompts, and openai/anthropic adapters used a 30s `http.Client{Timeout}` (inconsistent: gemini 60s, ollama 120s). Fix: unified `httpTimeout()` in `llm/retry.go` (default 120s, env `GOON_LLM_HTTP_TIMEOUT_SEC`, 1–600) applied to ALL four adapters; removed each adapter's now-unused `time` import; registered the key in cmd/config.go + web keys + advKeys. Needs rebuild. Daemon left paused so the 30s binary doesn't pile up failures overnight. Gated GREEN via outputs/gocheck.py.
+
+**Reliability + autonomy fixes from live QA (B1–B6).** After driving real tickets to execute and finding every failure traced to the LLM proxy: (B1) LLM retry already exists — `llm/retry.go doWithRetry` does 3× backoff on transport+429/5xx; no change. (B2) `parseTriage` now guards with `looksLikeProviderError(raw)` (auth/rate-limit/non-JSON/empty → clear "LLM returned no plan — …" message instead of "steps array is empty"); `TestParseTriage` still passes (every success case has `{`, `not json` still errors). (B3) each execute step bounded by `executeStepTimeout()` (default 10m, `GOON_EXECUTE_STEP_TIMEOUT_MIN`) via `context.WithTimeout` in `phaseExecute` so a hung LLM/command can't wedge "executing". (B4) the daemon "re-pause" was the circuit breaker self-pausing on the persistently-dead proxy — working as designed; manual resume clears it. (B5) `GOON_AUTO_APPROVE_PLAN=1` → `autoApprovePlanEnabled()` auto-accepts the plan while confirm_repo still gates → user's only actions become set-repo + approve-PR; config key registered (cmd/config.go, web keys, advKeys). (B6) after a resume, if `ResumableWorkflow()` reports more, the daemon `Wake()`s itself to drain a bulk-approve fast instead of waiting PollInterval. All gated GREEN via outputs/gocheck.py; run `go build ./... && go test ./internal/...`. Live finding: goon's pipeline is functionally correct end-to-end (repo gate→plan→execute-in-repo); PRs were blocked ONLY by the unreliable `127.0.0.1:3456` LLM proxy.
+
+**CRITICAL: agent now runs INSIDE the selected repo (was goon's launch dir).** QA-found root cause that made multi-repo goon useless: `executeStep` → `agent.Run` → `run_command` used `safety.ShellCommand` with NO `cmd.Dir`, and `search_code` defaulted to `os.Getwd()` — so the agent edited/greppped GOON'S OWN code for every ticket regardless of the chosen repo, then `open_pr` pushed an unchanged target repo → empty/garbage PR. (`runTests` already `cd <repo> && …`, so only execute was wrong — inconsistent.) Fix via context-threaded workdir (NO global `os.Chdir`, which would break the web server + daemon): new `tools.WithWorkDir(ctx,dir)`/`tools.WorkDirFrom(ctx)` (tools/workdir.go); `run_command` sets `c.Dir` from it; `search_code` root falls back to it; `agent.Snapshot(workDir,…)` shows the LLM the right cwd+files; `executeStep(ctx, repoDir, …)` sets the workdir when `isLocalCheckout(repoDir)`; `phaseExecute` passes `wf.Repo`. Now the chosen local checkout (incl. auto-cloned remotes) is where the agent actually works. Single caller of each changed sig updated; no test calls `Snapshot`/`executeStep`. Needs rebuild — do NOT trigger a live workflow run on the OLD binary (it still edits goon's dir). Gated GREEN via gocheck; run `go test ./internal/agent/... ./internal/tools/... ./internal/workflow/...`.
+
+**Light-mode contrast pass (QA).** Validated live in `html.light` and found dark-mode-only colors that were invisible/low-contrast in light mode. Fixed: the banners I'd added (needPick "N workflows need a repo", stuck, dead-end recovery, Home health banner) used `text-amber-200`/`text-rose-200`/`text-rose-300` (light text for dark bg) → now adaptive `text-amber-700 dark:text-amber-300` etc. (tinted bg like `amber-500/5` is light in BOTH themes, so text must flip). Onboarding "Get goon running" title + step labels `text-white` → `text-ink`. SYSTEMIC input bug: form inputs used `bg-surface text-white` → you typed invisible white text in light mode; replaced with `bg-surface text-ink` (repo map/clone forms, learning answer textarea). Surface-text `text-white` spans → `text-ink`: Setup section headers (`sectionHead`), repo list ("No repositories yet", tracked count, repo row name, remembered-rule repo), learning-question card title/body. Rule of thumb confirmed (CLAUDE.md): `text-white` on a COLORED button (`bg-accent text-white`) STAYS white; `text-white` on a surface/input becomes `text-ink`. `text-ink`/`text-muted` are the adaptive CSS-var colors. Remaining (next cycle, needs live light pass): `text-gray-200`/`text-gray-100` used as primary text in some inputs/fragments are low-contrast in light mode. Gated GREEN via gocheck.
+
+**Local tickets are now first-class daemon work (first-run activation fix).** Strict-review finding: `LocalTicket` (UI "create a ticket", no external board) said in its own doc-comment it "can be fed to the workflow engine" — but `nextTicket` only iterated `board.List`, so created local tickets were NEVER worked. Dead-end = the #1 activation killer. Fix in `internal/daemon/daemon.go`, ADDITIVE so the Jira path is byte-identical when no local tickets exist: `local := Memory.ListLocalTickets()` each poll; the `prov==nil||board==nil` guard relaxed to `prov==nil || (board==nil && len(local)==0)`; `board.List` wrapped in `if board != nil`; local tickets appended via `localToTicket(lt)` (Source "local", Status `boards.Status(lt.Status)`, empty Project); resume path uses `resolveTicket(ctx, board, id)` (local-first, else `board.Get`). Re-pick guarded by `HasCompletedWorkflowFor`. Net: a user with ONLY an LLM can create a local task and goon runs it; a non-code (needs_repo=false) task needs no git host → instant first value. Onboarding: `boardReady` now true when ≥1 local ticket exists; step reworded to "Give goon work to do — board OR local ticket"; added "+ Create a task" CTA. Gated GREEN via outputs/gocheck.py; run `go build ./... && go test ./internal/daemon/... ./internal/web/...`.
+
+**Diff preview (trust surface) + static "CI" gate.** (1) New `/fragments/workflow-diff?id=<wf>` (`handleWorkflowDiff` in actions.go): read-only git via `safety.ShellCommand` — `git -C <repo> log --oneline -n 12`, working-tree `diff`, and `show --stat --patch HEAD`, split on a sentinel into "recent commits / uncommitted changes / latest commit" sections (16 KB cap each), degrading gracefully when there's no local checkout or no changes. Surfaced as a lazy-loaded "⌥ view changes (git diff)" `<details>` in `fragWorkflowDetail` (shown once a repo is selected). No base-branch guessing (robust across repos). (2) Process note after a duplicate-decl build break (`ForgetRepoChoice` already existed): added `gocheck.py` (in outputs) — a no-toolchain static gate that flags unbalanced braces/parens, duplicate func decls per dir (ignoring platform build-tagged pairs like lock_windows/unix), and unused imports. Run it after every edit; the real gate is still the user's `go build`. Discipline: grep-before-add any new symbol.
+
+**Per-project repo rules — explicit, opt-in (NOT the removed auto-learn cache).** Iteration after auto-clone: kill the "goon keeps asking the same repo" friction without reviving the deprecated auto-cache (whose regression guard `TestEngine_PhaseConfirmRepoDoesNotLearnPerProject` must still pass). Mechanism: the confirm_repo picker has a "remember for this project (auto-confirm next time)" checkbox; ticking it makes `goonPickToggle` prefix the answer with `remember ` (button reads "use pick + remember →"). `phaseConfirmRepo` parses+strips that prefix, and AFTER `ensureReposCloned` resolves the pick to a LOCAL path, calls `Memory.RecordRepoChoice(t.Project, localPath)` (single pick only). On a FRESH entry (no pending question) it checks `Memory.RepoChoiceFor(t.Project)`; if the remembered path is still `isLocalCheckout`, it auto-confirms (`ensureApproval "auto:project-rule"` → WFPlanning) and skips the gate. Because recording only happens on the explicit opt-in, a normal "yes" still records nothing → the regression test stays green. Safety valve: remembered rules are listed on the Repositories tab (`RepoChoices()` map) each with a "forget" button → `/api/repo/forget-rule` → `Memory.ForgetRepoChoice`. New memory methods: `RepoChoiceFor`, `ForgetRepoChoice` (reuse the existing legacy `RepoChoices` map + `RecordRepoChoice`). Verified brace/arg balance; run `go test ./internal/workflow/... ./internal/web/... ./internal/memory/...`.
+
+**Auto-clone-on-pick — the last link to a real PR.** Picking a remote-only repo at confirm_repo could never reach a PR (no local checkout for execute). New in `internal/workflow/workflow.go`: `ensureReposCloned(ctx, wf, candidates)` runs at the end of the gated `phaseConfirmRepo` path — for each picked repo that (a) isn't already a local checkout AND (b) came from an `IsRemote` candidate, it `git clone`s into `cloneRoot()` (`GOON_WORKSPACE_DIR` else `./repos`), maps remote→local in REPOSITORY.md (`repository.Add`), and rewrites `wf.Repos`/`wf.Repo` to the local path. Helpers: `ensureRepoCloned`, `cloneURLFor` (RepoLister `r.URL` → else host-typed guess: bitbucket.org/gitlab.com/github.com), `isLocalCheckout` (dir has `.git`), `cloneRoot`, `shellQuoteArg`; clone goes through `safety.Default().Validate` + `safety.ShellCommand` (5-min budget), git uses the machine's existing auth. Deliberately scoped to REMOTE candidates only — arbitrary/triage-supplied paths (e.g. tests' `/r/eng`) are left untouched so `TestEngine_PhaseConfirmRepoDoesNotLearnPerProject` and the auto-approve tests still pass (auto-approve path NOT touched). Verified brace/arg balance; run `go test ./internal/workflow/...`.
+
+**THE big one — gate() answers were matched by question TEXT, so they never stuck.** Live-validated root cause of "workflows wedge / can't be answered / q-IDs keep climbing": `gate()` resolved a resumed answer via `Memory.FindAnswer(t.ID, question)` — matching the full question BODY, which embeds the live repo-candidate list (100 repos). Any shift in that list between asking and resuming meant the stored answer didn't match → goon asked a BRAND-NEW question every tick (q-36→q-39…), so answers were silently lost and confirm_repo never advanced. Fix: `gate()` now resolves the EXISTING `wf.PendingQuestionID` BY ID first — answered→consume & advance; still-pending→stay paused (no duplicate); vanished→re-ask once. Text-match kept only as a legacy fallback. This is what actually makes answering work end-to-end. Needs rebuild. (Verified live on the old binary: "use pick" submitted fine — toasts fired — but EB-5109 came back as a fresh q-39 with repos=["EB"], proving the text-match miss.) Also confirmed a deeper gap: the pipeline does NOT auto-clone the chosen REMOTE repo before `execute`, so picking a remote-only candidate can't reach a real PR — the repo must be cloned+mapped (Repositories tab) and the LOCAL candidate picked. Auto-clone-on-pick is the next feature to close. Plus this round: dead-end recovery box + bulk `/api/workflow/reset-stuck` (resets WFAwaitingApproval whose question is gone), removed the redundant "reject" button (picker is the sole action), `monitoredRepoSet()` scoping of git-host candidates to `GOON_REVIEW_REPOS`. Run `go test ./internal/workflow/... ./internal/web/...`.
+
+**confirm_repo picker: fix "use pick" (no enclosing form), scope to monitored repos, add workflow reset.** Three live-validated complaints. (1) **"use pick" did nothing** — `renderRepoPickButtons` emits a `<button type=submit name=answer>` but it was printed OUTSIDE the `/api/answer` `<form>` in `fragWorkflowDetail`, so clicks no-op'd. Fix: restructured the detail so ONE answer form wraps the picker + actions. When a picker is present we show the picker's own submit + a single "reject" (no redundant yes/send that confused users); the free-form yes/no/send path is kept only for non-picker gates (approve_plan). (2) **100-repo flood** — `buildRepoCandidates` now scopes git-host repos to the MONITORED set via new `monitoredRepoSet()` (parses `GOON_REVIEW_REPOS`); when that env is unset it still lists everything (so the gate isn't empty for un-curated users). Curate via Repositories tab → "manage which repos goon follows". (3) **Reset from start** — new `/api/workflow/reset` (`handleWorkflowReset`): cancels the pending question, clears Stage→triage/State→WFTriaging/Plan/Repo/Repos/NeedsRepo/Approvals/Error/PRURL/Note/VerifyRuns, `UpsertWorkflow`, wakes the daemon → re-runs the ticket from triage (OpenWorkflowFor returns it since WFTriaging is non-terminal). Surfaced as a "↻ reset from start" button (hx-confirm) in the detail meta strip. NOTE: served from the compiled binary — needs `go build` + restart. Verified brace/arg balance; `renderRepoPickButtons` only used in fragWorkflowDetail (+unit tests, unchanged) so no nested-form risk. Run `go test ./internal/web/... ./internal/workflow/...`.
+
+**confirm_repo "Suggested: EB" garbage + honest bulk-approve.** Live bug: 36 workflows parked at confirm_repo all showed "Suggested: EB" / "primary repo: EB" (EB = the Jira *project key*, not a repo) and the bulk banner promised "approve all suggested repos" with no real suggestions — accepting would commit garbage. Root cause: `phaseConfirmRepo` set `wf.Repo = e.pickRepoForTicket(t)` which returns `t.Project`. Fixes: (1) `phaseConfirmRepo` now treats `wf.Repo == t.Project` as "no suggestion" (clears it), builds candidates first, and defaults to the sole candidate only when exactly one exists (single-repo setups) — otherwise leaves it blank for an honest pick. The `isYes` branch now ERRORS ("no repo selected …") instead of silently proceeding with an empty repo. `pickRepoForTicket` kept returning `t.Project` (still used by triage hint + auto-approve fallback + asserted by `TestPickRepoForTicket`; the gate path no longer relies on it). (2) Web: new `projectKeyOf(ticketKey)` ("EB-4232"→"EB"), `repoSuggestionFor(wf)` (real suggestion or "" when it's just the project key), `stripBogusSuggestedLine`. `fragWorkflows` banner now splits into "N have a suggested repo → Accept all suggestions" (only when >1 real) vs an amber "M workflows need a repo — pick one" (no fake approve). `handleAnswerAll` skips confirm_repo workflows with no real suggestion (reports "accepted N · M skipped"). Detail view hides "primary repo" when it equals the project key and strips the stale "Suggested: EB" line. NOTE: served from the compiled binary — needs `go build` + restart to see. Verified brace/arg balance + that existing workflow tests (`TestPickRepoForTicket`, `TestEngine_PhaseConfirmRepoDoesNotLearnPerProject`, `workspace_test`) still hold; run `go test ./internal/workflow/... ./internal/web/...`.
+
+**Provider circuit breaker + backoff + health widget (Section 4 of GOON_IMPROVEMENT_PLAN).** Daemon now degrades gracefully when a provider/board is down (observed: triage hammering a dead `127.0.0.1:3456` proxy 10×). `memory.DaemonStatus` gained `ConsecutiveFails`/`NextRetryAt`/`ErrorClass`/`AutoPaused`. `pollAndRun` is now `pollAndRun(ctx, forced bool)`: scheduled ticks (`forced=false`) respect a backoff window; startup/wake/RunOnce (`forced=true`) bypass it. New daemon helpers: `backoffDelay` (exp 30s→cap 15m), `classifyProviderError` (network/auth/rate_limit/model/other + `infra` bool), `recordFail(class,msg)` (bumps counter, sets `NextRetryAt`, self-pauses **only on infra classes** after `maxConsecutiveFails=5` — config-class never auto-pauses so onboarding isn't bricked), `recordSuccess`, `afterRun(runErr)` (clears on clean/non-infra ticket failure, trips on infra), `humanizeUntil`. Wired: config-missing→`recordFail("config",…)`; `board.List` err→classify+`recordFail`; resume+pick paths→`afterRun`; idle/blocked branches→`recordSuccess` (NOT after `board.List`, else a provider-down-during-run would reset every tick and never trip). `memory.SetPaused(false)` now clears the whole breaker so manual resume always takes effect; `handleDaemonResume` now calls `Wake()` for instant retry. Web Home: always-on health widget (`healthPill` ×4: LLM/Board/Git host/Daemon, green/amber/red/gray) + richer failure banner (error-class chip, `errorClassHint` plain-English fix, "attempt N · next retry in Xs", "paused itself" + Resume button when `AutoPaused`). Readiness booleans hoisted to top of `fragTabDashboard` and shared with the first-run card. Verified brace/arg balance only (the lone `'('` rune literal is a counter false-positive) — run `go build ./... && go test ./internal/daemon/... ./internal/memory/... ./internal/web/...`.
+
+**Repositories PR filter — Bitbucket target-branch fix.** Filtering "Open pull requests" by target branch hid every row on Bitbucket repos. Root cause: `bbPRDetail` never decoded the PR's `destination.branch.name`, so `PR.Base` was empty and the client-side filter (`data-base` on each row, in `handleRepoDetail`) matched nothing. Fix: added `Destination` to `bbPRDetail` and set `Base` at all four PR-construction sites (ListPRs ×2, GetPRDetails, OpenPR uses `o.Base`). GitLab (`toPR` → `mr.TargetBranch`) and GitHub repo-path (`it.Base.Ref`) were already correct; GitHub's search/involves path still omits Base but the filter only renders in the repo-detail panel, which always uses the repo-specific list path. Regression test in `githost_test.go` (`TestBitbucket_ListPRs` asserts Base). Verified the bug live via Claude-in-Chrome (typing a branch hid all 20 PRs).
+
+**Workflow editor rebuilt: 2D canvas → guided step list** (`internal/web/server.go` `fragWorkflowConfig`). The node-graph canvas had a fatal drag bug (clicking a node ran selectNode→render→`g.innerHTML`, destroying the clicked element mid-pointerdown, then setPointerCapture on the dead node → pointerup lost → DRAG never cleared → node glued to cursor; reproduced live). Replaced the whole canvas (pan/zoom, SVG nodes, bezier edges, coordinate-based ordering) with a single-column numbered step list: click-to-expand accordion editor (reuses the full field renderer incl. routing/model under an "Advanced" `<details>`), reorder via drag handle AND up/down arrows (arrows are bug-proof), duplicate/delete, an always-visible "Add a step" zone (4 type buttons), Settings tab, undo (Ctrl+Z), template loader, inline validation. Order = array order (no coordinates), so the stuck-drag class is structurally gone. Backend/save/validate/templates unchanged. JS verified with `node --check`; no test asserts on editor HTML. NOTE: served from the compiled binary — needs `go build` + restart to appear.
+
+**Workflows-at-scale + first-run readiness card.** Two more dashboard/UX wins. (1) **Workflows list scales:** `fragWorkflows` now `sort.SliceStable`s by `workflowSortRank` (failed→awaiting→active→done) before the 50-cap, tags each card div with `data-wf-state` (`workflowStateKey`: failed/awaiting/active/done) + `data-wf-search` (lowercased ticket+title), and renders a filter bar (state chips with per-group counts + a search box) when >4 cards. Filtering is pure client-side JS (`goonWFFilter`/`goonWFSearch`/`goonWFApply` on `#wf-grid`), instant and SSE-re-render-safe; chips use Tailwind `data-[active=true]:` variants (CDN JIT supports them). (2) **First-run readiness:** `fragTabDashboard` renders a "Get goon running" checklist (LLM provider / board / git host(optional) / first ticket) that only shows when `!(llmReady && boardReady && activated)` — vanishes for configured instances, never nags. Helpers `llmConfigured()` (env/key check per provider; ollama needs none) + `firstTicketHint()`. Verified brace/arg balance only — run `go build ./... && go test ./internal/web/...`.
+
+**Approval-fatigue relief + provider-down banner + loading resilience.** Three UX fixes after observing a live instance stalled with 34 workflows parked at `confirm_repo`. (1) **Bulk approve:** new `/api/answer-all` (`handleAnswerAll`) answers every pending gate question whose workflow is at a given `stage` (default `confirm_repo`) with `"yes"` — behaviourally identical to clicking the green "yes" on each card, just N at once. Surfaced as an "Approve all repo confirmations" button on the Workflows fragment (banner when `repoWaiting>1`) and the Home "Blocking approvals" card (`dashRepoWaiting>1`). (2) **Opt-in auto-confirm:** `phaseConfirmRepo` now skips the gate when `GOON_AUTO_CONFIRM_REPO` is on AND triage produced a single repo that resolves via `repository.Lookup` (i.e. already in REPOSITORY.md). Off by default; narrower than `GOON_AUTO_APPROVE`. Helper `autoConfirmRepoEnabled()`. Config key registered in `cmd/config.go`, web `keys` table, and `advKeys`. (3) **Provider-down banner:** `memory.DaemonStatus` gained `LastError`/`LastErrorAt`; `daemon.setPollError/clearPollError` record poll-level failures (provider/board nil or unreachable, `board.List` error) and clear on a successful list. The Home dashboard renders a red banner with the error + "Open Setup" when `st.LastError != ""`. NOT auto-pausing (deliberate — recording+surfacing is the safe core). (4) **Loading resilience:** `index.html` sets `htmx.config.timeout=20000` and a global `htmx:timeout/responseError/sendError` listener replaces a GET fragment's stuck spinner with a retryable error box (skips POST forms via `requestConfig.verb`). Also renamed the Home stat card "pending questions" → "pending approvals" (it counts `PendingGateQuestions`). Verified by brace/arg balance only — no Go toolchain in sandbox; run `go build ./... && go test ./internal/web/... ./internal/workflow/... ./internal/daemon/...`. Strategy/positioning lives in repo-root `GOON_IMPROVEMENT_PLAN.md` + `GOON_POSITIONING.md`.
+
+**Streaming token metering + session anti-flicker.** Two follow-ups to the usage feature. (1) `Stream` now records tokens like `Generate` did: OpenAI sends `stream_options.include_usage` and reads the final usage chunk (`openAIStreamChunk.Usage`); `parseAnthropicSSE` and `parseGeminiSSE` now return `(text, prompt, completion, err)` — anthropic from `message_start`.input_tokens + `message_delta`.output_tokens (cumulative), gemini from `usageMetadata` on the last chunk — and the `Stream` methods call `usage.Global().Record`; ollama records on the `done` object. So chat (which streams) is now counted. Test call sites updated to the 4-return signatures; new parse-usage tests. (2) `usage` activities now LINGER: `EndActivity` sets `EndedAt` instead of deleting; `ActiveActivities()` keeps finished entries for `lingerWindow` (8s) and purges older — stops the dashboard flickering between an agent loop's back-to-back calls. `Activity.Running()` added; `fragSessions` renders lingering rows dimmed ("done"). Tests: `usage/activity_test.go` (linger), `llm/*_test.go` (SSE usage).
+
+**Live-sessions = in-flight model activity (not just the pool).** Original "Live agent sessions" card only read `agentpool.Global()` (spawn_agents subprocesses), so in-process model work (PR-review drafts, chat, workflow stages, reflection) never appeared — only token usage updated (it hooks the provider). Fix: `internal/usage/activity.go` adds an in-memory in-flight registry — `StartActivity(label, model)`/`EndActivity(id)`/`ActiveActivities()` + context helpers `WithLabel`/`LabelFrom`. Every provider `Generate` AND `Stream` brackets its call with `StartActivity(LabelFrom(ctx), model)` + `defer EndActivity` — same universal chokepoint as token tracking, so everything shows. Labels set at entry points: PR draft review (actions.go), chat (chat.go), daemon workflow runs (daemon.go, both resume + pick), standby reflection (reflect.go). `fragSessions` now renders ActiveActivities() (accent rows: label + model + elapsed) + pool queued/running children (sky rows). Caveat: in-flight = per-call, so multi-call agent loops can briefly flicker between calls (no linger added). Tests: `usage/activity_test.go`.
+
+**Token usage meter + dashboard cards** (`internal/usage` + web). New `usage` package: process-wide `Global()` `*Meter`, `Record(model, prompt, completion)`, `Snapshot()` (per-model, sorted by total desc), `Totals()`, persisted atomically to `./storage/usage.json`. Stdlib only; imports only `storage` so `llm` can import it without a cycle. Each provider's `Generate` parses its usage block and calls `usage.Global().Record(model, …)`: openai `usage.prompt_tokens/completion_tokens`, anthropic `usage.input_tokens/output_tokens`, gemini `usageMetadata.promptTokenCount/candidatesTokenCount`, ollama `prompt_eval_count/eval_count`. Mock unaffected (no usage block). Streaming (`Stream`, used by chat) not yet metered — Generate only (the daemon path). Dashboard (`fragTabDashboard`) gained two auto-refreshing cards: `fragUsage` (`/fragments/usage`, grand total + per-model table, 15s poll) and `fragSessions` (`/fragments/sessions`, live child agents from `agentpool.Global().List()` filtered to queued/running, 5s poll). `commafy` helper for token counts. Also corrected post-question-split: the dashboard's "Blocking questions" now reads `PendingGateQuestions()` and links to Workflows (was linking to the learning-only Questions tab). Tests: `usage/usage_test.go`, `web/usage_sessions_test.go`.
+
+**Standby self-learning + question split.** Goon now learns while idle. `memory.Question` gained a `Kind` ("gate" | "learning"; empty = gate for back-compat) + `IsLearning()`, plus `PendingGateQuestions()`/`PendingLearningQuestions()`. New daily reflection: `learnings.Reflect()` (reflect.go) runs an agent that reviews recent commits/HISTORY/notes, writes durable findings to `LEARNED.md` via `memory_append`, and calls `ask_user(kind=learning)` when unclear. Throttled by `memory.LastReflect()`/`SetLastReflect()` + `ReflectInterval()` (`GOON_LEARN_INTERVAL_HOURS`, default 24h); gated by `GOON_AUTO_LEARN`. Daemon hook: `maybeReflect()` runs in `pollAndRun`'s idle branch (pick==nil), skips if behind `maxOpenLearningQuestions=5`, 5-min timeout. Answering a learning question appends Q/A to `LEARNED.md` via `memory.AnswerQuestion` (memory now imports notes — no cycle; notes only imports storage). `LearnedFilename="LEARNED.md"` lives in the notes package. `ask_user` tool gained a `kind` arg (defaults: ticket/workflow set → gate, else learning); the workflow `gate()` sets Kind=gate. Web: **Questions tab = learning only** ("goon's questions for you", sky theme, textarea + skip, intro strip); **gate approvals stay on the Workflows tab** (workflow card's pending-question form). `fragQuestionsBanner` shows two distinct rows (amber gate→Workflows, sky learning→Questions). Tests: `memory/selflearn_test.go`, `learnings/reflect_test.go`. Config keys `GOON_AUTO_LEARN` + `GOON_LEARN_INTERVAL_HOURS` added to both tables.
+
+**`GOON_REPO_MAP` removed.** Vestigial after the REPOSITORY.md migration — it only seeded a soft triage hint and was NOT a determiner. Deleted `RepoMap()` + the dead `pickRepo()`; `pickRepoForTicket` now just returns `t.Project`. Pulled from `knownConfigKeys` (cmd/config.go), the web config table (server.go), `config.json.example`, README, and docs.html. `memory.RepoChoices` kept for backwards-compat (inert). Config-key audit (all keys grepped for real consumers): **no other key is orphaned** — every remaining config key has a live consumer, so nothing else was removed. `GOON_TICKET_STATUSES` is still live (daemon poll filter). Repo selection is now strictly: triage + REPOSITORY.md + the confirm_repo gate.
+
+**Parallel child agents** (`internal/agentpool`). `Pool` manages N child goon subprocesses in parallel. Each child gets an isolated `GOON_STORAGE_DIR` under `os.TempDir()/goon-pool-<pid>/<agent-id>/storage` so state never bleeds. Concurrency capped by a buffered semaphore channel (default 4, env `GOON_MAX_AGENTS`). Pool is a process-wide singleton via `agentpool.Global()`. Three LLM tools: `spawn_agents` (tasks=newline/pipe-sep list, wait=true/false, workdir, timeout), `agent_status` (id or all), `agent_cancel` (id). `Cleanup(age)` removes terminal agents older than age. `filteredEnv()` strips parent's `GOON_STORAGE_DIR` before injecting the child's. `isExitErr` avoids `errors.As` generic form for Go 1.21 compat.
+
+**Stage types `notify` + `http`** (`internal/workflow` config.go + runner.go). Declarative pipelines now have 4 stage types, not 2. Both reuse registry tools (zero new deps): `notify` renders `StageConfig.Message` → `Tools.Get("telegram")` (errors if unregistered; `on_error: continue` to soften); `http` renders `StageConfig.URL` → `fetch_url` tool (GET, https-only, capped) and stores the body under `.Stages.<name>`. New `StageType{Notify,HTTP}` consts + `{Message,URL}` fields + `runOne`/`validateStages` branches; `Validate()` inherits the rules. Editor: a single JS `TYPES` object drives palette/dropdown/node-colours/help; each type shows an inline `typeHelpBlock` (what/when/example), prompt-like fields show a `varHint`, `if`/`repeat` got helper text, and a "what's this?" toggle (`wgToggleHelp`) explains all types — fixes "users don't know what LLM/AGENT mean." Tests: `stage_types_test.go` (fake registry tools, no network).
+
+**Web pipeline editor rebuilt** (`internal/web/server.go` + `internal/workflow/templates.go`). Seeds from active pipeline or `workflow.BuiltinStageSeed()`. All StageConfig fields editable; "Workflow" tab for config-level fields + hooks. "Start from template" uses embedded `internal/workflow/templates/*.json`. Save calls `(WorkflowConfig).Validate()`. JS uses string concatenation only -- no backticks/`%` in the raw-string Fprintf. Tests: `templates_test.go`, `workflow_save_test.go`.
+
+**Configurable ticket status filter.** `GOON_TICKET_STATUSES` (default `open,in_progress`). `StatusUnknown` always included. `GITHUB_STATE` (default `open`) sets GitHub Issues `?state=` param. Both in `knownConfigKeys` and web Setup tab.
+
+**Repositories tab** replaces flat PR tab (`data-page="prs"` stays). Source of truth: REPOSITORY.md. Per-row: open-PR count, local-mapping status, notes. Click to expand: map-to-local form, clone-here form, PR list. Clone via `safety.ShellCommand` (5-min budget). SSE `repositoriesChanged` fires after map/clone. Routes: `/fragments/repositories`, `/fragments/repo`, `/api/repo/map`, `/api/repo/clone`.
+
+**Web UX pass round 2.** Pause button dispatches `CustomEvent('statusChanged')` after fetch (HTMX discards HX-Trigger on raw `fetch()`). Workflows tab config band (name, stage count, source path, auto_approve pill). Collapsible JSON editor POSTs to `/api/workflow/save` (validates + atomic write + SSE). `web.Options` gained `Workflow *workflow.Config + WorkflowPath string`.
+
+**Web UX pass (35-question audit).** Repo pill: `*` for suggested, `initialVisibleOthers=5`. `buildRepoGateQuestion`: renders "Suggested: X" only when `suggested != t.Project`. `stripRepoMenu` strips Reply/Triage prose. Workflow->Question jump via `goonJumpToQuestion`. Ticket transitions use `TransitionResolver`. PR row: chevron toggles + `goonPRRowToggle`. Active sidebar: 4px bar, `bg/0.18`, `font-weight:600`. `stripSoulMigrationBanner` in chat.go. `/fragments/tab-setup` alias added.
+
+**Proactive PR review + notifications** (`internal/review`). `ReviewRequester` + `Notifier` in githost. GitHub + GitLab + Mock implement both; Bitbucket only `ReviewRequester` (no inbox API). `review.Runner`: diff-hash dedup (`ReviewSeen` 500 cap) + `NotifSeen` (2000 cap). Delivery: CLI `goon review-prs`/`goon notifications` or Telegram auto-loop (`GOON_AUTO_REVIEW`/`GOON_AUTO_NOTIFY`, default OFF). Warning: Bitbucket `q=reviewers.uuid="..."` filter untested on real host.
+
+**PR tools in chat** (`internal/agentctx/pr_tools.go`). Tools: `pr_get`, `pr_list`, `pr_comment`, `pr_approve`, `pr_request_changes`. `parsePRReference` accepts URL or `owner/repo#number`. `githost.Reviewer{Name,State,Approved}` + `PR.Reviewers` added. `ChatTurnOptions` gained `Host githost.Host`.
+
+**"Draft with AI" button** on web PR list. `/api/pr/draft-review` calls `review.DraftReview`, writes draft into textarea. 3-min budget. No auto-posting.
+
+**Repo-pick UI for 100+ repos.** Cap 99->999. Sort suggested first. Typeahead filter. Overflow expander. Checked overflow pills graduate out.
+
+**`pr_review` smart diff.** `trimDiffSmart` emits DIFF DIGEST for diffs >18 KB (per-file +/- stats + fair head excerpts). `execPRReview` timeout 90s->3min.
+
+**Jira transitions by real name.** `boards.TransitionResolver{ListTransitions, TransitionByName}`. `matchTransition` uses normalised lowercase+alphanumeric (exact then containment). `jira_transitions` chat action lists available statuses. ACTION OK states real status name verbatim. TRUTHFULNESS bullet in chat rules footer.
+
+**`pr_review` chat tool.** Fenced draft `--- BEGIN REVIEW --- / --- END REVIEW ---`. Asks confirmation before posting. `executeToolCall` takes `llm.Provider`. `review.DraftReview` shared entry point.
+
+**Confluence + web tools in chat** (`internal/agentctx/ext_tools.go`). `confluence_search`, `confluence_get`, `web_search`, `web_fetch`. Tool results clamped 8 KB (`clampForChat`, rune-safe). No run_command/file tools in chat.
+
+**Codebase index** (`internal/codeindex`). Built on first `search_code`. Regex symbol extraction (10 langs). Modes: bare word -> symbol+content; `/pat/` -> regex; else -> substring. Shared `SearchCode` in DefaultRegistry. No Tree-sitter (CGo breaks zero-dep rule).
+
+**Browser tools** (`internal/tools/fetch.go`). `fetch_url`: HTTPS-only by default (`GOON_FETCH_ALLOW_HTTP=1` unlocks), 256 KB cap, hand-written HTML stripper. `web_search`: Google CSE if `GOOGLE_API_KEY+GOOGLE_CSE_ID`, else DuckDuckGo scrape.
+
+**Web file browser** (`internal/web/files.go`). Root: `GOON_WORKSPACE_DIR -> GOON_WORKDIR -> cwd`. Path safety: no absolute, no `..`, must stay under root. 2 MB cap, binary refused. No execute/rename/delete.
+
+**Daemon wake channel.** `daemon.Wake()` -> buffer-1 `wakeCh`. Web `/api/answer` + Telegram `/answer` use it to resume paused workflows in <1s. Coalesces bursts.
+
+**Gemini provider** (`internal/llm/gemini.go`). Env: `GEMINI_API_KEY` (or `GOOGLE_API_KEY`), `GEMINI_MODEL` (default `gemini-2.5-flash`), `GEMINI_BASE_URL`. Auth via query param. Stream parses full fragments (not deltas).
+
+**Chat agent tool use** (`internal/agentctx/chat.go`). `agentctx.ChatTurn` runs up to 3 LLM<->tool iterations. Tools: `jira_search`, `jira_comment`, `jira_transition`, `jira_update`. Board interfaces: `Searcher{Search}` + `Updater{Update(TicketPatch)}` optional companions.
+
+**Jira Transition** is real (GET transitions -> POST best-match). **Jira Update**: PUT with ADF description. `TicketPatch` uses pointer-to-string (nil=unchanged).
+
+**Pause/resume.** `Memory.Status.Paused` flipped by `goon pause`, web `/api/daemon/pause`, Telegram `/pause`. `daemon.stop()` always clears it.
+
+**Rejected plans re-plan.** `phaseApprovePlan` stores `replan_feedback`, resets `Plan=nil+Stage="triage"`, returns errPaused. Max 3 rejections (`maxRePlans`). `triageWithFeedback` injects feedback under `PREVIOUS PLAN WAS REJECTED`.
+
+**Question cap.** `maxQuestions=500`. Prunes oldest answered first.
+
+**Telegram subprocess env scrub.** `runGoonCLI` strips keys ending in `_TOKEN`/`_API_KEY`/`_SECRET`/`_PASSWORD`.
+
+**Dry-run reads through.** Only `isMutating` tools short-circuit.
+
+**`/start` Telegram.** Already-auth'd chats get friendly greeting.
+
+**`internal/util`.** Zero deps. Bar for adding: 4+ duplicates.
+
+**`memory.json` pruning.** `maxTicketSnapshots=500` (oldest by `LastSeen`), `maxTelegramAuth=100` (oldest by `AuthorizedAt`). Re-applied in `flush()`.
+
+**`goon doctor` ollama.** Returns `OK=false` if model not pulled. `git_host` check: unconfigured vs missing-host-with-board.
+
+**`internal/checkup.newReq`** returns placeholder non-nil on error; every call site checks err.
+
+**Telegram bot.** Long-poll goroutine. Auth: DM `/auth <secret>`. 10 builtin commands + CLI parity. Disallowed: `start, stop, uninstall, update`. 6-turn rolling history per chat (in-process). Tests use `httptest` fake server.
+
+**`githost.PRReviewer`.** `ListPRs/GetPRDetails/CommentPR/ApprovePR/RequestChangesPR`. GitHub + Mock implement it. `GOON_REVIEW_REPOS` default repo set.
+
+**Approval-gated workflow.** State machine: `triage->confirm_repo->approve_plan->execute->test->verify->update_memory->open_pr->notify`. Gates use `memory.AskQuestion`. `GOON_AUTO_APPROVE=1` / `cfg.AutoApprove:true` skips gates.
+
+**SOUL.md.** Auto-injected into `agent.SystemPrompt`. At `./storage/memory/SOUL.md`. Whitespace-only = absent. `notes.Store.Soul()` reads legacy `PINNED.md` transparently. `MergePersonalIntoSoul()` migrates personal.md on boot. `internal/personal` is a deprecated stub.
+
+**REPOSITORY.md.** `./storage/memory/REPOSITORY.md`. Table `| Remote | Local | Notes |`. `parseTriage` schema: `needs_repo` + `repos`. `needs_repo=false` skips confirm_repo+test+open_pr. Gate fires per-ticket; no more RepoChoices caching. `goon repo list/forget/clear` shows deprecation banner.
+
+**Self-improvement loop** (`internal/learnings`). `Capture()`: appends HISTORY.md + distillation agent. `GOON_AUTO_LEARN=0` opts out. Mock skips distillation. Shared by one-shot and workflow `update_memory` phase.
+
+**Atlassian env vars.** `ATLASSIAN_BASE_URL/EMAIL/API_TOKEN` shared; `JIRA_*`/`CONFLUENCE_*` override.
+
+**Jira search.** `/rest/api/3/search/jql` (CHANGE-2046). Cursor pagination via `nextPageToken`/`isLast`. Don't auto-paginate.
+
+**Windows.** `safety.ShellCommand`: `cmd /C` on Windows, `sh -c` on POSIX. `lock_windows.go`: `O_CREATE|O_EXCL`, 50ms backoff, 5s deadline, 2-min stale eviction.
 
 ## Common pitfalls
 
-- **No Go toolchain in the Cowork sandbox.** Don't try `go build` —
-  it'll fail. Static brace/paren balance check via Python is the
-  best you can do here. The user runs `go test ./...` on their
-  machine. Be confident before reporting "shipped".
-- **FUSE filesystem artifacts.** The user's machine sometimes drops
-  `.fuse_hidden*` files. They're in `.gitignore`. Don't ever
-  `rm -rf` blindly — make a `tar` backup first. We deleted the
-  whole repo once. Never again.
-- **The web fetch tool can't reach `go.dev`.** Allowlist blocks it.
-  Don't try to install Go from the sandbox.
-- **`internal/memory.Memory` flush uses flock**; warns once on
-  failure, then continues. Don't treat the warn as an error.
-- **The `mu sync.Mutex` in `daemon.Daemon`** only protects `pollAndRun`.
-  Reconfigure uses a separate `rcMu` (RWMutex). Don't introduce a
-  third lock; use `Snapshot()` to read providers safely.
-- **Tools ALWAYS receive `map[string]string` args** — never a typed
-  struct. The LLM emits strings, period. If you need an int, parse it
-  inside `Run()` and return a clear error if invalid.
+- **No Go toolchain in sandbox.** Python brace-balance check only. User runs `go test ./...`.
+- **FUSE artifacts** (`.fuse_hidden*`). Never `rm -rf` blindly -- tar backup first. We deleted the whole repo once.
+- **Web fetch can't reach `go.dev`.** Allowlist blocks it.
+- **`memory.Memory` flush uses flock.** One warn on failure is normal.
+- **`daemon.Daemon` has two locks.** `mu` for `pollAndRun`; `rcMu` (RWMutex) for Reconfigure. Don't add a third. Use `Snapshot()` to read providers.
+- **Tools always receive `map[string]string` args.** Parse ints inside `Run()`.
 
-## Verification ritual when you're done
+## Verification ritual
 
-1. Brace/paren balance on every `.go` file you touched
-   (Python token-aware check; example in conversation history).
-2. JSON-validate any sample/example JSONs you edited
-   (`python3 -c "import json; json.load(open('...'))"`).
-3. Search for orphaned imports / unused symbols in your new code.
+1. Brace/paren balance on every `.go` touched (Python token check).
+2. JSON-validate sample JSONs (`python3 -c "import json; json.load(open('...'))"`)
+3. Check orphaned imports / unused symbols.
 4. Update `README.md` if user-visible behavior changed.
-5. If you added a new package, mention it in this file's package map.
-6. Tell the user **what to verify on their machine** — usually a
-   `go test ./internal/<pkg>/... -v` or `go build ./...` invocation.
+5. Add new packages to package map above.
+6. Tell Harisa what to run: `go test ./internal/<pkg>/... -v` or `go build ./...`.
 
-## Notes for future Claude on the working relationship
+## Working relationship
 
-When asked to ship, ship — but verify first. They prefer
-the code be simple over clever, and they care about onboarding ergonomics
-(env var unification, friendly error messages, sensible defaults).
+Ship when asked, but verify first. Simple over clever. Onboarding ergonomics matter (env var unification, friendly errors, sensible defaults). When in doubt: read the code, ask one focused question.
 
-When in doubt: read the code, then ask one focused question. Don't
-guess at things that are easy to look up.
-
-**Standing instruction from Harisa: read this file at the start of every
-goon session, and update it at the end of every session.** New decisions
-go under "Recent decisions worth knowing"; new gotchas under "Common
-pitfalls"; new packages get a line in the package map. The point is
-that the next instance of you doesn't repeat mistakes I've already
-made.
+**Standing instruction: read this file at the start of every goon session, update it at the end.** New decisions -> "Key decisions"; new gotchas -> "Common pitfalls"; new packages -> package map.

@@ -41,6 +41,10 @@ goon-backup-*.tar.gz
 storage/
 .goon/
 
+# Repos goon clones to work on (auto-clone / GOON_WORKSPACE_DIR). These are
+# other projects checked out locally — never part of the goon repo itself.
+repos/
+
 # Editor / OS noise
 *.swp
 *.swo
@@ -62,3 +66,4 @@ storage/
 coverage.txt
 profile.cov
 run
+config.json

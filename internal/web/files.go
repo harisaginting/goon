@@ -197,11 +197,9 @@ func renderFilesPanel(w io.Writer, rel string, rows []fileEntry) {
 			hx-get="/api/files/tree?path=%s" hx-target="#files-panel" hx-swap="innerHTML">⬆ .. (up)</button></li>`,
 			html.EscapeString(urlQueryEscape(parent)))
 	}
+	const dirIcon = `<svg class="w-4 h-4 text-accent/70 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M2.25 12.75V12A2.25 2.25 0 014.5 9.75h15A2.25 2.25 0 0121.75 12v.75m-8.69-6.44l-2.12-2.12a1.5 1.5 0 00-1.061-.44H4.5A2.25 2.25 0 002.25 6v12a2.25 2.25 0 002.25 2.25h15A2.25 2.25 0 0021.75 18V9a2.25 2.25 0 00-2.25-2.25h-5.379a1.5 1.5 0 01-1.06-.44z"/></svg>`
+	const fileIcon = `<svg class="w-4 h-4 text-muted shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z"/></svg>`
 	for _, e := range rows {
-		icon := "📄"
-		if e.IsDir {
-			icon = "📁"
-		}
 		sizeNote := ""
 		if !e.IsDir {
 			sizeNote = humanizeBytes(e.Size)
@@ -209,15 +207,15 @@ func renderFilesPanel(w io.Writer, rel string, rows []fileEntry) {
 		if e.IsDir {
 			fmt.Fprintf(w, `<li><button type="button" class="w-full text-left px-3 py-2 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition flex items-center gap-2"
 				hx-get="/api/files/tree?path=%s" hx-target="#files-panel" hx-swap="innerHTML">
-				<span>%s</span><span class="font-mono">%s</span>
-			</button></li>`, html.EscapeString(urlQueryEscape(e.Path)), icon, html.EscapeString(e.Name))
+				%s<span class="font-mono">%s</span>
+			</button></li>`, html.EscapeString(urlQueryEscape(e.Path)), dirIcon, html.EscapeString(e.Name))
 		} else {
 			fmt.Fprintf(w, `<li><button type="button" class="w-full text-left px-3 py-2 hover:bg-gray-50 dark:hover:bg-surface-sunken/40 transition flex items-center gap-2"
 				hx-get="/api/files/read?path=%s" hx-target="#files-editor" hx-swap="innerHTML">
-				<span>%s</span><span class="font-mono flex-1 truncate">%s</span>
+				%s<span class="font-mono flex-1 truncate">%s</span>
 				<span class="text-[11px] text-gray-400 font-mono">%s</span>
 			</button></li>`,
-				html.EscapeString(urlQueryEscape(e.Path)), icon,
+				html.EscapeString(urlQueryEscape(e.Path)), fileIcon,
 				html.EscapeString(e.Name), html.EscapeString(sizeNote))
 		}
 	}
@@ -269,16 +267,38 @@ func (s *Server) handleFilesRead(w http.ResponseWriter, r *http.Request) {
 			<div class="font-mono text-gray-700 dark:text-gray-300 truncate">%s</div>
 			<div class="text-gray-400 font-mono">%s · %d lines</div>
 		</div>
-		<form hx-post="/api/files/write" hx-target="#files-write-result" hx-swap="innerHTML" class="space-y-0">
+		<form hx-post="/api/files/write" hx-target="#files-write-result" hx-swap="innerHTML" class="space-y-0"
+			hx-on::after-request="if(event.detail.successful){this.removeAttribute('data-dirty');document.getElementById('files-unsaved').style.display='none'}">
 			<input type="hidden" name="path" value="%s">
 			<textarea name="body" rows="28" spellcheck="false"
-				class="block w-full font-mono text-xs leading-snug bg-white dark:bg-surface px-3 py-2 focus:outline-none resize-y border-0">%s</textarea>
+				class="block w-full font-mono text-xs leading-snug bg-white dark:bg-surface px-3 py-2 focus:outline-none resize-y border-0"
+				oninput="this.closest('form').setAttribute('data-dirty','true');document.getElementById('files-unsaved').style.display='inline'">%s</textarea>
 			<div class="flex items-center justify-between gap-2 px-3 py-2 border-t border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40">
 				<div id="files-write-result" class="text-xs"></div>
-				<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1 font-semibold hover:brightness-110 transition">save</button>
+				<div class="flex items-center gap-2">
+					<span id="files-unsaved" style="display:none" class="text-xs text-amber-500">• unsaved changes</span>
+					<button type="submit" class="text-xs rounded-md bg-accent text-surface px-3 py-1 font-semibold hover:brightness-110 transition">save</button>
+					<span class="text-[10px] text-muted ml-2">⌘S / Ctrl+S</span>
+				</div>
 			</div>
 		</form>
-	</div>`,
+	</div>
+	<script>
+	(function() {
+	  var form = document.querySelector('#files-editor form');
+	  if (!form) return;
+	  var handler = function(e) {
+	    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
+	      e.preventDefault();
+	      htmx.trigger(form, 'submit');
+	    }
+	  };
+	  document.addEventListener('keydown', handler);
+	  form.addEventListener('htmx:beforeCleanup', function() {
+	    document.removeEventListener('keydown', handler);
+	  });
+	})();
+	</script>`,
 		html.EscapeString(rel),
 		humanizeBytes(info.Size()),
 		strings.Count(string(body), "\n")+1,
@@ -356,7 +376,13 @@ func (s *Server) fragTabFiles(w http.ResponseWriter, _ *http.Request) {
 	}
 	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-[minmax(260px,360px)_1fr] gap-4">
 		<div id="files-panel" hx-get="/api/files/tree" hx-trigger="load" hx-swap="innerHTML">
-			<div class="text-xs text-gray-500">Loading tree…</div>
+			<div class="space-y-1 animate-pulse p-2">
+				<div class="h-5 bg-surface-raised rounded w-2/3"></div>
+				<div class="h-5 bg-surface-raised rounded w-1/2 ml-4"></div>
+				<div class="h-5 bg-surface-raised rounded w-3/4 ml-4"></div>
+				<div class="h-5 bg-surface-raised rounded w-1/3 ml-4"></div>
+				<div class="h-5 bg-surface-raised rounded w-2/3"></div>
+			</div>
 		</div>
 		<div id="files-editor" class="min-w-0">
 			<div class="rounded-lg border border-dashed border-gray-300 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/40 p-6 text-center text-sm text-gray-500">

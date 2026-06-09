@@ -117,6 +117,7 @@ type glMR struct {
 	Description  string `json:"description"`
 	State        string `json:"state"`
 	SourceBranch string `json:"source_branch"`
+	TargetBranch string `json:"target_branch"`
 	Author       struct {
 		Username string `json:"username"`
 	} `json:"author"`
@@ -173,6 +174,7 @@ func (mr glMR) toPR() PR {
 		URL:    mr.WebURL,
 		Title:  mr.Title,
 		Branch: mr.SourceBranch,
+		Base:   mr.TargetBranch,
 		Author: mr.Author.Username,
 		State:  glNormalizeState(mr.State),
 		Body:   mr.Description,

@@ -57,6 +57,9 @@ func (s *SearchCode) Run(ctx context.Context, args map[string]string) (Result, e
 	}
 	root := strings.TrimSpace(args["root"])
 	if root == "" {
+		root = WorkDirFrom(ctx) // the selected repo, when the workflow set one
+	}
+	if root == "" {
 		root = strings.TrimSpace(os.Getenv("GOON_WORKDIR"))
 	}
 	if root == "" {

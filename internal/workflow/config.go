@@ -96,10 +96,13 @@ type WorkflowConfig struct {
 	Stages []StageConfig `json:"stages,omitempty"`
 }
 
-// Stage type constants. Keep in sync with internal/workflow/stages.go.
+// Stage type constants. Keep in sync with the dispatch switch in
+// runner.go (runOne) and the web editor's TYPES metadata.
 const (
-	StageTypeLLM   = "llm"
-	StageTypeAgent = "agent"
+	StageTypeLLM    = "llm"    // one model call (prompt → text/JSON)
+	StageTypeAgent  = "agent"  // goon's autonomous tool-using loop
+	StageTypeNotify = "notify" // send a message via the 'telegram' tool
+	StageTypeHTTP   = "http"   // GET an https URL via the 'fetch_url' tool
 )
 
 // StageConfig declares one step in a user-defined pipeline.
@@ -107,21 +110,57 @@ const (
 // Common fields:
 //
 //	name      — unique identifier; later stages reference output as {{.Stages.NAME.…}}
-//	type      — "llm" | "agent"
+//	type      — "llm" | "agent" | "notify" | "http"
 //	if        — optional Go-template expression; stage skipped when it renders to "", "false", "no", "0"
 //	repeat    — run the stage this many times (1 if omitted). Useful for verify-style passes.
 //	on_error  — "fail" (default) | "continue" | "warn"
 //
 // Type-specific fields:
 //
-//	llm  : prompt, system, json_mode, temperature, max_tokens, output (named key)
-//	agent: task, max_steps
+//	llm    : prompt, system, json_mode, temperature, max_tokens, output (named key)
+//	agent  : task, max_steps
+//	notify : message — text sent via the 'telegram' tool. The rendered message
+//	         is also stored under .Stages.<name> so later stages can reference it.
+//	http   : url — an https URL fetched (GET) via the 'fetch_url' tool. The
+//	         response body is stored under .Stages.<name> as a string.
 type StageConfig struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
 	If      string `json:"if,omitempty"`
 	Repeat  int    `json:"repeat,omitempty"`
 	OnError string `json:"on_error,omitempty"`
+
+	// ── Routing ────────────────────────────────────────────────────────────────
+	//
+	// By default stages execute in array order. Setting these fields enables
+	// non-linear pipelines: conditional branches, sub-calls, and loops.
+	//
+	//   on_next   — stage name to go to after a successful run. "end" finishes
+	//               the pipeline. Empty = next stage in array order.
+	//   reject_if — Go-template expression evaluated against StageState after
+	//               the stage runs. When it renders to a truthy value (anything
+	//               except "", "false", "no", "0") the stage is REJECTED and
+	//               routing follows on_reject instead of on_next.
+	//   on_reject — stage name to jump to on rejection. "end" aborts the
+	//               pipeline with an error. Empty = "end".
+	//   ask_stage — name of a helper stage to run as an inline sub-call BEFORE
+	//               this stage executes. Its output is available as .Ask in
+	//               the current stage's templates.
+	//   max_loops — max number of times on_reject can loop back to an earlier
+	//               stage before the pipeline hard-fails. Default 3.
+
+	OnNext   string `json:"on_next,omitempty"`
+	RejectIf string `json:"reject_if,omitempty"`
+	OnReject string `json:"on_reject,omitempty"`
+	AskStage string `json:"ask_stage,omitempty"`
+	MaxLoops int    `json:"max_loops,omitempty"`
+
+	// Model override — leave empty to use the process-wide default.
+	// Provider is the provider name (openai | anthropic | gemini | ollama | mock).
+	// Model is the model string (e.g. "gpt-4o", "claude-opus-4-5").
+	// When only Model is set, the current provider is used with that model.
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
 
 	// llm
 	Prompt      string  `json:"prompt,omitempty"`
@@ -134,6 +173,12 @@ type StageConfig struct {
 	// agent
 	Task     string `json:"task,omitempty"`
 	MaxSteps int    `json:"max_steps,omitempty"`
+
+	// notify
+	Message string `json:"message,omitempty"`
+
+	// http
+	URL string `json:"url,omitempty"`
 }
 
 // Hook phase names. Keep in sync with the engine.
@@ -169,9 +214,9 @@ var AllHooks = []string{
 // skips them for unattended runs.
 func DefaultConfig() WorkflowConfig {
 	return WorkflowConfig{
-		Version:     1,
-		Name:        "default",
-		Description: "Goon's all-purpose pipeline: triage → confirm_repo (gate) → approve_plan (gate) → execute → test → verify → update_memory → open_pr → notify. Set auto_approve=true to skip the gates for unattended runs.",
+		Version:         1,
+		Name:            "default",
+		Description:     "Goon's all-purpose pipeline: triage → confirm_repo (gate) → approve_plan (gate) → execute → test → verify → update_memory → open_pr → notify. Set auto_approve=true to skip the gates for unattended runs.",
 		BranchPrefix:    "goon/",
 		VerifyRuns:      0, // 0 = inherit package var (default 3, env GOON_VERIFY_RUNS)
 		AutoApprove:     false,
@@ -247,7 +292,11 @@ func LoadConfig(repoDir string) (WorkflowConfig, string, error) {
 			return cfg, p, fmt.Errorf("parse %s: %w", p, err)
 		}
 		merge(&cfg, got)
-		return cfg, p, nil
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			abs = p
+		}
+		return cfg, abs, nil
 	}
 	return cfg, "", nil
 }

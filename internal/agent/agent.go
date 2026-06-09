@@ -50,11 +50,17 @@ type Options struct {
 
 // Agent runs the multi-step loop.
 type Agent struct {
-	opts Options
+	opts   Options
+	result string // the final "finish" message, exposed via Result()
 }
 
 // New constructs an Agent.
 func New(opts Options) *Agent { return &Agent{opts: opts} }
+
+// Result returns the agent's final "finish" message (the task outcome /
+// answer), available after Run returns. Empty if the agent never called
+// finish. Lets callers surface the result instead of discarding it.
+func (a *Agent) Result() string { return a.result }
 
 // Run executes the loop and returns the final summary or the last error.
 func (a *Agent) Run(ctx context.Context, task string) error {
@@ -81,7 +87,7 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 		default:
 		}
 
-		snapshot := Snapshot(lastOutput, a.opts.Memory.FrequentCommands(5))
+		snapshot := Snapshot(tools.WorkDirFrom(ctx), lastOutput, a.opts.Memory.FrequentCommands(5))
 		userMsg := BuildUserContext(task, snapshot)
 		if step == 0 {
 			chat = append(chat, llm.Message{Role: llm.RoleUser, Content: userMsg})
@@ -152,6 +158,7 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 			if msg == "" {
 				msg = "done"
 			}
+			a.result = msg
 			fmt.Fprintln(a.opts.Stdout, msg)
 			a.opts.Memory.Append(memory.Interaction{
 				Input: task, ToolUsed: "finish", OK: true, Output: msg,
@@ -201,8 +208,11 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 }
 
 func formatToolResultForLLM(name string, r tools.Result, runErr error) string {
+	// XML delimiters prevent tool output (e.g. file contents or command
+	// stdout) from spoofing a previous TOOL RESULT block or injecting
+	// instructions by making the boundary explicit and unambiguous.
 	var b strings.Builder
-	fmt.Fprintf(&b, "TOOL RESULT (%s)\n", name)
+	fmt.Fprintf(&b, "<tool_result name=%q>\n", name)
 	if runErr != nil {
 		fmt.Fprintf(&b, "error: %s\n", runErr.Error())
 	}
@@ -215,6 +225,7 @@ func formatToolResultForLLM(name string, r tools.Result, runErr error) string {
 	if r.Stderr != "" {
 		fmt.Fprintf(&b, "stderr:\n%s\n", truncateLines(r.Stderr, 30))
 	}
+	b.WriteString("</tool_result>\n")
 	return b.String()
 }
 

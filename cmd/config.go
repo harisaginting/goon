@@ -2,18 +2,18 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/harisaginting/goon/internal/envstore"
 )
 
-// configKey describes one environment variable goon understands.
+// configKey describes one setting goon understands.
 type configKey struct {
 	Name      string
 	Default   string
@@ -29,17 +29,47 @@ var knownConfigKeys = []configKey{
 	{Name: "GOON_MEMORY_PATH", Default: "$GOON_STORAGE_DIR/memory.json", Group: "agent"},
 	{Name: "GOON_MEMORY_DIR", Default: "$GOON_STORAGE_DIR/memory", Group: "agent"},
 	{Name: "GOON_UPSTREAM", Default: "https://github.com/harisaginting/goon", Group: "agent"},
+	{Name: "GOON_WORKSPACE_DIR", Group: "agent"},
 
 	{Name: "GOON_BOARD", Default: "", Group: "daemon"},
 	{Name: "GOON_GIT_HOST", Default: "", Group: "daemon"},
 	{Name: "GOON_POLL_SECONDS", Default: "300", Group: "daemon"},
 	{Name: "GOON_VERIFY_RUNS", Default: "3", Group: "daemon"},
-	{Name: "GOON_REPO_MAP", Default: "", Group: "daemon"},
 	{Name: "GOON_PID_FILE", Default: "$GOON_STORAGE_DIR/goon.pid", Group: "daemon"},
 	{Name: "GOON_LOG_FILE", Default: "$GOON_STORAGE_DIR/logs/goon.log", Group: "daemon"},
 	{Name: "GOON_WORKFLOW_FILE", Default: "./workflow.json", Group: "daemon"},
+	// GOON_TICKET_STATUSES controls which canonical goon statuses the daemon
+	// picks up from the board on each poll. Comma-separated list of:
+	// open, in_progress, in_review, blocked, done.
+	{Name: "GOON_TICKET_STATUSES", Default: "open,in_progress", Group: "daemon"},
+	// GOON_DAEMON_AUTO_START controls whether the daemon's poll loop starts
+	// active (true, default) or paused (false). Set to "false" if you want to
+	// open the web UI and review configuration before the daemon begins polling.
+	{Name: "GOON_DAEMON_AUTO_START", Default: "true", Group: "daemon"},
+	// GOON_AUTO_LEARN toggles goon's self-learning (post-run distillation +
+	// the daily standby reflection). On unless set to off/false/0/no.
+	{Name: "GOON_AUTO_LEARN", Default: "true", Group: "daemon"},
+	// GOON_LEARN_INTERVAL_HOURS throttles how often standby self-learning runs
+	// while idle. Positive integer hours; default 24 (once per idle day).
+	{Name: "GOON_LEARN_INTERVAL_HOURS", Default: "24", Group: "daemon"},
+	// GOON_AUTO_CONFIRM_REPO skips the confirm_repo gate when triage
+	// produced a single repo that resolves to a REPOSITORY.md entry.
+	// Off by default. Narrower than GOON_AUTO_APPROVE (which skips all gates).
+	{Name: "GOON_AUTO_CONFIRM_REPO", Default: "", Group: "daemon"},
+	// GOON_AUTO_APPROVE_PLAN auto-accepts the plan (keeps the confirm_repo
+	// gate) so the only human actions are: set repo + review the PR.
+	{Name: "GOON_AUTO_APPROVE_PLAN", Default: "", Group: "daemon"},
+	// GOON_LLM_HTTP_TIMEOUT_SEC bounds each LLM HTTP request. Default 120s;
+	// raise for slow proxies/models that take >30s to return headers.
+	{Name: "GOON_LLM_HTTP_TIMEOUT_SEC", Default: "120", Group: "daemon"},
 
-	{Name: "GOON_WORKSPACE_DIR", Group: "agent"},
+	// Google Workspace (read-only) — Calendar, Tasks, Gmail + Cloud Logging.
+	// Run `goon google auth` to obtain the refresh token after setting the
+	// OAuth client id/secret.
+	{Name: "GOOGLE_OAUTH_CLIENT_ID", Group: "google"},
+	{Name: "GOOGLE_OAUTH_CLIENT_SECRET", Sensitive: true, Group: "google"},
+	{Name: "GOOGLE_OAUTH_REFRESH_TOKEN", Sensitive: true, Group: "google"},
+	{Name: "GOOGLE_CLOUD_PROJECT", Group: "google"},
 
 	{Name: "OPENAI_API_KEY", Sensitive: true, Group: "openai"},
 	{Name: "OPENAI_MODEL", Default: "gpt-4o-mini", Group: "openai"},
@@ -72,6 +102,9 @@ var knownConfigKeys = []configKey{
 	{Name: "GITHUB_LABEL", Group: "github"},
 	{Name: "GITHUB_ASSIGNEE", Default: "@me", Group: "github"},
 	{Name: "GITHUB_API_URL", Default: "https://api.github.com", Group: "github"},
+	// GITHUB_STATE filters GitHub Issues by state. Accepted values: open,
+	// closed, all. Defaults to "open".
+	{Name: "GITHUB_STATE", Default: "open", Group: "github"},
 
 	{Name: "GITLAB_TOKEN", Sensitive: true, Group: "gitlab"},
 	{Name: "GITLAB_API_URL", Default: "https://gitlab.com/api/v4", Group: "gitlab"},
@@ -88,6 +121,10 @@ var knownConfigKeys = []configKey{
 	{Name: "TELEGRAM_BOT_TOKEN", Sensitive: true, Group: "telegram"},
 	{Name: "TELEGRAM_CHAT_ID", Group: "telegram"},
 	{Name: "TELEGRAM_API_BASE_URL", Default: "https://api.telegram.org", Group: "telegram"},
+
+	// Obsidian vault integration.
+	{Name: "GOON_OBSIDIAN_VAULT", Group: "obsidian"},
+	{Name: "GOON_OBSIDIAN_REPO", Group: "obsidian"},
 }
 
 // runConfig dispatches the `goon config <action>` subsubcommand.
@@ -126,15 +163,15 @@ func printConfigHelp(w io.Writer) {
 	fmt.Fprintln(w, "Usage:")
 	fmt.Fprintln(w, "  goon config                  # show all config (secrets masked)")
 	fmt.Fprintln(w, "  goon config show [--reveal]  # show all config (--reveal prints secrets)")
-	fmt.Fprintln(w, "  goon config get <KEY>        # print one value")
-	fmt.Fprintln(w, "  goon config set <KEY> <VAL>  # write to ~/.config/goon/.env")
+	fmt.Fprintln(w, "  goon config get <KEY>        # print one value from config.json")
+	fmt.Fprintln(w, "  goon config set <KEY> <VAL>  # write to ./config.json")
 	fmt.Fprintln(w, "  goon config set KEY=VAL      # KEY=VAL form also accepted")
-	fmt.Fprintln(w, "  goon config unset <KEY>      # remove from config file")
-	fmt.Fprintln(w, "  goon config path             # print path to config file")
-	fmt.Fprintln(w, "  goon config edit             # open config file in $EDITOR")
+	fmt.Fprintln(w, "  goon config unset <KEY>      # remove from config.json")
+	fmt.Fprintln(w, "  goon config path             # print path to config.json")
+	fmt.Fprintln(w, "  goon config edit             # open config.json in $EDITOR")
 }
 
-// configShow prints all known + unknown GOON_*-style env keys.
+// configShow prints all known keys with their values and source.
 func configShow(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("config show", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -143,7 +180,7 @@ func configShow(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
-	fileVals := readConfigFile(configFilePath())
+	fileVals, _ := envstore.Load()
 
 	groups := map[string][]configKey{}
 	order := []string{}
@@ -154,8 +191,7 @@ func configShow(args []string, stdout, stderr io.Writer) error {
 		groups[k.Group] = append(groups[k.Group], k)
 	}
 
-	fmt.Fprintf(stdout, "config file: %s\n", configFilePath())
-	fmt.Fprintf(stdout, "(env vars in shell take precedence over config file)\n\n")
+	fmt.Fprintf(stdout, "config file: %s\n\n", configFilePath())
 
 	for _, g := range order {
 		fmt.Fprintf(stdout, "[%s]\n", g)
@@ -177,13 +213,11 @@ func configShow(args []string, stdout, stderr io.Writer) error {
 
 func configGet(args []string, stdout, _ io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: goon config get <KEY>")
+		return fmt.Errorf("usage: goon config get <KEY>")
 	}
 	key := strings.ToUpper(strings.TrimSpace(args[0]))
-	val := os.Getenv(key)
-	if val == "" {
-		val = readConfigFile(configFilePath())[key]
-	}
+	m, _ := envstore.Load()
+	val := m[key]
 	fmt.Fprintln(stdout, val)
 	return nil
 }
@@ -199,44 +233,37 @@ func configSet(args []string, stdout, _ io.Writer) error {
 		key = strings.TrimSpace(args[0])
 		value = strings.TrimSpace(args[1])
 	default:
-		return errors.New("usage: goon config set <KEY> <VALUE>  (or KEY=VALUE)")
+		return fmt.Errorf("usage: goon config set <KEY> <VALUE>  (or KEY=VALUE)")
 	}
 	key = strings.ToUpper(key)
 	if key == "" {
-		return errors.New("config: empty key")
+		return fmt.Errorf("config: empty key")
 	}
-	path := configFilePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := envstore.Set(key, value); err != nil {
 		return err
 	}
-	if err := writeConfigKey(path, key, value); err != nil {
-		return err
-	}
-	fmt.Fprintf(stdout, "set %s in %s\n", key, path)
+	fmt.Fprintf(stdout, "set %s in %s\n", key, configFilePath())
 	return nil
 }
 
 func configUnset(args []string, stdout, _ io.Writer) error {
 	if len(args) != 1 {
-		return errors.New("usage: goon config unset <KEY>")
+		return fmt.Errorf("usage: goon config unset <KEY>")
 	}
 	key := strings.ToUpper(strings.TrimSpace(args[0]))
-	path := configFilePath()
-	if err := removeConfigKey(path, key); err != nil {
+	if err := envstore.Unset(key); err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "unset %s from %s\n", key, path)
+	fmt.Fprintf(stdout, "unset %s from %s\n", key, configFilePath())
 	return nil
 }
 
 func configEdit(ctx context.Context, stdout, stderr io.Writer) error {
 	path := configFilePath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	if !exists(path) {
-		if err := os.WriteFile(path, []byte("# goon config\n"), 0o600); err != nil {
-			return err
+	// Seed an empty JSON object if the file doesn't exist yet.
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		if err := envstore.Set("_placeholder", ""); err == nil {
+			_ = envstore.Unset("_placeholder")
 		}
 	}
 	editor := os.Getenv("EDITOR")
@@ -253,34 +280,12 @@ func configEdit(ctx context.Context, stdout, stderr io.Writer) error {
 	return cmd.Run()
 }
 
-// configFilePath returns ~/.config/goon/.env (or $XDG_CONFIG_HOME/goon/.env).
-// Falls back to ./.goon/.env when the home directory can't be resolved
-// (e.g. running in a stripped-down container) so config commands keep
-// working instead of writing to the empty path.
-func configFilePath() string {
-	if xdg := strings.TrimSpace(os.Getenv("XDG_CONFIG_HOME")); xdg != "" {
-		return filepath.Join(xdg, "goon", ".env")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".goon", ".env")
-	}
-	return filepath.Join(home, ".config", "goon", ".env")
-}
+// configFilePath returns the path to ./config.json.
+func configFilePath() string { return envstore.Path() }
 
-// resolveValue returns (value, source) for a known key. Source is one of
-// "shell", "config-file", "default", or "unset". When falling back to the
-// built-in default, the value is the default itself (not "") so callers
-// don't need a separate lookup just for display.
+// resolveValue returns (value, source) for a known key.
+// Source is one of "config-file", "default", or "unset".
 func resolveValue(k configKey, fileVals map[string]string) (string, string) {
-	if v := os.Getenv(k.Name); v != "" {
-		// Differentiate between shell-set and config-file-set when the file
-		// contains the same value.
-		if fv, ok := fileVals[k.Name]; ok && fv == v {
-			return v, "config-file"
-		}
-		return v, "shell"
-	}
 	if v, ok := fileVals[k.Name]; ok && v != "" {
 		return v, "config-file"
 	}
@@ -298,92 +303,6 @@ func mask(v string) string {
 		return "***"
 	}
 	return v[:2] + "…" + v[len(v)-3:]
-}
-
-// readConfigFile parses a .env-style file and returns its key/value pairs.
-// Returns an empty map if the file is missing.
-func readConfigFile(path string) map[string]string {
-	out := map[string]string{}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return out
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		eq := strings.IndexByte(line, '=')
-		if eq <= 0 {
-			continue
-		}
-		k := strings.TrimSpace(line[:eq])
-		v := strings.Trim(strings.TrimSpace(line[eq+1:]), `"'`)
-		out[k] = v
-	}
-	return out
-}
-
-// writeConfigKey replaces or appends key=value in path, atomically.
-func writeConfigKey(path, key, value string) error {
-	lines := []string{}
-	if data, err := os.ReadFile(path); err == nil {
-		lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	}
-	out := make([]string, 0, len(lines)+1)
-	found := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			out = append(out, line)
-			continue
-		}
-		eq := strings.IndexByte(trimmed, '=')
-		if eq > 0 && strings.TrimSpace(trimmed[:eq]) == key {
-			out = append(out, fmt.Sprintf("%s=%s", key, value))
-			found = true
-			continue
-		}
-		out = append(out, line)
-	}
-	if !found {
-		out = append(out, fmt.Sprintf("%s=%s", key, value))
-	}
-	return atomicWrite(path, strings.Join(out, "\n")+"\n", 0o600)
-}
-
-// removeConfigKey deletes key from the .env file. No-op if file or key absent.
-func removeConfigKey(path, key string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
-	out := make([]string, 0, len(lines))
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			out = append(out, line)
-			continue
-		}
-		eq := strings.IndexByte(trimmed, '=')
-		if eq > 0 && strings.TrimSpace(trimmed[:eq]) == key {
-			continue // drop
-		}
-		out = append(out, line)
-	}
-	return atomicWrite(path, strings.Join(out, "\n")+"\n", 0o600)
-}
-
-func atomicWrite(path, content string, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), mode); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
 }
 
 // sortedKnownKeys is a small helper used by tests; keeps the ordering

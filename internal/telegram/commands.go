@@ -41,6 +41,7 @@ var menuCommands = []struct {
 	{"tickets", "List tickets goon has seen + status"},
 	{"ticket", "Show a ticket: /ticket <id-or-key>"},
 	{"knowledge", "What goon knows — SOUL.md + topic-note index"},
+	{"obsidian", "Obsidian vault: /obsidian list [folder] | search <q> | sync"},
 	{"skills", "Specialist skills: /skills list|read|write|delete"},
 	{"jira", "Jira actions: /jira search|comment|move|edit (no LLM needed)"},
 	{"mine", "Tickets assigned to me (alias for /jira mine)"},
@@ -162,6 +163,7 @@ var builtins = map[string]bool{
 	"tickets":   true,
 	"ticket":    true,
 	"knowledge": true,
+	"obsidian":  true,
 	"refresh":   true,
 	"memory":    true,
 	"skills":    true,
@@ -227,6 +229,8 @@ func (b *Bot) handleCommand(ctx context.Context, chatID int64, from User, text s
 		b.cmdTicketDetail(ctx, chatID, args)
 	case "knowledge":
 		b.cmdKnowledge(ctx, chatID)
+	case "obsidian":
+		b.cmdObsidian(ctx, chatID, args)
 	case "refresh":
 		b.cmdRefresh(ctx, chatID)
 	case "memory":

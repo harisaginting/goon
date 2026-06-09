@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/agentctx"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // cmdKnowledge renders goon's active-memory layer for the user:
@@ -118,6 +119,77 @@ func (b *Bot) cmdSkills(ctx context.Context, chatID int64, args []string) {
 		_ = b.Send(ctx, chatID, "✓ deleted skill "+args[0])
 	default:
 		_ = b.Send(ctx, chatID, "unknown sub-command: "+sub+"\nusage: /skills list|read|write|delete")
+	}
+}
+
+// cmdObsidian is the Telegram surface for the Obsidian vault integration.
+//
+//	/obsidian             — list all notes (top-level)
+//	/obsidian list [folder] — list notes, optionally under a subfolder
+//	/obsidian search <q>  — search across all notes
+//	/obsidian sync        — git pull + reload (requires GOON_OBSIDIAN_REPO)
+func (b *Bot) cmdObsidian(ctx context.Context, chatID int64, args []string) {
+	if !tools.ObsidianConfigured() {
+		_ = b.Send(ctx, chatID,
+			"✗ Obsidian vault not configured.\n"+
+				"Set GOON_OBSIDIAN_VAULT in your .env to your vault path.\n"+
+				"Optionally set GOON_OBSIDIAN_REPO if it is git-backed.")
+		return
+	}
+
+	sub := "list"
+	if len(args) > 0 {
+		sub = strings.ToLower(args[0])
+		args = args[1:]
+	}
+
+	switch sub {
+	case "list", "":
+		folder := ""
+		if len(args) > 0 {
+			folder = args[0]
+		}
+		notes, err := tools.ObsidianList(folder)
+		if err != nil {
+			_ = b.Send(ctx, chatID, "✗ "+err.Error())
+			return
+		}
+		if notes == "" {
+			if folder != "" {
+				_ = b.Send(ctx, chatID, "No notes found under "+folder)
+			} else {
+				_ = b.Send(ctx, chatID, "Vault is empty.")
+			}
+			return
+		}
+		b.SendChunked(ctx, chatID, "📓 Obsidian vault notes:\n\n"+notes)
+
+	case "search":
+		if len(args) == 0 {
+			_ = b.Send(ctx, chatID, "usage: /obsidian search <query>")
+			return
+		}
+		query := strings.Join(args, " ")
+		results, err := tools.ObsidianSearch(query, 30)
+		if err != nil {
+			_ = b.Send(ctx, chatID, "✗ "+err.Error())
+			return
+		}
+		if results == "" {
+			_ = b.Send(ctx, chatID, "No matches for: "+query)
+			return
+		}
+		b.SendChunked(ctx, chatID, "🔍 Obsidian search results for \""+query+"\":\n\n"+results)
+
+	case "sync":
+		_ = b.Send(ctx, chatID, "→ syncing Obsidian vault…")
+		msg := tools.ObsidianSync()
+		_ = b.Send(ctx, chatID, "✓ "+msg)
+
+	default:
+		_ = b.Send(ctx, chatID,
+			"unknown sub-command: "+sub+"\n"+
+				"usage: /obsidian [list [folder] | search <q> | sync]")
 	}
 }
 

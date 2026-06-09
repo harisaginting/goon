@@ -118,6 +118,68 @@ func execWebFetch(ctx context.Context, c ToolCall) (string, string) {
 		"web_fetch ok"
 }
 
+// execObsidianList lists notes in the Obsidian vault, optionally under a folder.
+func execObsidianList(c ToolCall) (string, string) {
+	notes, err := tools.ObsidianList(c.Folder)
+	if err != nil {
+		return "TOOL ERROR: obsidian_list failed: " + err.Error() + ". Tell the user what went wrong.",
+			"obsidian_list failed: " + err.Error()
+	}
+	if notes == "" {
+		if c.Folder != "" {
+			return "OBSIDIAN NOTES (no notes found under " + c.Folder + "):\n\nTell the user the folder appears to be empty.",
+				"obsidian_list empty"
+		}
+		return "OBSIDIAN NOTES (vault is empty):\n\nTell the user the vault has no markdown notes yet.",
+			"obsidian_list empty"
+	}
+	return "OBSIDIAN NOTES:\n" + clampForChat(notes, maxChatToolResult) +
+		"\n\nList these notes to the user. To read one in full, call obsidian_read with its path.",
+		"obsidian_list ok"
+}
+
+// execObsidianRead reads one Obsidian note by vault-relative path.
+func execObsidianRead(c ToolCall) (string, string) {
+	if c.Note == "" {
+		return `TOOL ERROR: obsidian_read needs a "note" path.`, "obsidian_read rejected (no note)"
+	}
+	content, err := tools.ObsidianRead(c.Note)
+	if err != nil {
+		return "TOOL ERROR: obsidian_read failed: " + err.Error() + ". Tell the user what went wrong.",
+			"obsidian_read failed: " + err.Error()
+	}
+	return "OBSIDIAN NOTE (" + c.Note + "):\n" + clampForChat(content, maxChatToolResult) +
+		"\n\nAnswer the user in prose from this note.",
+		"obsidian_read ok"
+}
+
+// execObsidianSearch searches across all Obsidian vault notes.
+func execObsidianSearch(c ToolCall) (string, string) {
+	q := strings.TrimSpace(c.Query)
+	if q == "" {
+		return `TOOL ERROR: obsidian_search needs a "query".`, "obsidian_search rejected (no query)"
+	}
+	results, err := tools.ObsidianSearch(q, 30)
+	if err != nil {
+		return "TOOL ERROR: obsidian_search failed: " + err.Error() + ". Tell the user what went wrong.",
+			"obsidian_search failed: " + err.Error()
+	}
+	if results == "" {
+		return fmt.Sprintf("OBSIDIAN SEARCH: no matches for %q in the vault.\n\nTell the user nothing matched.", q),
+			"obsidian_search empty"
+	}
+	return "OBSIDIAN SEARCH RESULTS (note:line: text):\n" + clampForChat(results, maxChatToolResult) +
+		"\n\nSummarise the relevant hits for the user. Call obsidian_read to get the full note if needed.",
+		"obsidian_search ok"
+}
+
+// execObsidianSync runs git pull + store reload and reports the result.
+func execObsidianSync() (string, string) {
+	msg := tools.ObsidianSync()
+	return "OBSIDIAN SYNC RESULT:\n" + msg + "\n\nReport this to the user.",
+		"obsidian_sync ok"
+}
+
 // clampForChat truncates a tool result so it can't blow the chat
 // context window. Rune-safe so the result stays valid UTF-8.
 func clampForChat(s string, max int) string {

@@ -229,12 +229,14 @@ func TestBitbucket_ListPRs(t *testing.T) {
 		     "state": "OPEN",
 		     "links": {"html": {"href": "https://bb/pr/7"}},
 		     "author": {"display_name": "Alice"},
-		     "source": {"branch": {"name": "feat/login"}}},
+		     "source": {"branch": {"name": "feat/login"}},
+		     "destination": {"branch": {"name": "main"}}},
 		    {"id": 9, "title": "Add metrics", "description": "",
 		     "state": "OPEN",
 		     "links": {"html": {"href": "https://bb/pr/9"}},
 		     "author": {"display_name": "Bob"},
-		     "source": {"branch": {"name": "feat/metrics"}}}
+		     "source": {"branch": {"name": "feat/metrics"}},
+		     "destination": {"branch": {"name": "develop"}}}
 		  ]
 		}`))
 	}))
@@ -249,6 +251,11 @@ func TestBitbucket_ListPRs(t *testing.T) {
 	}
 	if prs[0].Number != 7 || prs[0].Author != "Alice" || prs[0].Repo != "myteam/myrepo" {
 		t.Errorf("first PR: %+v", prs[0])
+	}
+	// Base (target branch) must be parsed so the Repositories tab can filter
+	// PRs by target branch — regression guard for the empty-base filter bug.
+	if prs[0].Base != "main" || prs[1].Base != "develop" {
+		t.Errorf("base branches: %q, %q (want main, develop)", prs[0].Base, prs[1].Base)
 	}
 	if prs[1].URL != "https://bb/pr/9" {
 		t.Errorf("second PR url: %q", prs[1].URL)

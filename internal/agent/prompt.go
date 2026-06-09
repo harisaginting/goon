@@ -35,9 +35,13 @@ func SystemPrompt(reg *tools.Registry) string {
 	soulBlock := ""
 	if store, err := notes.New(""); err == nil {
 		if soul := store.Soul(); soul != "" {
+			// Wrapped in XML-style delimiters so a crafted SOUL.md entry
+			// cannot inject instructions outside the data boundary.
 			soulBlock = fmt.Sprintf(`
-PERSISTENT MEMORY (always loaded for you — character + project knowledge, from %s/%s):
+PERSISTENT MEMORY (%s/%s) — project knowledge and conventions for you to follow:
+<soul>
 %s
+</soul>
 
 `, store.Path(), notes.SoulFilename, soul)
 		}

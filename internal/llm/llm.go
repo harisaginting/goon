@@ -98,6 +98,71 @@ func NewFromEnv() (Provider, error) {
 	}
 }
 
+// NewWithOverrides builds a Provider where provider and model override the
+// corresponding environment variables. Pass empty strings to inherit from env.
+// When both are empty this is equivalent to NewFromEnv().
+//
+// Typical usage in the workflow runner: per-stage provider/model fields.
+func NewWithOverrides(provider, model string) (Provider, error) {
+	provider = strings.TrimSpace(provider)
+	model = strings.TrimSpace(model)
+
+	name := provider
+	if name == "" {
+		name = strings.ToLower(strings.TrimSpace(os.Getenv("GOON_LLM_PROVIDER")))
+		if name == "" {
+			name = "openai"
+		}
+	}
+
+	switch strings.ToLower(name) {
+	case "openai":
+		key := os.Getenv("OPENAI_API_KEY")
+		if key == "" {
+			return nil, errors.New("OPENAI_API_KEY is not set")
+		}
+		base := envOr("OPENAI_BASE_URL", "https://api.openai.com/v1")
+		m := envOr("OPENAI_MODEL", "gpt-4o-mini")
+		if model != "" {
+			m = model
+		}
+		return NewOpenAI(OpenAIConfig{APIKey: key, BaseURL: base, Model: m}), nil
+	case "anthropic":
+		key := os.Getenv("ANTHROPIC_API_KEY")
+		if key == "" {
+			return nil, errors.New("ANTHROPIC_API_KEY is not set")
+		}
+		base := envOr("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1")
+		m := envOr("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+		if model != "" {
+			m = model
+		}
+		return NewAnthropic(AnthropicConfig{APIKey: key, BaseURL: base, Model: m}), nil
+	case "ollama":
+		base := envOr("OLLAMA_BASE_URL", "http://localhost:11434")
+		m := envOr("OLLAMA_MODEL", "llama3")
+		if model != "" {
+			m = model
+		}
+		return NewOllama(OllamaConfig{BaseURL: base, Model: m}), nil
+	case "gemini", "google":
+		key := envOr("GEMINI_API_KEY", os.Getenv("GOOGLE_API_KEY"))
+		if key == "" {
+			return nil, errors.New("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set")
+		}
+		base := envOr("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta")
+		m := envOr("GEMINI_MODEL", "gemini-2.5-flash")
+		if model != "" {
+			m = model
+		}
+		return NewGemini(GeminiConfig{APIKey: key, BaseURL: base, Model: m}), nil
+	case "mock":
+		return NewMock(nil), nil
+	default:
+		return nil, fmt.Errorf("unknown provider %q (want openai|anthropic|gemini|ollama|mock)", name)
+	}
+}
+
 func envOr(key, fallback string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v

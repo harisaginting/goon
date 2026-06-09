@@ -1,0 +1,90 @@
+{
+  "_comment": "Copy to config.json and fill what you need. Empty string = unset (uses default). Secrets live here in plain text — keep config.json out of git (.gitignore already covers it).",
+
+  "GOON_LLM_PROVIDER": "openai",
+
+  "OPENAI_API_KEY": "sk-...",
+  "OPENAI_MODEL": "gpt-4o-mini",
+  "OPENAI_BASE_URL": "https://api.openai.com/v1",
+
+  "ANTHROPIC_API_KEY": "",
+  "ANTHROPIC_MODEL": "claude-sonnet-4-5",
+  "ANTHROPIC_BASE_URL": "https://api.anthropic.com/v1",
+
+  "GEMINI_API_KEY": "",
+  "GEMINI_MODEL": "gemini-2.5-flash",
+  "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
+
+  "OLLAMA_BASE_URL": "http://localhost:11434",
+  "OLLAMA_MODEL": "llama3",
+
+  "GOON_BOARD": "github",
+  "GOON_GIT_HOST": "github",
+  "GOON_TICKET_STATUSES": "open,in_progress",
+  "GOON_POLL_SECONDS": "300",
+  "GOON_VERIFY_RUNS": "3",
+  "GOON_DAEMON_AUTO_START": "true",
+  "GOON_WORKSPACE_DIR": "",
+
+  "_comment_autonomy": "How much goon does without asking. Defaults keep every gate ON.",
+  "GOON_AUTO_APPROVE": "",
+  "GOON_AUTO_APPROVE_PLAN": "",
+  "GOON_AUTO_CONFIRM_REPO": "",
+  "GOON_LLM_HTTP_TIMEOUT_SEC": "120",
+
+  "_comment_learning": "Self-learning: post-run notes + daily idle reflection.",
+  "GOON_AUTO_LEARN": "true",
+  "GOON_LEARN_INTERVAL_HOURS": "24",
+
+  "ATLASSIAN_BASE_URL": "https://your-domain.atlassian.net",
+  "ATLASSIAN_EMAIL": "you@example.com",
+  "ATLASSIAN_API_TOKEN": "",
+
+  "JIRA_BASE_URL": "",
+  "JIRA_EMAIL": "",
+  "JIRA_API_TOKEN": "",
+  "JIRA_JQL": "",
+
+  "GITHUB_TOKEN": "ghp_...",
+  "GITHUB_REPOS": "owner/repo",
+  "GITHUB_LABEL": "",
+  "GITHUB_ASSIGNEE": "@me",
+  "GITHUB_API_URL": "",
+  "GITHUB_STATE": "open",
+
+  "GITLAB_TOKEN": "",
+  "GITLAB_API_URL": "",
+
+  "BITBUCKET_TOKEN": "",
+  "BITBUCKET_USERNAME": "",
+  "BITBUCKET_APP_PASSWORD": "",
+  "BITBUCKET_API_URL": "",
+  "BITBUCKET_WORKSPACE": "",
+
+  "_comment_google": "Google Workspace agent (read-only). Create an OAuth 'Desktop app' client in Google Cloud, paste the id+secret, then run `goon google auth` to fill the refresh token. Set GOOGLE_CLOUD_PROJECT to enable log search. Guide: docs/google-workspace.md",
+  "GOOGLE_OAUTH_CLIENT_ID": "1234567890-abc123def456.apps.googleusercontent.com",
+  "GOOGLE_OAUTH_CLIENT_SECRET": "GOCSPX-xxxxxxxxxxxxxxxxxxxxxxxx",
+  "GOOGLE_OAUTH_REFRESH_TOKEN": "",
+  "GOOGLE_CLOUD_PROJECT": "my-gcp-project-123456",
+
+  "_comment_telegram": "Optional Telegram bridge — chat with goon + get PR/review notifications.",
+  "TELEGRAM_BOT_TOKEN": "",
+  "GOON_TELEGRAM_SECRET": "",
+  "TELEGRAM_CHAT_ID": "",
+  "TELEGRAM_API_BASE_URL": "",
+  "GOON_REVIEW_REPOS": "",
+  "GOON_AUTO_REVIEW": "",
+  "GOON_AUTO_NOTIFY": "",
+  "GOON_AUTO_INTERVAL": "",
+
+  "CONFLUENCE_BASE_URL": "",
+  "CONFLUENCE_EMAIL": "",
+  "CONFLUENCE_API_TOKEN": "",
+
+  "GOON_OBSIDIAN_VAULT": "",
+  "GOON_OBSIDIAN_REPO": "",
+
+  "GOON_STORAGE_DIR": "",
+  "GOON_LOG_LEVEL": "info",
+  "GOON_MAX_STEPS": "5"
+}

@@ -114,6 +114,47 @@ func TestMemory_PersistenceWithEngineerData(t *testing.T) {
 	}
 }
 
+func TestMemory_ReconcileTickets(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := New(filepath.Join(dir, "memory.json"))
+	// Two jira tickets, one github ticket, and one jira ticket that has a
+	// workflow on record.
+	m.SeenTicket(TicketSnapshot{ID: "EB-1", Source: "jira", Assignee: "me"})
+	m.SeenTicket(TicketSnapshot{ID: "EB-2", Source: "jira", Assignee: "someone-else"})
+	m.SeenTicket(TicketSnapshot{ID: "GH-9", Source: "github"})
+	m.SeenTicket(TicketSnapshot{ID: "EB-7", Source: "jira"})
+	m.UpsertWorkflow(Workflow{ID: "w1", TicketID: "EB-7"})
+
+	// Latest jira poll only returns EB-1 (filter tightened to assignee=me).
+	removed := m.ReconcileTickets("jira", []string{"EB-1"})
+	if removed != 1 {
+		t.Fatalf("expected 1 removed (EB-2), got %d", removed)
+	}
+	got := map[string]bool{}
+	for _, tk := range m.ListTickets() {
+		got[tk.ID] = true
+	}
+	if !got["EB-1"] {
+		t.Error("EB-1 (still in filter) was wrongly dropped")
+	}
+	if got["EB-2"] {
+		t.Error("EB-2 (fell out of filter) should have been dropped")
+	}
+	if !got["GH-9"] {
+		t.Error("GH-9 (different source) must not be touched")
+	}
+	if !got["EB-7"] {
+		t.Error("EB-7 (has a workflow) must be kept even when not in the list")
+	}
+
+	if n := m.ClearTickets(); n != 3 {
+		t.Fatalf("ClearTickets should remove all 3 remaining, got %d", n)
+	}
+	if len(m.ListTickets()) != 0 {
+		t.Fatal("ClearTickets left tickets behind")
+	}
+}
+
 func TestMemory_TicketsPrune(t *testing.T) {
 	dir := t.TempDir()
 	m, _ := New(filepath.Join(dir, "memory.json"))

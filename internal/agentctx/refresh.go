@@ -36,6 +36,7 @@ func RefreshTickets(ctx context.Context, mem *memory.Memory, board boards.Board)
 		return 0, fmt.Errorf("board list: %w", err)
 	}
 	now := time.Now()
+	bySource := map[string][]string{}
 	for _, t := range tickets {
 		if mem == nil {
 			continue
@@ -48,6 +49,18 @@ func RefreshTickets(ctx context.Context, mem *memory.Memory, board boards.Board)
 			Project:   t.Project,
 			UpdatedAt: t.UpdatedAt, LastSeen: now,
 		})
+		bySource[t.Source] = append(bySource[t.Source], t.ID)
+	}
+	// Reconcile so a tightened filter (e.g. assignee=currentUser) drops
+	// tickets that fell out of the result instead of leaving stale,
+	// now-excluded rows in the table. Skip a source whose page looks
+	// truncated (>=50) to avoid dropping legitimate page-2 matches.
+	if mem != nil {
+		for src, ids := range bySource {
+			if len(ids) < 50 {
+				mem.ReconcileTickets(src, ids)
+			}
+		}
 	}
 	// Bump the daemon's LastPoll so /status reflects the manual
 	// refresh. Don't touch Running/Paused — that's the daemon's job.

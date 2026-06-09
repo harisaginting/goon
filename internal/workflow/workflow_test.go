@@ -41,6 +41,10 @@ func newEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githost
 		// gates. Specific tests that exercise those gates create a separate
 		// engine and toggle this off.
 		AutoApprove: true,
+		// Version=1 prevents resolveConfig from calling LoadConfig and
+		// accidentally picking up the repo-root workflow.json, which
+		// would inject stages the test mock isn't prepared for.
+		Config: WorkflowConfig{Version: 1},
 	}
 	return e, &out, host, board, mem
 }
@@ -242,7 +246,7 @@ func TestEngine_RunsHooksAtEachPhase(t *testing.T) {
 		}
 	}
 	// Branch should use the custom prefix.
-	if len(host.Opened) != 1 || host.Opened[0].Head != "feature/eng-1" {
+	if len(host.Opened) != 1 || host.Opened[0].Head != "feature/ENG-1" {
 		t.Errorf("branch prefix: %+v", host.Opened)
 	}
 }
@@ -304,10 +308,9 @@ func TestEngine_TestCommandOverride(t *testing.T) {
 	e.VerifyRunsOverride = 1
 	e.Config = cfg
 
-	// Use the temp dir as the repo so runTests does anything at all.
-	t.Setenv("GOON_REPO_MAP", "X="+dir)
-
-	_, err := e.Run(context.Background(), boards.Ticket{ID: "X-1", Title: "t", Project: "X"})
+	// Point the repo at the temp dir (pickRepoForTicket returns the
+	// ticket's project) so runTests has somewhere real to run.
+	_, err := e.Run(context.Background(), boards.Ticket{ID: "X-1", Title: "t", Project: dir})
 	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -360,72 +363,28 @@ func TestEngine_PRTitleAndBodyTemplates(t *testing.T) {
 	}
 }
 
-func TestRepoMap(t *testing.T) {
-	t.Setenv("GOON_REPO_MAP", "ENG=/r/eng,WEB=/r/web")
-	m := RepoMap()
-	if m["ENG"] != "/r/eng" || m["WEB"] != "/r/web" {
-		t.Fatalf("RepoMap: %v", m)
-	}
-}
-
-func TestPickRepo(t *testing.T) {
-	t.Setenv("GOON_REPO_MAP", "ENG=/r/eng,*=/r/default")
-	if got := pickRepo(boards.Ticket{Project: "ENG"}); got != "/r/eng" {
-		t.Errorf("ENG: %q", got)
-	}
-	if got := pickRepo(boards.Ticket{Project: "OTHER"}); got != "/r/default" {
-		t.Errorf("OTHER: %q", got)
-	}
-}
-
-// TestPickRepoForTicket_SoftHintLadder covers the soft-hint
-// ladder pickRepoForTicket exposes to the triage prompt:
+// TestPickRepoForTicket asserts the soft hint pickRepoForTicket exposes to
+// the triage prompt: the ticket's own project key. The LLM + REPOSITORY.md +
+// confirm_repo gate make the real decision.
 //
-//   1. GOON_REPO_MAP exact key match (operator-explicit)
-//   2. GOON_REPO_MAP "*" wildcard fallback
-//   3. ticket.Project literal (last resort)
-//
-// We DELIBERATELY no longer consult Memory.RepoChoices here — that
-// per-project cache was the source of the "ENG-1 and ENG-2 forced
-// to the same single repo" bug. Each ticket is now classified +
-// asked independently via triage + REPOSITORY.md, with this
-// function providing only a low-confidence default the LLM is free
-// to override.
-func TestPickRepoForTicket_SoftHintLadder(t *testing.T) {
-	t.Run("env exact wins over wildcard", func(t *testing.T) {
-		t.Setenv("GOON_REPO_MAP", "ENG=/r/env-eng,*=/r/wildcard")
-		e := &Engine{Memory: memory.Disabled()}
-		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/env-eng" {
-			t.Errorf("env exact should win; got %q", got)
-		}
-	})
-	t.Run("wildcard used when no exact match", func(t *testing.T) {
-		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
-		e := &Engine{Memory: memory.Disabled()}
-		if got := e.pickRepoForTicket(boards.Ticket{Project: "OTHER"}); got != "/r/wildcard" {
-			t.Errorf("wildcard fallback failed; got %q", got)
-		}
-	})
-	t.Run("project literal as last resort", func(t *testing.T) {
-		t.Setenv("GOON_REPO_MAP", "")
+// It must NEVER consult Memory.RepoChoices — that per-project cache was the
+// source of the "ENG-1 and ENG-2 forced to the same single repo" bug. Each
+// ticket is classified + asked independently via triage + REPOSITORY.md.
+func TestPickRepoForTicket(t *testing.T) {
+	t.Run("returns the ticket project", func(t *testing.T) {
 		e := &Engine{Memory: memory.Disabled()}
 		if got := e.pickRepoForTicket(boards.Ticket{Project: "owner/repo"}); got != "owner/repo" {
-			t.Errorf("project-literal fallback failed; got %q", got)
+			t.Errorf("hint should be the ticket project; got %q", got)
 		}
 	})
 	t.Run("learned cache is IGNORED (regression guard)", func(t *testing.T) {
-		// memory.RepoChoices still exists on disk for backwards-compat
-		// with old memory.json files, but pickRepoForTicket must never
-		// consult it. Otherwise we re-introduce the project-level
-		// auto-pick bug — ENG-1 always seeing the same repo as the
-		// last confirmed ENG ticket regardless of triage's per-ticket
-		// classification.
-		t.Setenv("GOON_REPO_MAP", "*=/r/wildcard")
+		// memory.RepoChoices still exists on disk for backwards-compat with
+		// old memory.json files, but pickRepoForTicket must never consult it.
 		mem := memory.Disabled()
 		mem.RecordRepoChoice("ENG", "/r/stale-cache")
 		e := &Engine{Memory: mem}
-		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "/r/wildcard" {
-			t.Errorf("learned cache should not influence the hint; got %q want /r/wildcard", got)
+		if got := e.pickRepoForTicket(boards.Ticket{Project: "ENG"}); got != "ENG" {
+			t.Errorf("learned cache should not influence the hint; got %q want ENG", got)
 		}
 	})
 }
@@ -475,8 +434,16 @@ func TestEngine_PhaseConfirmRepoDoesNotLearnPerProject(t *testing.T) {
 		t.Fatalf("run ENG-2: %v", err)
 	}
 	pending = mem.PendingQuestions()
-	if len(pending) != 1 {
-		t.Fatalf("ENG-2 should fire its own gate, got %d pending question(s)", len(pending))
+	// ENG-1's approve_plan question is still pending + ENG-2's confirm_repo question.
+	// Assert ENG-2 fired its own gate (at least one new question exists).
+	var eng2Gate bool
+	for _, q := range pending {
+		if strings.Contains(q.Question, "ENG-2") {
+			eng2Gate = true
+		}
+	}
+	if !eng2Gate {
+		t.Fatalf("ENG-2 should fire its own gate, got %d pending question(s): %+v", len(pending), pending)
 	}
 }
 
@@ -503,6 +470,7 @@ func gatedEngine(t *testing.T, replies []string) (*Engine, *bytes.Buffer, *githo
 		Stdout: &out, Stderr: &out,
 		VerifyRunsOverride: 1,
 		AutoApprove:        false,
+		Config:             WorkflowConfig{Version: 1},
 	}
 	return e, &out, host, board, mem
 }

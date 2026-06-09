@@ -11,6 +11,7 @@ import (
 	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/tools"
 )
 
 // maxChatToolIterations caps the LLM ↔ tool loop per chat turn. Each
@@ -84,6 +85,22 @@ type ToolCall struct {
 	URL string `json:"url,omitempty"`
 	// confluence_get — the Confluence page id.
 	PageID string `json:"page_id,omitempty"`
+
+	// obsidian_list — optional subfolder to filter by (e.g. "Projects").
+	Folder string `json:"folder,omitempty"`
+	// obsidian_read — vault-relative note path.
+	Note string `json:"note,omitempty"`
+
+	// gmail_get — the message id from a gmail_search result.
+	ID string `json:"id,omitempty"`
+
+	// gcp_log_search — lookback window in hours (default 24), an optional
+	// severity floor (e.g. "ERROR"), a specific trace id, or a username to
+	// scope a login/register lookup. Query carries free-text/raw filter.
+	Hours    int    `json:"hours,omitempty"`
+	Severity string `json:"severity,omitempty"`
+	Trace    string `json:"trace,omitempty"`
+	User     string `json:"user,omitempty"`
 }
 
 // validActions is the closed set of action strings parseToolCall
@@ -106,6 +123,15 @@ var validActions = map[string]bool{
 	"confluence_get":     true,
 	"web_search":         true,
 	"web_fetch":          true,
+	"obsidian_list":      true,
+	"obsidian_read":      true,
+	"obsidian_search":    true,
+	"obsidian_sync":      true,
+	"calendar_today":     true,
+	"tasks_list":         true,
+	"gmail_search":       true,
+	"gmail_get":          true,
+	"gcp_log_search":     true,
 }
 
 // ChatTurnOptions configures one ChatTurn invocation.
@@ -451,6 +477,89 @@ explicitly asks you to act. "who's reviewing PR 12" → pr_get;
 `)
 	}
 
+	if tools.ObsidianConfigured() {
+		sb.WriteString(`## obsidian_list — list notes in the Obsidian vault
+
+  {"action":"obsidian_list"}
+  {"action":"obsidian_list","folder":"Projects"}
+
+Without "folder" lists every note. With "folder" lists only that subtree.
+
+## obsidian_read — read one Obsidian note in full
+
+  {"action":"obsidian_read","note":"Projects/goon.md"}
+  {"action":"obsidian_read","note":"Daily/2025-01-15"}
+
+"note" is a vault-relative path; .md is auto-appended if omitted.
+
+## obsidian_search — search across all Obsidian notes
+
+  {"action":"obsidian_search","query":"<keyword or phrase>"}
+
+Case-insensitive substring search. Returns note:line: text hits.
+Use obsidian_search to find relevant notes, then obsidian_read for
+the full content. Use these for the user's personal notes and knowledge.
+
+## obsidian_sync — pull latest notes from git repo and reload
+
+  {"action":"obsidian_sync"}
+
+Call this when the user says their vault is updated or asks to sync.
+Only useful when GOON_OBSIDIAN_REPO is configured.
+
+`)
+	}
+
+	if googleConfigured() {
+		sb.WriteString(`## calendar_today — the user's Google Calendar events for today
+
+  {"action":"calendar_today"}
+
+Use for "what meetings do I have today", "what's my schedule", "am I busy".
+
+## tasks_list — the user's open Google Tasks
+
+  {"action":"tasks_list"}
+
+Use for "what are my tasks", "my to-do list", "what's on my plate"
+(combine with jira_search for work assigned on the board).
+
+## gmail_search — search the user's Gmail (read-only)
+
+  {"action":"gmail_search","query":"from:finance newer_than:7d","limit":8}
+
+query uses Gmail's own search syntax: from:, to:, subject:, is:unread,
+newer_than:7d, older_than:1m, has:attachment. Returns id · from · subject
+· snippet. Use for "check my email from …", "any unread from X",
+"emails about <topic> last week".
+
+## gmail_get — read one email in full
+
+  {"action":"gmail_get","id":"<id from gmail_search>"}
+
+Use after gmail_search when the user wants the full content of a specific
+message ("open it", "what does it say", "summarise that email").
+
+`)
+	}
+
+	if gcpLogConfigured() {
+		sb.WriteString(`## gcp_log_search — search Google Cloud Logging (Log Explorer), read-only
+
+  {"action":"gcp_log_search","query":"payment failed","hours":24,"severity":"ERROR","limit":20}
+  {"action":"gcp_log_search","trace":"<traceId>"}              // everything for one trace
+  {"action":"gcp_log_search","user":"harisa","query":"login"}  // a user's login/register events
+
+Fields: query (free text matched across the log entry; may also be a raw
+Cloud Logging filter), hours (lookback, default 24), severity (floor:
+DEBUG/INFO/WARNING/ERROR/CRITICAL), trace (exact trace id), user (username
+to scope to), limit (default 20). Returns rows: timestamp · severity ·
+trace · message. Use for "check the log when user X registered", "get the
+traceId for the login of username …", "search logs for …", "recent errors".
+
+`)
+	}
+
 	sb.WriteString(`## web_search — search the web
 
   {"action":"web_search","query":"<search text>"}
@@ -478,7 +587,8 @@ those have dedicated tools above.
     landed in a different status than the user asked for, say so
     plainly. If a tool failed, report the actual error — do not invent
     a reason or a missing capability. You DO have live Jira / PR /
-    Confluence / web access through these tools.
+    Confluence / web access through these tools, plus Obsidian vault
+    access when GOON_OBSIDIAN_VAULT is configured.
 `)
 	return sb.String()
 }
@@ -665,6 +775,24 @@ func executeToolCall(ctx context.Context, board boards.Board, host githost.Host,
 		return execWebSearch(ctx, c)
 	case "web_fetch":
 		return execWebFetch(ctx, c)
+	case "obsidian_list":
+		return execObsidianList(c)
+	case "obsidian_read":
+		return execObsidianRead(c)
+	case "obsidian_search":
+		return execObsidianSearch(c)
+	case "obsidian_sync":
+		return execObsidianSync()
+	case "calendar_today":
+		return execCalendarToday(ctx, c)
+	case "tasks_list":
+		return execTasksList(ctx, c)
+	case "gmail_search":
+		return execGmailSearch(ctx, c)
+	case "gmail_get":
+		return execGmailGet(ctx, c)
+	case "gcp_log_search":
+		return execGCPLogSearch(ctx, c)
 	default:
 		// Should never happen — parseToolCall already filters action.
 		return fmt.Sprintf("TOOL ERROR: unknown action %q.", c.Action),

@@ -94,13 +94,14 @@ func TestExample_Engineering(t *testing.T) {
 		t.Errorf("execute output type = %T (want string)", state.Stages["execute"])
 	}
 
-	// Trace the recorded prompts/tasks. The execute task must contain the
+	// Trace all recorded prompts/tasks. The execute task must contain the
 	// triage steps interpolated via the {{range}} block.
 	var sawExecutePrompt bool
-	for i := range mock.LastMsgs {
-		c := mock.LastMsgs[i].Content
-		if strings.Contains(c, "add OAuth handler") && strings.Contains(c, "wire route") {
-			if strings.Contains(c, "Implement ticket") {
+	for _, msgs := range mock.AllMsgs {
+		for _, msg := range msgs {
+			c := msg.Content
+			if strings.Contains(c, "add OAuth handler") && strings.Contains(c, "wire route") &&
+				strings.Contains(c, "Implement ticket") {
 				sawExecutePrompt = true
 			}
 		}
@@ -139,7 +140,8 @@ func TestExample_MarketingBrief(t *testing.T) {
 
 	// The review stage's prompt must contain the brief as actual JSON, not as
 	// Go's default map[key:value] string formatting.
-	reviewPrompt := mock.LastMsgs[1].Content
+	// AllMsgs[1] = the messages sent on the 2nd LLM call (review stage).
+	reviewPrompt := mock.AllMsgs[1][len(mock.AllMsgs[1])-1].Content
 	if !strings.Contains(reviewPrompt, `"audience":"indie devs"`) {
 		t.Errorf("review prompt does not contain JSON-marshaled brief:\n%s", reviewPrompt)
 	}
@@ -148,7 +150,8 @@ func TestExample_MarketingBrief(t *testing.T) {
 	}
 
 	// The publish task should have rendered the ticket key.
-	publishTask := mock.LastMsgs[2].Content
+	// AllMsgs[2] = the messages sent on the 3rd LLM call (publish agent).
+	publishTask := mock.AllMsgs[2][len(mock.AllMsgs[2])-1].Content
 	if !strings.Contains(publishTask, "ENG-1") {
 		t.Errorf("publish task missing ticket key:\n%s", publishTask)
 	}

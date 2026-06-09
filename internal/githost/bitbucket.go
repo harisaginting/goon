@@ -132,6 +132,7 @@ func (b *Bitbucket) OpenPR(ctx context.Context, o CreateOptions) (PR, error) {
 		URL:    pr.Links.HTML.Href,
 		Title:  pr.Title,
 		Branch: pr.Source.Branch.Name,
+		Base:   o.Base,
 	}, nil
 }
 
@@ -158,6 +159,13 @@ type bbPRDetail struct {
 			Name string `json:"name"`
 		} `json:"branch"`
 	} `json:"source"`
+	// Destination is the PR's target/base branch — needed so the UI can
+	// show "head → base" and filter PRs by target branch.
+	Destination struct {
+		Branch struct {
+			Name string `json:"name"`
+		} `json:"branch"`
+	} `json:"destination"`
 	// Participants includes both reviewers and anyone who has
 	// commented; we filter to role=="REVIEWER" in reviewers().
 	Participants []bbParticipant `json:"participants"`
@@ -261,6 +269,7 @@ func (b *Bitbucket) ListPRs(ctx context.Context, repos []string) ([]PR, error) {
 				URL:    it.Links.HTML.Href,
 				Title:  it.Title,
 				Branch: it.Source.Branch.Name,
+				Base:   it.Destination.Branch.Name,
 				Author: it.authorName(),
 				State:  strings.ToLower(it.State),
 				Body:   it.Description,
@@ -443,7 +452,7 @@ func (b *Bitbucket) GetPRDetails(ctx context.Context, repo string, number int) (
 	}
 	pr := PR{
 		Number: d.ID, Title: d.Title, URL: d.Links.HTML.Href,
-		Branch: d.Source.Branch.Name, Author: d.authorName(),
+		Branch: d.Source.Branch.Name, Base: d.Destination.Branch.Name, Author: d.authorName(),
 		State: strings.ToLower(d.State), Body: d.Description, Repo: repo,
 		Reviewers: d.reviewers(),
 	}
@@ -620,6 +629,7 @@ func (b *Bitbucket) ReviewRequestedPRs(ctx context.Context) ([]PR, error) {
 				URL:    it.Links.HTML.Href,
 				Title:  it.Title,
 				Branch: it.Source.Branch.Name,
+				Base:   it.Destination.Branch.Name,
 				Author: it.authorName(),
 				State:  strings.ToLower(it.State),
 				Body:   it.Description,

@@ -7,7 +7,7 @@
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <style>
   /* ---------- design tokens — dark-only, mirrors the dashboard palette
-       primary / accent → Neon Purple   #A855F7
+       primary / accent → Indigo   #6366F1
        highlight        → Vibrant Amber #F59E0B (callouts use this)
        background       → Obsidian #09090B family
        muted            → Cool Grey #94A3B8
@@ -23,8 +23,8 @@
     --fg: #FFFFFF;
     --fg-soft: #94A3B8;
     --fg-mute: #64748B;
-    --accent: #A855F7;
-    --accent-soft: rgba(168, 85, 247, 0.14);
+    --accent: #6366F1;
+    --accent-soft: rgba(99, 102, 241, 0.14);
     --highlight: #F59E0B;
     --highlight-soft: rgba(245, 158, 11, 0.14);
     --warn: #F59E0B;
@@ -33,9 +33,9 @@
     --border: #27272D;
     --border-soft: rgba(39, 39, 45, 0.7);
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
-    --shadow:    0 12px 32px -14px rgba(168,85,247,0.30);
+    --shadow:    0 12px 32px -14px rgba(99,102,241,0.30);
     --topbar-h: 56px;
     color-scheme: dark;
   }
@@ -354,7 +354,6 @@ goon config path         # print the config file path</code></pre>
     <tr><td><code>GOON_AUTO_APPROVE</code></td><td><code>1</code> to skip the approval gates (fully unattended)</td></tr>
     <tr><td><code>GOON_POLL_SECONDS</code></td><td>poll interval, default <code>300</code> (5 min)</td></tr>
     <tr><td><code>GOON_VERIFY_RUNS</code></td><td>extra verify passes before PR, default <code>3</code></td></tr>
-    <tr><td><code>GOON_REPO_MAP</code></td><td>map board project to local clone, e.g. <code>ENG=/repos/eng,*=/repos/default</code></td></tr>
   </table>
 
   <h3>Atlassian (Jira board + Confluence tool)</h3>
@@ -716,7 +715,7 @@ goon uninstall --yes --purge   # also removes the binary</code></pre>
   <p>Yes — use Ollama for local models, or the <code>mock</code> provider for offline testing. Both are zero-cost.</p>
 
   <h4>How does goon decide which repo to work on?</h4>
-  <p>By <code>GOON_REPO_MAP</code> (mapping board project keys to local paths) or by the ticket's project field. The <code>confirm_repo</code> gate gives you a chance to override before any code is written.</p>
+  <p>Per ticket: goon's triage step reads <code>REPOSITORY.md</code> (your remote→local repo map) and proposes the right repo(s), defaulting to the ticket's project field. The <code>confirm_repo</code> gate lets you override before any code is written.</p>
 
   <h4>What does goon write to memory.json that I should know about?</h4>
   <p>Tickets seen, workflow records (state + plan + approvals + PR URL), the question queue, daemon status snapshot, and authorized Telegram chat IDs. No source code, no secrets — secrets stay in <code>.env</code>, never in <code>memory.json</code>.</p>

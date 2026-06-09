@@ -7,14 +7,19 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/harisaginting/goon/internal/agentctx"
 	"github.com/harisaginting/goon/internal/chats"
+	"github.com/harisaginting/goon/internal/google"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/notes"
 	"github.com/harisaginting/goon/internal/repository"
+	"github.com/harisaginting/goon/internal/tools"
+	"github.com/harisaginting/goon/internal/usage"
 )
 
 // chatSystemPrompt mirrors the Telegram bot's chat persona. Both
@@ -149,6 +154,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// what it needs.
 	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
 	defer cancel()
+	ctx = usage.WithLabel(ctx, "chat")
 	result, err := agentctx.ChatTurn(ctx, agentctx.ChatTurnOptions{
 		LLM:          s.opts.LLM,
 		Memory:       s.opts.Memory,
@@ -200,12 +206,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.events.Publish("threadsChanged")
 	}
 
-	// Return TWO bubbles back-to-back: the user's message echoed
-	// (in case the form clear races the response render) + the
-	// assistant reply. htmx's beforeend swap on the message column
-	// appends both.
+	// Return ONLY the assistant bubble. The user bubble is injected
+	// client-side in goonChatBeforeRequest before the request fires,
+	// so it appears instantly without waiting for the LLM.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	writeChatBubble(w, "user", msg)
 	writeChatBubble(w, "assistant", reply)
 }
 
@@ -230,7 +234,7 @@ func (s *Server) handleChatReset(w http.ResponseWriter, r *http.Request) {
 	// Return the empty conversation log so htmx outerHTML-swaps the
 	// transcript pane back to its zero state.
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	io.WriteString(w, chatTranscriptEmpty)
+	io.WriteString(w, chatTranscriptEmpty())
 }
 
 // handleChatThreads renders the left-rail thread list — past
@@ -255,17 +259,19 @@ func (s *Server) handleChatThreads(w http.ResponseWriter, _ *http.Request) {
 		}
 		fmt.Fprintf(w, `<div class="group flex items-center gap-1 rounded-md hover:bg-surface-raised transition px-1">
 			<button type="button" onclick="goonChatLoadThread('%s')"
+				title="%s"
 				class="flex-1 min-w-0 text-left py-1.5 px-1.5">
-				<div class="text-xs text-white truncate">%s</div>
+				<div class="text-xs text-ink truncate">%s</div>
 				%s
 				<div class="text-[10px] text-muted/70">%s · %d msg%s</div>
 			</button>
-			<form hx-post="/api/chat/thread/delete" hx-confirm="Delete this saved chat?" hx-target="#chat-threads" hx-swap="innerHTML" class="opacity-0 group-hover:opacity-100 transition">
+			<form hx-post="/api/chat/thread/delete" hx-target="#chat-threads" hx-swap="innerHTML" class="opacity-0 group-hover:opacity-100 transition">
 				<input type="hidden" name="id" value="%s">
-				<button type="submit" class="text-xs text-muted hover:text-rose-500 px-1.5 py-1" title="delete">✕</button>
+				<button type="submit" onclick="return confirm('Delete this chat?')" class="text-xs text-muted hover:text-rose-500 px-1.5 py-1" title="delete">✕</button>
 			</form>
 		</div>`,
 			html.EscapeString(t.ID),
+			html.EscapeString(t.Title),
 			html.EscapeString(t.Title),
 			repoBadge,
 			html.EscapeString(ago), t.MessageN, pluralS(t.MessageN),
@@ -349,36 +355,46 @@ func (s *Server) handleChatSaveAsNote(w http.ResponseWriter, r *http.Request) {
 	fragOK(w, "saved to "+path+" — visible to goon in every future run")
 }
 
-// chatTranscriptEmpty is the "nothing here yet" pane rendered before
-// the first message and after /api/chat/reset. Includes clickable
-// example prompts that auto-fill the composer.
-const chatTranscriptEmpty = `<div id="chat-transcript" class="flex flex-col gap-4 min-h-[280px] max-h-[60vh] overflow-y-auto scrollbar-thin pr-2 py-1">
-	<div class="mx-auto max-w-md text-center py-6">
-		<div class="mx-auto mb-3 h-12 w-12 rounded-2xl bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-base font-bold shadow-lift">GO</div>
-		<div class="text-sm font-medium text-gray-700 dark:text-gray-300">Ask goon anything</div>
-		<div class="mt-1 text-xs text-gray-500 dark:text-gray-500">
-			Grounded on your live tickets, PRs, workflows, and knowledge notes. Tools: Jira · PRs · Confluence · web.
-		</div>
-		<div class="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-2 text-left">
-			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="what tickets are open?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
-				<div class="font-medium">→ what tickets are open?</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">list non-done tickets</div>
-			</button>
-			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="any pending approvals?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
-				<div class="font-medium">→ any pending approvals?</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">workflows waiting on you</div>
-			</button>
-			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="review my open PRs awaiting my review" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
-				<div class="font-medium">→ review my open PRs</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">draft a review for PRs awaiting me</div>
-			</button>
-			<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="what do you know about this project?" class="rounded-md border border-gray-200 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 text-xs text-left text-gray-700 dark:text-gray-300 hover:border-accent hover:text-accent transition">
-				<div class="font-medium">→ what do you know about this project?</div>
-				<div class="mt-0.5 text-[11px] text-gray-500">recall from SOUL.md + notes</div>
-			</button>
-		</div>
+// chatTranscriptEmpty is the "nothing here yet" pane rendered before the
+// first message and after /api/chat/reset. It's a function (not a const)
+// so it can surface Google Workspace prompt chips once goon is connected —
+// otherwise those tools are invisible and users never discover them.
+// #chat-transcript is the htmx beforeend target AND the scroll container —
+// no max-height cap here; height comes from the flex parent in fragTabChat.
+func chatTranscriptEmpty() string {
+	subtitle := "Tickets · PRs · Confluence · web · Obsidian"
+	if google.Configured() {
+		subtitle = "Tickets · PRs · Calendar · Mail · Logs · web"
+	}
+	chips := chatChip("what tickets are open?", "open tickets", "non-done tickets") +
+		chatChip("any pending approvals?", "pending approvals", "workflows waiting on you") +
+		chatChip("review my open PRs awaiting my review", "review open PRs", "draft a PR review") +
+		chatChip("what do you know about this project?", "project knowledge", "what goon knows")
+	if google.Configured() {
+		chips += chatChip("what meetings do I have today?", "today's schedule", "Google Calendar") +
+			chatChip("what are my tasks today?", "my tasks", "Google Tasks + Jira") +
+			chatChip("check my email from the last week", "recent email", "search Gmail")
+		if strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_PROJECT")) != "" {
+			chips += chatChip("any errors in the logs in the last hour?", "recent errors", "Cloud Logging")
+		}
+	}
+	return `<div id="chat-transcript" class="h-full overflow-y-auto scrollbar-thin px-4 py-4 space-y-4">
+	<div class="mx-auto max-w-sm text-center py-10">
+		<div class="mx-auto mb-4 h-12 w-12 rounded-2xl bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-base font-bold shadow-lift">GO</div>
+		<div class="text-sm font-semibold text-ink">Ask goon anything</div>
+		<div class="mt-1 text-xs text-muted">` + subtitle + `</div>
+		<div class="mt-5 grid grid-cols-2 gap-2 text-left">` + chips + `</div>
 	</div>
 </div>`
+}
+
+// chatChip renders one starter-prompt button for the empty chat state.
+func chatChip(query, title, sub string) string {
+	return `<button type="button" onclick="goonChatFill(this.dataset.q)" data-q="` + html.EscapeString(query) + `" class="rounded-lg border border-surface-border bg-surface px-3 py-2.5 text-xs text-ink hover:border-accent hover:text-accent transition text-left">
+				<div class="font-medium">→ ` + html.EscapeString(title) + `</div>
+				<div class="mt-0.5 text-[11px] text-muted">` + html.EscapeString(sub) + `</div>
+			</button>`
+}
 
 // writeChatBubble emits one styled message bubble. Roles map to
 // distinct visual tones: user is right-aligned accent, assistant is
@@ -389,13 +405,14 @@ func writeChatBubble(w io.Writer, role, body string) {
 	safe := html.EscapeString(body)
 	safe = strings.ReplaceAll(safe, "\n", "<br>")
 	now := time.Now().Format("15:04")
+	tsUnix := time.Now().Unix()
 
 	var wrap, bubble, avatar, label string
 	switch role {
 	case "user":
 		wrap = "flex flex-row-reverse gap-2 chat-bubble animate-fade-in"
 		bubble = `max-w-[85%] rounded-2xl rounded-tr-md bg-accent text-surface px-3.5 py-2 text-sm whitespace-pre-wrap shadow-sm`
-		avatar = `<div class="shrink-0 h-7 w-7 rounded-full bg-accent/15 text-accent flex items-center justify-center text-xs font-semibold">YO</div>`
+		avatar = `<div class="shrink-0 h-7 w-7 rounded-full bg-accent/15 text-accent flex items-center justify-center text-xs font-semibold">H</div>`
 		label = "you"
 	case "assistant":
 		wrap = "flex flex-row gap-2 chat-bubble animate-fade-in"
@@ -423,11 +440,11 @@ func writeChatBubble(w io.Writer, role, body string) {
 		<div class="min-w-0 flex flex-col %s">
 			<div class="flex items-baseline gap-2 mb-0.5 px-0.5">
 				<span class="text-[11px] font-medium text-gray-600 dark:text-gray-400">%s</span>
-				<span class="text-[10px] text-gray-400 font-mono">%s</span>
+				<span class="msg-time text-[10px] text-muted font-mono" data-ts="%d">%s</span>
 			</div>
 			<div class="%s">%s</div>
 		</div>
-	</div>`, wrap, avatar, metaAlign, html.EscapeString(label), now, bubble, safe)
+	</div>`, wrap, avatar, metaAlign, html.EscapeString(label), tsUnix, now, bubble, safe)
 }
 
 // trimChatHistory keeps the last maxWebChatHistory*2 messages.
@@ -441,126 +458,132 @@ func trimChatHistory(hist []llm.Message) []llm.Message {
 
 // --- Tab composers ---------------------------------------------------------
 
-// fragTabChat renders the chat panel — transcript + input form. The
-// transcript pane is a single htmx swap target; each POST to
-// /api/chat appends two bubbles (user echo + assistant reply).
+// fragTabChat renders the full-height chat shell.
+//
+// Layout (flex column fills viewport below header):
+//   ┌─ sidebar (history) ─┬─ chat panel (flex col) ─────────────────┐
+//   │  thread list        │  topbar (repo picker + new)             │
+//   │  (scroll)           ├─────────────────────────────────────────┤
+//   │                     │  #chat-transcript (flex-1, scrolls)     │
+//   │                     ├─────────────────────────────────────────┤
+//   │                     │  composer (shrink-0, always visible)    │
+//   └─────────────────────┴─────────────────────────────────────────┘
+//
+// The fix for "chat is so damn bad":
+//   - chatTranscriptEmpty no longer has max-h-[60vh] — height comes
+//     from the flex parent.
+//   - #chat-transcript has h-full overflow-y-auto so it fills and
+//     scrolls internally rather than fighting a nested scroll container.
+//   - Overall container uses calc height to fill the viewport exactly.
 func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	llmAvailable := s.opts.LLM != nil
-
-	// Pre-fetch the REPOSITORY.md entries for the repo-context picker
-	// so users can scope a conversation without typing slugs. Empty
-	// when no host is configured / no repos tracked — the picker
-	// collapses to a free-text input in that case.
 	repoEntries, _ := repositoryEntriesForPicker()
 
-	fmt.Fprint(w, `<section>
-		<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-			<div>
-				<h2 class="text-xl font-semibold tracking-tight">Chat</h2>
-				<p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-					Ask about tickets, PRs, or your knowledge notes. Goon can comment on Jira tickets and pull requests, move statuses, draft PR reviews, search Confluence, and fetch web pages. Conversations are saved automatically — reopen one anytime from the left rail.
-				</p>
-			</div>
-			<div class="flex items-center gap-2">
-				<button type="button" onclick="goonChatNewThread()"
-					class="inline-flex items-center gap-1.5 rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">
-					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-					new chat
-				</button>
-				<button type="button" hx-post="/api/chat/reset" hx-target="#chat-transcript" hx-swap="outerHTML"
-					class="inline-flex items-center gap-1.5 rounded-md border border-gray-200 dark:border-surface-border px-3 py-1.5 text-xs text-gray-500 hover:border-rose-500/40 hover:text-rose-500 transition">
-					reset window
-				</button>
-			</div>
-		</div>`)
 	if !llmAvailable {
-		fmt.Fprint(w, `<div class="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
-			No LLM provider configured. Set one on the Configuration tab and reload.
-		</div></section>`)
+		fmt.Fprint(w, `<div class="rounded-xl border border-amber-500/40 bg-amber-500/10 px-4 py-4 text-sm text-amber-700 dark:text-amber-400">
+			No LLM provider configured — set one on the <strong>Setup</strong> tab and reload.
+		</div>`)
 		return
 	}
 
-	// Two-column layout: thread sidebar (left) + chat panel (right).
-	// Sidebar collapses on narrow viewports to a stacked accordion.
-	fmt.Fprint(w, `<div class="grid grid-cols-1 lg:grid-cols-[16rem_1fr] gap-4">`)
+	// Outer flex row — fills viewport below header (3.5rem) + main top padding (1.5rem).
+	// -mt-6 cancels the main section's py-6 top so we reach from header to bottom
+	// without the transcript getting clipped. -mx-4 lg:-mx-8 bleeds to edge.
+	fmt.Fprint(w, `<div class="-mx-4 lg:-mx-8 -mt-6 flex h-[calc(100vh-3.5rem)] overflow-hidden">`)
 
-	// --- Left rail: saved threads -------------------------------------------
-	fmt.Fprint(w, `<aside class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card overflow-hidden">
-		<div class="px-3 py-2 border-b border-surface-border flex items-center justify-between">
-			<div class="text-[11px] uppercase tracking-wider text-muted font-semibold">Saved chats</div>
+	// ── Left sidebar: chat history (toggleable drawer) ─────────────────
+	fmt.Fprint(w, `<aside id="chat-history-drawer" class="flex flex-col w-56 shrink-0 border-r border-surface-border bg-surface-sunken/60 overflow-hidden lg:flex hidden">
+		<div class="px-3 py-3 border-b border-surface-border flex items-center justify-between shrink-0">
+			<span class="text-[11px] uppercase tracking-wider text-muted font-semibold">History</span>
+			<button type="button" onclick="goonChatNewThread()"
+				class="text-[11px] text-accent hover:brightness-125 font-medium transition">+ new</button>
 		</div>
-		<div id="chat-threads" class="px-1.5 py-2 max-h-[60vh] overflow-y-auto scrollbar-thin"
+		<div id="chat-threads" class="flex-1 overflow-y-auto scrollbar-thin px-1.5 py-2"
 			hx-get="/api/chat/threads" hx-trigger="load, threadsChanged from:body" hx-swap="innerHTML">
-			<div class="text-xs text-muted px-2 py-1">Loading…</div>
+			<div class="text-xs text-muted px-2 py-2">Loading…</div>
 		</div>
 	</aside>`)
 
-	// --- Right: chat panel --------------------------------------------------
-	fmt.Fprint(w, `<div class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card overflow-hidden flex flex-col min-h-[60vh]">`)
+	// ── Right: chat panel (flex col, fills remaining width) ────────────
+	fmt.Fprint(w, `<div class="flex-1 min-w-0 flex flex-col overflow-hidden">`)
 
-	// Repo-context picker pinned above the transcript.
-	fmt.Fprint(w, `<div class="px-4 py-3 border-b border-surface-border bg-surface-sunken/40 flex items-center gap-3 flex-wrap">
-		<label class="text-[11px] uppercase tracking-wider text-muted font-semibold whitespace-nowrap">talking about</label>
-		<select id="chat-repo-context" name="repo"
-			class="flex-1 min-w-[180px] rounded-md border border-surface-border bg-surface text-sm text-white px-2 py-1 focus:border-accent focus:outline-none">
-			<option value="">— no specific repo —</option>`)
-	for _, e := range repoEntries {
-		fmt.Fprintf(w, `<option value="%s">%s</option>`,
-			html.EscapeString(e), html.EscapeString(e))
+	// Topbar — compact bar with history toggle, repo picker, new chat
+	fmt.Fprint(w, `<div class="shrink-0 flex items-center gap-2 px-4 py-2.5 border-b border-surface-border bg-surface-raised/80 backdrop-blur-sm">
+		<button id="chat-history-toggle" type="button"
+			class="p-1.5 rounded-md text-muted hover:text-accent hover:bg-accent-soft transition"
+			onclick="(function(){var d=document.getElementById('chat-history-drawer');d.classList.toggle('hidden');d.classList.toggle('flex');})()"
+			title="Toggle history sidebar">☰</button>
+		<span class="text-sm font-semibold text-ink shrink-0">goon</span>
+		<div class="flex-1 min-w-0">`)
+	if len(repoEntries) > 0 {
+		fmt.Fprint(w, `<select id="chat-repo-context" name="repo" title="Conversation scope"
+				class="w-full max-w-[260px] rounded-md border border-surface-border bg-surface text-xs text-muted px-2 py-1 focus:border-accent focus:outline-none truncate">
+				<option value="">— any repo —</option>`)
+		for _, e := range repoEntries {
+			fmt.Fprintf(w, `<option value="%s">%s</option>`, html.EscapeString(e), html.EscapeString(e))
+		}
+		fmt.Fprint(w, `</select>`)
+	} else {
+		fmt.Fprint(w, `<input type="hidden" id="chat-repo-context" value="">`)
 	}
-	fmt.Fprint(w, `</select>
-		<span class="text-[10px] text-muted/70 hidden sm:inline">Goon uses this as scope for every message until you change it.</span>
+	fmt.Fprint(w, `</div>
+		<button type="button" onclick="goonChatNewThread()"
+			class="shrink-0 inline-flex items-center gap-1 rounded-md bg-accent text-surface px-2.5 py-1.5 text-xs font-semibold hover:brightness-110 transition shadow-sm">
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+			new
+		</button>
 	</div>`)
 
-	// Transcript + composer.
-	fmt.Fprint(w, `<div class="px-4 py-4 sm:px-5 sm:py-5 flex-1 overflow-y-auto">`)
-	fmt.Fprint(w, chatTranscriptEmpty)
-	fmt.Fprint(w, `</div>
-		<div class="border-t border-gray-200 dark:border-surface-border bg-gray-50/60 dark:bg-surface-sunken/60 px-3 py-3 sm:px-4">
-			<form id="goon-chat-form" hx-post="/api/chat" hx-target="#chat-transcript" hx-swap="beforeend"
-				hx-on::after-request="goonChatAfter(event)" class="flex items-end gap-2">
-				<!-- Hidden fields auto-populated from the picker + the current
-				     thread id. JS keeps them in sync so the server always
-				     knows which thread + which repo scope to write against. -->
-				<input type="hidden" id="goon-chat-thread-id" name="thread_id" value="">
-				<input type="hidden" id="goon-chat-repo-mirror" name="repo" value="">
-				<div class="flex-1 relative">
-					<textarea id="goon-chat-input" name="message" autocomplete="off" required autofocus rows="1"
-						placeholder="ask goon anything…  (Shift+Enter for newline)"
-						class="w-full resize-none rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 pr-10 text-sm focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none max-h-40"
-						onkeydown="goonChatKey(event)"
-						oninput="goonChatAutosize(this)"></textarea>
-					<div class="absolute bottom-2 right-3 text-[10px] text-gray-400 pointer-events-none htmx-indicator">
-						<svg class="h-4 w-4 animate-spin-slow text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"/><path d="M22 12a10 10 0 0 1-10 10"/></svg>
-					</div>
+	// Transcript — flex-1 so it fills remaining height; #chat-transcript
+	// has h-full so overflow-y-auto works without a hard px cap.
+	fmt.Fprint(w, `<div class="flex-1 overflow-hidden">`)
+	fmt.Fprint(w, chatTranscriptEmpty())
+	fmt.Fprint(w, `</div>`)
+
+	// Composer — shrink-0 keeps it pinned to the bottom at all times.
+	fmt.Fprint(w, `<div class="shrink-0 border-t border-surface-border bg-surface-raised/80 px-4 py-3">
+		<form id="goon-chat-form" hx-post="/api/chat" hx-target="#chat-transcript" hx-swap="beforeend"
+			hx-on::before-request="goonChatBeforeRequest(event)"
+			hx-on::after-request="goonChatAfter(event)" class="flex items-end gap-2">
+			<input type="hidden" id="goon-chat-thread-id" name="thread_id" value="">
+			<input type="hidden" id="goon-chat-repo-mirror" name="repo" value="">
+			<div class="flex-1 relative">
+				<textarea id="goon-chat-input" name="message" autocomplete="off" required autofocus rows="1"
+					placeholder="ask goon anything… (Shift+Enter for newline)"
+					class="w-full resize-none rounded-xl border border-surface-border bg-surface px-4 py-2.5 pr-10 text-sm text-ink placeholder:text-muted focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none max-h-40 scrollbar-thin"
+					onkeydown="goonChatKey(event)"
+					oninput="goonChatAutosize(this)"></textarea>
+				<div class="absolute bottom-2.5 right-3 pointer-events-none htmx-indicator">
+					<svg class="h-4 w-4 animate-spin-slow text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" stroke-opacity="0.25"/><path d="M22 12a10 10 0 0 1-10 10"/></svg>
 				</div>
-				<button type="submit"
-					class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 active:brightness-95 transition shadow-sm">
-					<span>send</span>
-					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-				</button>
-			</form>
-			<!-- Thread actions row: save-as-knowledge is the standout — converts
-			     the conversation into a markdown note goon loads on every run. -->
-			<div id="chat-thread-actions" class="hidden mt-2 flex items-center gap-2 text-[11px]">
+			</div>
+			<button type="submit"
+				class="shrink-0 inline-flex items-center justify-center rounded-xl bg-accent text-surface w-10 h-10 hover:brightness-110 active:brightness-95 transition shadow-sm">
+				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+			</button>
+		</form>
+		<div class="mt-2 flex items-center justify-between gap-2 text-[11px] text-muted/70">
+			<span>Shift+Enter for newline</span>
+			<div id="chat-thread-actions" class="hidden flex items-center gap-2">
 				<form hx-post="/api/chat/save-as-note" hx-target="#chat-action-result" hx-swap="innerHTML" class="flex items-center gap-1.5">
 					<input type="hidden" id="goon-chat-thread-id-mirror" name="id" value="">
-					<input type="text" name="name" placeholder="kebab-case-name (optional)"
-						class="rounded-md border border-surface-border bg-surface px-2 py-1 text-xs w-48 focus:border-accent focus:outline-none">
+					<input type="text" name="name" placeholder="note name (optional)"
+						class="rounded-md border border-surface-border bg-surface px-2 py-1 text-[11px] w-36 focus:border-accent focus:outline-none">
 					<button type="submit"
-						class="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 text-emerald-700 dark:text-emerald-400 px-2.5 py-1 text-xs hover:bg-emerald-500/10 transition"
-						title="save this conversation as a knowledge note that goon loads on every run">
-						✨ save as knowledge
+						class="text-emerald-700 dark:text-emerald-400 hover:text-emerald-300 transition whitespace-nowrap text-[11px]">
+						✨ save as note
 					</button>
 				</form>
 				<span id="chat-action-result" class="text-muted"></span>
 			</div>
 		</div>
-	</div>
 	</div>`)
 
-	// --- JS plumbing --------------------------------------------------------
+	fmt.Fprint(w, `</div>`) // close chat panel
+	fmt.Fprint(w, `</div>`) // close outer flex row
+
+	// ── JS plumbing ────────────────────────────────────────────────────
 	fmt.Fprint(w, `<script>
 	(function() {
 		window.goonChatFill = function(q) {
@@ -579,59 +602,98 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 				if (form) htmx.trigger(form, 'submit');
 			}
 		};
-		// Mirror the repo picker into the hidden form field on every change
-		// so the form post always carries the latest scope.
-		const picker = document.getElementById('chat-repo-context');
-		const mirror = document.getElementById('goon-chat-repo-mirror');
-		if (picker && mirror) {
-			const sync = function(){ mirror.value = picker.value; };
-			picker.addEventListener('change', sync);
-			sync();
-		}
-		window.goonChatAfter = function(ev) {
+		// Mirror repo picker → hidden field so POST always carries latest scope.
+		(function syncRepoPicker() {
+			const picker = document.getElementById('chat-repo-context');
+			const mirror = document.getElementById('goon-chat-repo-mirror');
+			if (picker && mirror) {
+				const sync = function(){ mirror.value = picker.value; };
+				picker.addEventListener('change', sync);
+				sync();
+			}
+		})();
+		// Before the POST fires: inject user bubble + thinking indicator
+		// immediately so the UI responds in zero milliseconds.
+		window.goonChatBeforeRequest = function() {
 			const ta = document.getElementById('goon-chat-input');
-			if (ta) { ta.value = ''; ta.style.height = ''; ta.focus(); }
+			const msg = ta ? ta.value.trim() : '';
+			if (!msg) return;
 			const t = document.getElementById('chat-transcript');
-			if (t) t.scrollTop = t.scrollHeight;
-			// Pick up the thread id the server resolved (new or existing)
-			// from the HX-Trigger payload so subsequent posts continue
-			// the same thread instead of creating new ones.
+			if (!t) return;
+			// Remove empty-state prompt grid on first message.
+			const empty = document.getElementById('chat-empty-state');
+			if (empty) empty.remove();
+			// User bubble.
+			const ub = document.createElement('div');
+			ub.className = 'flex flex-row-reverse gap-2 animate-fade-in';
+			const esc = function(s){ return s.replace(/[<>&"]/g, function(c){return({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'})[c];}); };
+			ub.innerHTML =
+				'<div class="shrink-0 h-7 w-7 rounded-full bg-accent/15 text-accent flex items-center justify-center text-xs font-semibold">H</div>' +
+				'<div class="min-w-0 flex flex-col items-end">' +
+				'<div class="max-w-[85%] rounded-2xl rounded-tr-md bg-accent text-surface px-3.5 py-2 text-sm whitespace-pre-wrap shadow-sm">' + esc(msg) + '</div>' +
+				'</div>';
+			t.appendChild(ub);
+			// Thinking indicator.
+			const think = document.createElement('div');
+			think.id = 'goon-thinking';
+			think.className = 'flex flex-row gap-2 animate-fade-in';
+			think.innerHTML =
+				'<div class="shrink-0 h-7 w-7 rounded-full bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-[10px] font-bold">GO</div>' +
+				'<div class="max-w-[85%] rounded-2xl rounded-tl-md border border-surface-border bg-surface-raised px-4 py-3 shadow-sm">' +
+				'<div class="flex gap-1 items-center">' +
+				'<span class="h-1.5 w-1.5 rounded-full bg-muted" style="animation:bounce 1s ease-in-out infinite;animation-delay:0ms"></span>' +
+				'<span class="h-1.5 w-1.5 rounded-full bg-muted" style="animation:bounce 1s ease-in-out infinite;animation-delay:160ms"></span>' +
+				'<span class="h-1.5 w-1.5 rounded-full bg-muted" style="animation:bounce 1s ease-in-out infinite;animation-delay:320ms"></span>' +
+				'</div></div>';
+			t.appendChild(think);
+			// Scroll + clear textarea.
+			requestAnimationFrame(function(){ t.scrollTop = t.scrollHeight; });
+			if (ta) { ta.value = ''; ta.style.height = ''; ta.focus(); }
+		};
+		// After each POST: remove thinking indicator, scroll, sync thread id.
+		window.goonChatAfter = function(ev) {
+			const think = document.getElementById('goon-thinking');
+			if (think) think.remove();
+			const t = document.getElementById('chat-transcript');
+			if (t) requestAnimationFrame(function(){ t.scrollTop = t.scrollHeight; });
 			try {
 				const trig = ev && ev.detail && ev.detail.xhr && ev.detail.xhr.getResponseHeader('HX-Trigger');
 				if (trig) {
 					const j = JSON.parse(trig);
 					if (j && j.chatThreadID) {
-						const f = document.getElementById('goon-chat-thread-id');
-						const fm = document.getElementById('goon-chat-thread-id-mirror');
-						if (f) f.value = j.chatThreadID;
-						if (fm) fm.value = j.chatThreadID;
+						['goon-chat-thread-id','goon-chat-thread-id-mirror'].forEach(function(id){
+							const el = document.getElementById(id);
+							if (el) el.value = j.chatThreadID;
+						});
 						const acts = document.getElementById('chat-thread-actions');
 						if (acts) acts.classList.remove('hidden');
 					}
 				}
 			} catch(e) {}
 		};
+		// Start a fresh conversation: clear ids, replace transcript with empty state,
+		// clear composer. Uses outerHTML swap to inject the empty pane in-place.
 		window.goonChatNewThread = function() {
-			// Clear thread id + transcript + composer to start fresh.
-			const fields = ['goon-chat-thread-id','goon-chat-thread-id-mirror'];
-			fields.forEach(function(id){ const f = document.getElementById(id); if (f) f.value = ''; });
-			const t = document.getElementById('chat-transcript');
-			if (t) t.outerHTML = ` + "`" + "`" + `;
-			// Re-fetch the empty transcript template via reset.
-			htmx.ajax('POST', '/api/chat/reset', '#goon-chat-form');
+			['goon-chat-thread-id','goon-chat-thread-id-mirror'].forEach(function(id){
+				const el = document.getElementById(id);
+				if (el) el.value = '';
+			});
 			const acts = document.getElementById('chat-thread-actions');
 			if (acts) acts.classList.add('hidden');
 			const ta = document.getElementById('goon-chat-input');
-			if (ta) { ta.value = ''; ta.focus(); }
+			if (ta) { ta.value = ''; ta.style.height = ''; ta.focus(); }
+			// Swap the transcript pane via the reset endpoint.
+			htmx.ajax('POST', '/api/chat/reset', {target: '#chat-transcript', swap: 'outerHTML'});
 		};
+		// Load an existing thread from the sidebar.
 		window.goonChatLoadThread = function(id) {
 			fetch('/api/chat/thread?id=' + encodeURIComponent(id))
 				.then(function(r){ if (!r.ok) throw new Error('load failed'); return r.json(); })
 				.then(function(t) {
-					const f  = document.getElementById('goon-chat-thread-id');
-					const fm = document.getElementById('goon-chat-thread-id-mirror');
-					if (f)  f.value = t.id;
-					if (fm) fm.value = t.id;
+					['goon-chat-thread-id','goon-chat-thread-id-mirror'].forEach(function(fid){
+						const el = document.getElementById(fid);
+						if (el) el.value = t.id;
+					});
 					const picker = document.getElementById('chat-repo-context');
 					if (picker && t.repo_context) {
 						picker.value = t.repo_context;
@@ -640,34 +702,57 @@ func (s *Server) fragTabChat(w http.ResponseWriter, _ *http.Request) {
 					}
 					const acts = document.getElementById('chat-thread-actions');
 					if (acts) acts.classList.remove('hidden');
-					// Rehydrate the transcript by replacing the pane.
 					const pane = document.getElementById('chat-transcript');
 					if (!pane) return;
 					pane.innerHTML = '';
 					(t.messages || []).forEach(function(m) {
 						const wrap = document.createElement('div');
-						wrap.className = 'mb-3';
-						wrap.innerHTML = '<div class="text-[10px] uppercase tracking-wider text-muted mb-0.5">' +
-							(m.role === 'user' ? 'you' : (m.role === 'assistant' ? 'goon' : m.role)) +
-							'</div><div class="rounded-md px-3 py-2 text-sm whitespace-pre-wrap ' +
-							(m.role === 'user' ? 'bg-accent/10 text-white' : 'bg-surface text-gray-200') +
-							'">' + (m.content || '').replace(/[<>&]/g, function(c){return ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c];}) + '</div>';
+						wrap.className = 'flex ' + (m.role === 'user' ? 'flex-row-reverse' : 'flex-row') + ' gap-2 animate-fade-in';
+						const esc = function(s){ return (s||'').replace(/[<>&]/g, function(c){return ({'<':'&lt;','>':'&gt;','&':'&amp;'})[c];}); };
+						const avatarCls = m.role === 'user'
+							? 'shrink-0 h-7 w-7 rounded-full bg-accent/15 text-accent flex items-center justify-center text-xs font-semibold'
+							: 'shrink-0 h-7 w-7 rounded-full bg-gradient-to-br from-accent to-highlight text-white flex items-center justify-center text-[10px] font-bold';
+						const bubbleCls = m.role === 'user'
+							? 'max-w-[85%] rounded-2xl rounded-tr-md bg-accent text-surface px-3.5 py-2 text-sm whitespace-pre-wrap shadow-sm'
+							: 'max-w-[85%] rounded-2xl rounded-tl-md border border-surface-border bg-surface text-gray-200 px-3.5 py-2 text-sm whitespace-pre-wrap shadow-sm';
+						const avatarLabel = m.role === 'user' ? 'H' : 'GO';
+						wrap.innerHTML =
+							'<div class="' + avatarCls + '">' + avatarLabel + '</div>' +
+							'<div class="min-w-0 flex flex-col ' + (m.role==='user'?'items-end':'items-start') + '">' +
+							'<div class="' + bubbleCls + '">' + esc(m.content) + '</div>' +
+							'</div>';
 						pane.appendChild(wrap);
 					});
-					pane.scrollTop = pane.scrollHeight;
+					requestAnimationFrame(function(){ pane.scrollTop = pane.scrollHeight; });
 				})
-				.catch(function(err){ alert('Could not load thread: ' + err.message); });
+				.catch(function(err){ console.error('Could not load thread:', err); });
 		};
-		// Auto-scroll on streamed swaps.
+		// Auto-scroll when htmx appends new bubbles.
 		document.addEventListener('htmx:afterSwap', function(e) {
 			const t = document.getElementById('chat-transcript');
 			if (t && e.target && (e.target.id === 'chat-transcript' || t.contains(e.target))) {
-				t.scrollTop = t.scrollHeight;
+				requestAnimationFrame(function(){ t.scrollTop = t.scrollHeight; });
 			}
 		});
+		// Relative timestamps — update all [data-ts] spans every 30s.
+		window.goonUpdateTimestamps = function() {
+			var now = Math.floor(Date.now() / 1000);
+			document.querySelectorAll('.msg-time[data-ts]').forEach(function(el) {
+				var ts = parseInt(el.dataset.ts, 10);
+				if (isNaN(ts)) return;
+				var diff = now - ts;
+				var label;
+				if (diff < 60) label = 'just now';
+				else if (diff < 3600) label = Math.floor(diff/60) + 'm ago';
+				else if (diff < 86400) label = Math.floor(diff/3600) + 'h ago';
+				else label = Math.floor(diff/86400) + 'd ago';
+				el.textContent = label;
+			});
+		};
+		goonUpdateTimestamps();
+		setInterval(goonUpdateTimestamps, 30000);
 	})();
-	</script>
-	</section>`)
+	</script>`)
 }
 
 // repositoryEntriesForPicker returns the slugs from REPOSITORY.md for
@@ -690,164 +775,403 @@ func repositoryEntriesForPicker() ([]string, error) {
 	return out, nil
 }
 
-// fragTabMemory is the consolidated tab covering Knowledge + Skills.
-// Two segmented buttons toggle between two pre-rendered bodies
-// WITHOUT a network round-trip — pure CSS class flip via the
-// goonSwitchStore helper at the bottom.
-//
-// The old Personal segment is gone — character / voice content was
-// folded into SOUL.md (Knowledge tab). One always-loaded file is
-// less confusing than two.
+// fragTabMemory renders the Memory tab as a two-column layout:
+// a sidebar nav on the left (Soul / Notes / Skills) and the active
+// panel on the right. This replaces the old horizontal tab switcher.
 func (s *Server) fragTabMemory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	fmt.Fprint(w, `<div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
-		<div>
-			<h2 class="text-xl font-semibold tracking-tight">Memory</h2>
-			<p class="mt-0.5 text-sm text-muted max-w-2xl">
-				What goon remembers. <strong>Knowledge</strong> is the auto-loaded SOUL.md (character + project facts in one place), plus on-demand topic notes and HISTORY.md. <strong>Skills</strong> are specialist procedures activated on demand.
-			</p>
-		</div>
-		<div class="inline-flex rounded-lg border border-surface-border bg-surface-sunken p-0.5 text-xs font-medium" role="tablist">
-			<button type="button" data-store-switch="knowledge" onclick="goonSwitchStore('knowledge')"
-				class="px-3 py-1.5 rounded-md transition bg-surface-raised text-accent shadow-card" aria-current="page">
-				Knowledge
-			</button>
-			<button type="button" data-store-switch="skills" onclick="goonSwitchStore('skills')"
-				class="px-3 py-1.5 rounded-md transition text-muted hover:text-accent">
-				Skills
-			</button>
-		</div>
+
+	noteIdx := agentctx.KnowledgeIndex("")
+	skillIdx := agentctx.SkillsIndex("")
+
+	// ── Two-column layout ────────────────────────────────────────────────
+	fmt.Fprint(w, `<div class="flex gap-6 min-h-[420px]">`)
+
+	// ── Left sidebar nav ─────────────────────────────────────────────────
+	fmt.Fprint(w, `<nav class="w-40 shrink-0 flex flex-col">
+		<div class="mb-3 px-2 text-[10px] uppercase tracking-wider font-semibold text-muted/60">Memory</div>`)
+
+	type navItem struct{ id, svgPath, label string }
+	items := []navItem{
+		{"soul",
+			`<path d="M12 2l3 6 6 .9-4.5 4.4 1 6.7L12 17l-5.5 3 1-6.7L3 8.9 9 8z"/>`,
+			"Soul"},
+		{"notes",
+			`<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>`,
+			"Notes"},
+		{"skills",
+			`<path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>`,
+			"Skills"},
+	}
+	for i, it := range items {
+		activeClass := ""
+		if i == 0 {
+			activeClass = "bg-accent/10 text-accent font-semibold"
+		}
+		badge := ""
+		if it.id == "notes" && len(noteIdx) > 0 {
+			badge = fmt.Sprintf(`<span class="ml-auto text-[10px] font-mono bg-surface-sunken px-1.5 py-0.5 rounded-full shrink-0">%d</span>`, len(noteIdx))
+		} else if it.id == "skills" && len(skillIdx) > 0 {
+			badge = fmt.Sprintf(`<span class="ml-auto text-[10px] font-mono bg-surface-sunken px-1.5 py-0.5 rounded-full shrink-0">%d</span>`, len(skillIdx))
+		}
+		fmt.Fprintf(w, `<button type="button" data-mem-nav="%s" onclick="goonMemoryNav('%s')"
+			class="w-full text-left px-3 py-2 mb-0.5 rounded-lg text-sm flex items-center gap-2.5 transition text-muted hover:text-ink hover:bg-surface-raised/60 %s">
+			<svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">%s</svg>
+			<span>%s</span>%s
+		</button>`, it.id, it.id, activeClass, it.svgPath, it.label, badge)
+	}
+
+	// Separator + context-aware new buttons
+	fmt.Fprint(w, `<div class="mt-auto pt-4 border-t border-surface-border space-y-0.5">
+		<button id="mem-new-note-btn" type="button" onclick="goonMemoryNewNote()"
+			class="w-full text-left text-xs px-3 py-1.5 rounded-md text-muted hover:text-accent hover:bg-accent/5 transition flex items-center gap-1.5">
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+			new note
+		</button>
+		<button id="mem-new-skill-btn" type="button" onclick="goonMemoryNewSkill()"
+			class="hidden w-full text-left text-xs px-3 py-1.5 rounded-md text-muted hover:text-accent hover:bg-accent/5 transition flex items-center gap-1.5">
+			<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+			new skill
+		</button>
 	</div>
+	</nav>`)
 
-	<div data-store="knowledge">`)
-	s.renderKnowledgeBody(w)
-	fmt.Fprint(w, `</div>
-	<div data-store="skills" class="hidden">`)
+	// ── Right content area ───────────────────────────────────────────────
+	fmt.Fprint(w, `<div class="flex-1 min-w-0">`)
+
+	// Inline create form — hidden until triggered
+	fmt.Fprint(w, `<div id="memory-new-form" class="hidden mb-5 rounded-xl border border-accent/40 bg-surface-raised shadow-card overflow-hidden">
+		<div class="px-4 py-3 border-b border-surface-border flex items-center justify-between">
+			<span id="memory-new-form-label" class="text-xs font-semibold text-accent uppercase tracking-wider">New note</span>
+			<button type="button" onclick="document.getElementById('memory-new-form').classList.add('hidden')"
+				class="text-muted hover:text-ink transition text-sm">✕</button>
+		</div>
+		<form id="memory-new-form-inner" hx-post="/api/memory/write" hx-target="#memory-save-result" hx-swap="innerHTML"
+			hx-on::after-request="if(event.detail.successful){this.reset();document.getElementById('memory-new-form').classList.add('hidden');}"
+			class="px-4 py-4 space-y-3">
+			<input type="text" name="name" required placeholder="api-notes.md, research.md, …"
+				class="w-full font-mono text-sm rounded-lg border border-surface-border bg-surface px-3 py-2 text-ink placeholder:text-muted focus:border-accent focus:ring-1 focus:ring-accent/40 focus:outline-none">
+			<textarea name="body" rows="5" required placeholder="# Notes&#10;- …"
+				class="w-full font-mono text-sm rounded-lg border border-surface-border bg-surface px-3 py-2 text-ink placeholder:text-muted focus:border-accent focus:ring-1 focus:ring-accent/40 focus:outline-none resize-none"></textarea>
+			<div class="flex items-center justify-between gap-3">
+				<div id="memory-save-result" class="text-xs"></div>
+				<button type="submit"
+					class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-xs font-semibold hover:brightness-110 transition">save</button>
+			</div>
+		</form>
+	</div>`)
+
+	// Soul panel — default visible
+	fmt.Fprint(w, `<div data-mem-panel="soul">`)
+	s.renderSoulPanel(w)
+	fmt.Fprint(w, `</div>`)
+
+	// Notes panel — hidden by default
+	fmt.Fprint(w, `<div data-mem-panel="notes" class="hidden">`)
+	s.renderNotesPanel(w, noteIdx)
+	fmt.Fprint(w, `</div>`)
+
+	// Skills panel — hidden by default
+	fmt.Fprint(w, `<div data-mem-panel="skills" class="hidden">`)
 	s.renderSkillsBody(w)
-	fmt.Fprint(w, `</div>
+	fmt.Fprint(w, `</div>`)
 
-	<script>
+	fmt.Fprint(w, `</div>`) // end content
+	fmt.Fprint(w, `</div>`) // end flex
+
+	// ── JS ───────────────────────────────────────────────────────────────
+	fmt.Fprint(w, `<script>
 	(function() {
-		// Defined once; subsequent loads just rebind handlers via inline onclick.
-		if (window.goonSwitchStore) return;
-		window.goonSwitchStore = function(target) {
-			document.querySelectorAll('[data-store]').forEach(function(el) {
-				el.classList.toggle('hidden', el.dataset.store !== target);
+		// Sidebar nav switch: show panel, highlight item, toggle new buttons
+		window.goonMemoryNav = function(target) {
+			document.querySelectorAll('[data-mem-panel]').forEach(function(el) {
+				el.classList.toggle('hidden', el.dataset.memPanel !== target);
 			});
-			document.querySelectorAll('[data-store-switch]').forEach(function(btn) {
-				var active = btn.dataset.storeSwitch === target;
-				// Dark-only now: the active pill sits on surface-raised
-				// with the brand-purple accent. Inactive rows fade to muted.
-				btn.classList.toggle('bg-surface-raised', active);
+			document.querySelectorAll('[data-mem-nav]').forEach(function(btn) {
+				var active = btn.dataset.memNav === target;
+				btn.classList.toggle('bg-accent/10', active);
 				btn.classList.toggle('text-accent', active);
-				btn.classList.toggle('shadow-card', active);
+				btn.classList.toggle('font-semibold', active);
 				btn.classList.toggle('text-muted', !active);
 				if (active) btn.setAttribute('aria-current', 'page');
 				else btn.removeAttribute('aria-current');
+			});
+			var noteBtn  = document.getElementById('mem-new-note-btn');
+			var skillBtn = document.getElementById('mem-new-skill-btn');
+			if (noteBtn)  noteBtn.classList.toggle('hidden',  target === 'skills' || target === 'soul');
+			if (skillBtn) skillBtn.classList.toggle('hidden', target !== 'skills');
+			// Reset form endpoint to match panel
+			var form = document.getElementById('memory-new-form-inner');
+			var lbl  = document.getElementById('memory-new-form-label');
+			if (form && lbl) {
+				if (target === 'skills') {
+					form.setAttribute('hx-post', '/api/skills/write');
+					lbl.textContent = 'New skill';
+				} else {
+					form.setAttribute('hx-post', '/api/memory/write');
+					lbl.textContent = 'New note';
+				}
+				htmx.process(form);
+			}
+		};
+		window.goonMemoryNewNote = function() {
+			var f = document.getElementById('memory-new-form');
+			if (f) {
+				f.classList.remove('hidden');
+				var inp = f.querySelector('input[name=name]');
+				if (inp) setTimeout(function(){ inp.focus(); }, 30);
+			}
+		};
+		window.goonMemoryNewSkill = function() {
+			var form = document.getElementById('memory-new-form-inner');
+			var lbl  = document.getElementById('memory-new-form-label');
+			if (form) { form.setAttribute('hx-post', '/api/skills/write'); htmx.process(form); }
+			if (lbl)  { lbl.textContent = 'New skill'; }
+			window.goonMemoryNewNote();
+		};
+		window.goonSoulToggleEdit = function() {
+			var pw  = document.getElementById('soul-preview-wrap');
+			var ed  = document.getElementById('soul-editor');
+			var btn = document.getElementById('soul-edit-btn');
+			if (!ed) return;
+			var editing = !ed.classList.contains('hidden');
+			if (editing) {
+				ed.classList.add('hidden');
+				if (pw)  pw.classList.remove('hidden');
+				if (btn) btn.textContent = 'edit';
+			} else {
+				ed.classList.remove('hidden');
+				if (pw)  pw.classList.add('hidden');
+				if (btn) btn.textContent = 'cancel';
+				var ta = ed.querySelector('textarea');
+				if (ta) setTimeout(function(){ ta.focus(); ta.setSelectionRange(0,0); }, 20);
+			}
+		};
+		window.goonSoulToggleFull = function() {
+			var el  = document.getElementById('soul-full-content');
+			var btn = document.getElementById('soul-show-more');
+			if (!el) return;
+			var hidden = el.classList.toggle('hidden');
+			if (btn) btn.textContent = hidden ? btn.textContent.replace('↑','↓') : btn.textContent.replace('↓','↑');
+		};
+		window.goonToggleNote = function(slug, nameQ) {
+			var body    = document.getElementById('note-body-' + slug);
+			var chevron = document.getElementById('note-chevron-' + slug);
+			if (!body) return;
+			var isOpen = !body.classList.contains('hidden');
+			if (isOpen) {
+				body.classList.add('hidden');
+				if (chevron) chevron.style.transform = '';
+			} else {
+				body.classList.remove('hidden');
+				if (chevron) chevron.style.transform = 'rotate(90deg)';
+				if (!body.dataset.loaded) {
+					body.dataset.loaded = '1';
+					body.innerHTML = '<div class="px-4 py-3 space-y-1.5 animate-pulse"><div class="h-3 bg-surface-sunken rounded w-1/3 mb-2"></div><div class="h-3 bg-surface-sunken rounded w-full"></div></div>';
+					htmx.ajax('GET', '/api/knowledge/note?name=' + nameQ, {target: '#note-body-' + slug, swap: 'innerHTML'});
+				}
+			}
+		};
+		window.goonFilterNotes = function(q) {
+			var lq = q.trim().toLowerCase();
+			document.querySelectorAll('[data-note-name]').forEach(function(row) {
+				var nm = (row.dataset.noteName      || '').toLowerCase();
+				var hl = (row.dataset.noteHeadline  || '').toLowerCase();
+				row.style.display = (!lq || nm.includes(lq) || hl.includes(lq)) ? '' : 'none';
 			});
 		};
 	})();
 	</script>`)
 }
 
-// renderKnowledgeBody renders the original Knowledge UI inside the
-// shared Memory tab shell. SOUL.md card + topic notes index.
-// Caller (fragTabMemory) has already emitted the section opener and
-// segmented header.
-func (s *Server) renderKnowledgeBody(w http.ResponseWriter) {
-	fmt.Fprint(w, `<details class="mb-4 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised">
-			<summary class="px-4 py-3 cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center gap-2">
-				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-				create or replace a note
-			</summary>
-			<form hx-post="/api/memory/write" hx-target="#memory-save-result" hx-swap="innerHTML" hx-on::after-request="if (event.detail.successful) this.reset()" class="px-4 pb-4 space-y-3">
-				<input type="text" name="name" required placeholder="SOUL.md, kebab-case-name.md, …"
-					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
-				<textarea name="body" rows="6" required placeholder="# Project context&#10;- API base URL is …&#10;- always run `+"make verify"+` before pushing"
-					class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"></textarea>
-				<div class="flex items-center justify-between">
-					<div id="memory-save-result"></div>
-					<button type="submit" class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 transition">save note</button>
-				</div>
-			</form>
-		</details>`)
-
+// renderSoulPanel renders the SOUL.md card with inline edit and show-more.
+func (s *Server) renderSoulPanel(w http.ResponseWriter) {
 	soul := stripSoulMigrationBanner(agentctx.Soul(""))
-	if strings.TrimSpace(soul) == "" {
-		fmt.Fprint(w, `<div class="mb-6 rounded-xl border border-dashed border-accent/30 bg-surface-raised/60 p-6 text-center">
+	soulTrimmed := strings.TrimSpace(soul)
+	if soulTrimmed == "" {
+		fmt.Fprint(w, `<div class="mb-5 rounded-xl border border-dashed border-accent/30 bg-surface-raised/60 p-6 text-center">
 			<div class="mx-auto h-10 w-10 rounded-xl bg-accent-soft text-accent flex items-center justify-center mb-2">
 				<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
 			</div>
-			<div class="text-sm font-medium text-white">SOUL.md is empty</div>
+			<div class="text-sm font-medium text-ink">SOUL.md is empty</div>
 			<div class="mt-1 text-xs text-muted max-w-md mx-auto">
 				Seed it with <code class="font-mono text-accent">goon memory init</code> — facts in here are visible to the agent on every run.
 			</div>
 		</div>`)
 	} else {
-		fmt.Fprint(w, `<div class="mb-6 relative overflow-hidden rounded-xl border border-accent/30 bg-gradient-to-br from-accent-soft to-transparent shadow-card">
-			<div class="absolute left-0 top-0 bottom-0 w-1 bg-accent"></div>
-			<div class="px-5 py-4">
-				<div class="flex items-center gap-2 mb-3">
+		lines := strings.Split(soulTrimmed, "\n")
+		const previewN = 20
+		previewText := strings.Join(lines, "\n")
+		var restText string
+		if len(lines) > previewN {
+			previewText = strings.Join(lines[:previewN], "\n")
+			restText = strings.Join(lines[previewN:], "\n")
+		}
+		fmt.Fprint(w, `<div class="mb-5 rounded-xl border border-accent/25 bg-surface-raised overflow-hidden shadow-card">
+			<div class="flex items-center justify-between px-4 py-2.5 border-b border-surface-border">
+				<div class="flex items-center gap-2">
 					<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l3 6 6 .9-4.5 4.4 1 6.7L12 17l-5.5 3 1-6.7L3 8.9 9 8z"/></svg>
-					<span class="text-[11px] font-semibold uppercase tracking-wider text-accent">SOUL.md</span>
-					<span class="text-[11px] text-gray-500 font-mono">always-loaded</span>
+					<span class="text-xs font-semibold text-accent uppercase tracking-wider">SOUL.md</span>
+					<span class="text-[10px] text-muted font-mono bg-surface-sunken px-1.5 py-0.5 rounded-md">always-loaded</span>
 				</div>
-				<pre class="whitespace-pre-wrap text-sm font-mono text-gray-800 dark:text-gray-200 leading-relaxed">`)
-		fmt.Fprint(w, html.EscapeString(strings.TrimSpace(soul)))
-		fmt.Fprint(w, `</pre>
+				<button id="soul-edit-btn" type="button" onclick="goonSoulToggleEdit()"
+					class="text-xs text-muted hover:text-accent transition font-medium">edit</button>
+			</div>
+			<div id="soul-preview-wrap" class="px-4 py-3">
+				<pre class="text-xs font-mono text-ink whitespace-pre-wrap leading-relaxed">`)
+		fmt.Fprint(w, html.EscapeString(previewText))
+		fmt.Fprint(w, `</pre>`)
+		if restText != "" {
+			fmt.Fprint(w, `<div id="soul-full-content" class="hidden"><pre class="text-xs font-mono text-ink whitespace-pre-wrap leading-relaxed">`)
+			fmt.Fprint(w, html.EscapeString(restText))
+			fmt.Fprintf(w, `</pre></div>
+			<button id="soul-show-more" type="button" onclick="goonSoulToggleFull()"
+				class="mt-2 text-[10px] text-accent hover:brightness-125 transition">show all (%d lines) ↓</button>`, len(lines))
+		}
+		fmt.Fprint(w, `</div>
+			<div id="soul-editor" class="hidden border-t border-surface-border px-4 py-3">
+				<form hx-post="/api/memory/write" hx-target="#soul-save-result" hx-swap="innerHTML"
+					hx-on::after-request="if(event.detail.successful){goonSoulToggleEdit();}"
+					class="space-y-2">
+					<input type="hidden" name="name" value="SOUL.md">
+					<textarea name="body" rows="14"
+						class="w-full font-mono text-xs rounded-lg border border-surface-border bg-surface px-3 py-2 text-gray-200 focus:border-accent focus:ring-1 focus:ring-accent/40 focus:outline-none resize-none leading-relaxed">`)
+		fmt.Fprint(w, html.EscapeString(soulTrimmed))
+		fmt.Fprint(w, `</textarea>
+					<div class="flex items-center justify-between gap-3">
+						<div id="soul-save-result" class="text-xs text-emerald-700 dark:text-emerald-400"></div>
+						<div class="flex items-center gap-2">
+							<button type="button" onclick="goonSoulToggleEdit()" class="text-xs text-muted hover:text-ink transition">cancel</button>
+							<button type="submit" class="inline-flex items-center gap-1 rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">save</button>
+						</div>
+					</div>
+				</form>
 			</div>
 		</div>`)
 	}
+}
 
-	idx := agentctx.KnowledgeIndex("")
+// renderNotesPanel renders the topic-notes list with search filter and
+// the Obsidian vault card when configured. idx is the pre-fetched
+// KnowledgeIndex slice.
+func (s *Server) renderNotesPanel(w http.ResponseWriter, idx []agentctx.IndexEntry) {
 	if len(idx) == 0 {
 		fmt.Fprint(w, `<div class="rounded-xl border border-dashed border-surface-border bg-surface-raised/40 p-6 text-center">
 			<div class="mx-auto h-10 w-10 rounded-xl bg-surface-sunken text-muted flex items-center justify-center mb-2">
 				<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
 			</div>
-			<div class="text-sm font-medium text-white">No topic notes yet</div>
+			<div class="text-sm font-medium text-ink">No topic notes yet</div>
 			<div class="mt-1 text-xs text-muted max-w-md mx-auto">
-				Workflows write here as they learn. You can also create them manually with
-				<code class="font-mono text-xs text-accent">goon memory write &lt;name&gt; &lt;body&gt;</code>.
+				Workflows write here as they learn. You can also create them with the + new note button above.
 			</div>
 		</div>`)
-		return
-	}
-	fmt.Fprintf(w, `<div class="flex items-baseline justify-between mb-3">
-		<h3 class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-500">
-			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
-			Topic notes
-			<span class="rounded-full bg-gray-100 dark:bg-surface-sunken text-gray-600 dark:text-gray-300 px-2 py-0.5 text-[10px] font-mono normal-case tracking-normal">%d</span>
-		</h3>
-	</div>
-	<div class="space-y-2">`, len(idx))
-	for _, e := range idx {
-		headline := html.EscapeString(e.Headline)
-		if headline == "" {
-			headline = "<span class='text-gray-400 italic'>(no headline)</span>"
+	} else {
+		fmt.Fprintf(w, `<div class="flex items-center gap-3 mb-3">
+			<label class="relative flex-1 max-w-xs">
+				<svg class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3 w-3 text-muted pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+				<input type="search" placeholder="filter notes…" oninput="goonFilterNotes(this.value)"
+					class="w-full rounded-md border border-surface-border bg-surface text-xs pl-7 pr-3 py-1.5 text-ink placeholder:text-muted focus:border-accent focus:outline-none">
+			</label>
+			<span class="text-[10px] font-mono text-muted bg-surface-sunken px-2 py-0.5 rounded-full shrink-0">%d notes</span>
+		</div>
+		<div id="notes-list" class="space-y-1.5">`, len(idx))
+
+		for _, e := range idx {
+			slug := noteSlug(e.Name)
+			nameEsc := html.EscapeString(e.Name)
+			nameQ := url.QueryEscape(e.Name)
+			headlineEsc := html.EscapeString(e.Headline)
+			if headlineEsc == "" {
+				headlineEsc = `<span class="italic text-muted/60">(no headline)</span>`
+			}
+			fmt.Fprintf(w,
+				`<div data-note-name="%s" data-note-headline="%s"
+					class="group rounded-lg border border-surface-border bg-surface-raised hover:border-accent/40 transition overflow-hidden">
+					<div class="flex items-center gap-3 px-4 py-2.5 cursor-pointer select-none"
+						onclick="goonToggleNote('%s','%s')">
+						<svg id="note-chevron-%s" class="h-3.5 w-3.5 text-muted shrink-0 transition-transform duration-150"
+							viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+							<polyline points="9 18 15 12 9 6"/>
+						</svg>
+						<div class="flex-1 min-w-0">
+							<div class="text-xs font-mono text-gray-200 truncate">%s</div>
+							<div class="text-[11px] text-muted truncate">%s</div>
+						</div>
+						<div class="opacity-0 group-hover:opacity-100 flex items-center gap-1 shrink-0 ml-2 transition-opacity"
+							onclick="event.stopPropagation()">
+							<form hx-post="/api/memory/delete" hx-target="#memory-list-result" hx-swap="innerHTML" class="m-0">
+								<input type="hidden" name="name" value="%s">
+								<button type="submit" onclick="return confirm('Delete this note?')" class="text-[10px] text-muted hover:text-rose-500 px-1.5 py-1 rounded transition" title="delete">✕</button>
+							</form>
+						</div>
+					</div>
+					<div id="note-body-%s" class="hidden border-t border-surface-border"></div>
+				</div>`,
+				html.EscapeString(e.Name), html.EscapeString(e.Headline),
+				jsEscape(slug), nameQ,
+				slug,
+				nameEsc, headlineEsc,
+				nameEsc,
+				slug,
+			)
 		}
-		nameEsc := html.EscapeString(e.Name)
-		nameQ := urlQueryEscape(e.Name)
-		fmt.Fprintf(w, `<details class="group rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-accent/40 transition open:border-accent/50 open:shadow-card">
-			<summary class="flex items-center gap-3 px-4 py-3 cursor-pointer list-none">
-				<svg class="h-4 w-4 text-gray-400 group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-				<div class="flex-1 min-w-0">
-					<div class="font-mono text-sm text-gray-800 dark:text-gray-200 group-open:text-accent group-open:font-semibold truncate">%s</div>
-					<div class="text-xs text-gray-500 truncate">%s</div>
-				</div>
-				<form hx-post="/api/memory/delete" hx-confirm="Delete %s?" hx-target="#memory-list-result" hx-swap="innerHTML" class="m-0">
-					<input type="hidden" name="name" value="%s">
-					<button type="submit" class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1 transition" title="delete">✕</button>
-				</form>
-			</summary>
-			<div hx-get="/api/knowledge/note?name=%s" hx-trigger="toggle from:closest details once" hx-swap="innerHTML"
-				class="px-4 pb-4 -mt-1 text-sm">
-				<div class="space-y-2"><div class="skel h-3 w-1/3"></div><div class="skel h-3 w-full"></div><div class="skel h-3 w-5/6"></div></div>
-			</div>
-		</details>`,
-			nameEsc, headline, nameEsc, nameEsc, nameQ)
+		fmt.Fprint(w, `</div>
+		<div id="memory-list-result" class="mt-3"></div>`)
 	}
-	fmt.Fprint(w, `</div><div id="memory-list-result" class="mt-3"></div>`)
+
+	// ── Obsidian vault card (only when GOON_OBSIDIAN_VAULT is set) ──────────
+	if tools.ObsidianConfigured() {
+		vaultPath := strings.TrimSpace(os.Getenv("GOON_OBSIDIAN_VAULT"))
+		hasRepo := strings.TrimSpace(os.Getenv("GOON_OBSIDIAN_REPO")) != ""
+		repoLabel := ""
+		if hasRepo {
+			repoLabel = ` <span class="text-[10px] text-muted font-mono">git-backed</span>`
+		}
+		fmt.Fprintf(w, `
+	<div class="mt-6 rounded-xl border border-surface-border bg-surface-raised">
+		<div class="flex items-center justify-between px-4 py-3 border-b border-surface-border">
+			<div class="flex items-center gap-2">
+				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+				<span class="text-xs font-semibold uppercase tracking-wider text-muted">Obsidian Vault</span>
+				%s
+			</div>
+			<span class="font-mono text-[10px] text-gray-500 truncate max-w-[200px]" title="%s">%s</span>
+		</div>
+		<div class="px-4 py-3 flex items-center justify-between gap-4 flex-wrap">
+			<p class="text-xs text-muted">
+				Agent tools: <code class="text-accent">obsidian_list</code> · <code class="text-accent">obsidian_read</code> · <code class="text-accent">obsidian_search</code>
+			</p>
+			<div class="flex items-center gap-2">
+				<button
+					hx-post="/api/obsidian/sync"
+					hx-target="#obsidian-sync-result"
+					hx-swap="innerHTML"
+					hx-indicator="#obsidian-sync-spinner"
+					class="inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium hover:border-accent/50 hover:text-accent transition">
+					<svg id="obsidian-sync-spinner" class="htmx-indicator h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-3.5"/></svg>
+					sync vault
+				</button>
+				<button
+					hx-post="/api/obsidian/push"
+					hx-target="#obsidian-sync-result"
+					hx-swap="innerHTML"
+					class="inline-flex items-center gap-1.5 rounded-lg border border-surface-border bg-surface px-3 py-1.5 text-xs font-medium hover:border-accent/50 hover:text-accent transition">
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
+					push
+				</button>
+			</div>
+		</div>
+		<div id="obsidian-sync-result" class="px-4 text-xs font-mono text-muted empty:hidden"></div>
+		<div id="obsidian-notes-list"
+			hx-get="/fragments/obsidian-notes"
+			hx-trigger="load, obsidianSynced from:body"
+			hx-swap="innerHTML"
+			class="border-t border-surface-border px-4 py-3">
+			<span class="text-xs text-muted">loading notes…</span>
+		</div>
+	</div>`, repoLabel, html.EscapeString(vaultPath), html.EscapeString(vaultPath))
+	}
 }
 
 // stripSoulMigrationBanner removes the one-time "<!-- migrated from
@@ -887,6 +1211,23 @@ func urlQueryEscape(s string) string {
 	).Replace(s)
 }
 
+// noteSlug turns a note name into a safe HTML element id suffix by
+// replacing non-alphanumeric runs with a single hyphen.
+func noteSlug(name string) string {
+	var b strings.Builder
+	prev := false
+	for _, c := range name {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			b.WriteRune(c)
+			prev = false
+		} else if !prev {
+			b.WriteByte('-')
+			prev = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
+}
+
 // handleKnowledgeNote returns the full body of one note as a styled
 // fragment, called lazily from the details-expand handler.
 func (s *Server) handleKnowledgeNote(w http.ResponseWriter, r *http.Request) {
@@ -906,9 +1247,9 @@ func (s *Server) handleKnowledgeNote(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<div class="text-xs text-gray-500">(empty)</div>`)
 		return
 	}
-	fmt.Fprint(w, `<pre class="whitespace-pre-wrap text-sm font-mono text-gray-800 dark:text-gray-200 bg-gray-50 dark:bg-surface-sunken rounded-md p-3 border border-gray-200 dark:border-gray-800 overflow-x-auto">`)
+	fmt.Fprint(w, `<div class="px-4 py-3"><pre class="text-xs font-mono text-ink whitespace-pre-wrap leading-relaxed bg-surface-sunken rounded-md p-3 border border-surface-border overflow-x-auto">`)
 	fmt.Fprint(w, html.EscapeString(body))
-	fmt.Fprint(w, `</pre>`)
+	fmt.Fprint(w, `</pre></div>`)
 }
 
 // handleRefresh forces a fresh board.List and updates memory so the
@@ -991,9 +1332,9 @@ func (s *Server) handleSkillNote(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `<div class="text-xs text-gray-500">(empty)</div>`)
 		return
 	}
-	fmt.Fprint(w, `<pre class="whitespace-pre-wrap text-sm font-mono text-gray-800 dark:text-gray-200 bg-gray-50 dark:bg-surface-sunken rounded-md p-3 border border-gray-200 dark:border-gray-800 overflow-x-auto">`)
+	fmt.Fprint(w, `<div class="px-4 py-3"><pre class="text-xs font-mono text-ink whitespace-pre-wrap leading-relaxed bg-surface-sunken rounded-md p-3 border border-surface-border overflow-x-auto">`)
 	fmt.Fprint(w, html.EscapeString(body))
-	fmt.Fprint(w, `</pre>`)
+	fmt.Fprint(w, `</pre></div>`)
 }
 
 // handleStoreWrite is the shared implementation for the memory and
@@ -1057,77 +1398,281 @@ func (s *Server) handleStoreDelete(w http.ResponseWriter, r *http.Request, kind 
 		html.EscapeString(kind), html.EscapeString(name))
 }
 
-// renderSkillsBody renders the Skills index inside the shared Memory
-// tab shell. Caller (fragTabMemory) has already emitted the section
-// opener and segmented header.
+// renderSkillsBody renders the Skills tab content. The create form
+// lives in the fragTabMemory header; this just triggers the lazy list.
 func (s *Server) renderSkillsBody(w http.ResponseWriter) {
-	fmt.Fprint(w, `<p class="mb-4 text-sm text-gray-500 dark:text-gray-400 max-w-2xl">
-		Specialist procedures the agent can apply on demand — role definitions, how-tos, review checklists. Activated when you ask, not auto-loaded.
-	</p>
-
-	<details class="mb-4 rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised">
-		<summary class="px-4 py-3 cursor-pointer text-sm font-medium text-gray-700 dark:text-gray-300 flex items-center gap-2">
-			<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-			create new skill
-		</summary>
-		<form hx-post="/api/skills/write" hx-target="#skill-save-result" hx-swap="innerHTML" hx-on::after-request="if (event.detail.successful) this.reset()" class="px-4 pb-4 space-y-3">
-			<input type="text" name="name" required placeholder="kebab-case-name.md (e.g. code-reviewer.md)"
-				class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none">
-			<textarea name="body" rows="6" required placeholder="# Code reviewer&#10;&#10;When asked to review code, focus on: ..."
-				class="w-full font-mono text-sm rounded-lg border border-gray-300 dark:border-surface-border bg-white dark:bg-surface px-3 py-2 focus:border-accent focus:ring-2 focus:ring-accent/30 focus:outline-none"></textarea>
-			<div class="flex items-center justify-between">
-				<div id="skill-save-result"></div>
-				<button type="submit" class="inline-flex items-center gap-1.5 rounded-lg bg-accent text-surface px-4 py-2 text-sm font-semibold hover:brightness-110 transition">save skill</button>
-			</div>
-		</form>
-	</details>
-
-	<div hx-get="/fragments/skills-list" hx-trigger="load, skillsChanged from:body" hx-swap="innerHTML">
-		<div class="text-sm text-gray-500">Loading skills…</div>
+	fmt.Fprint(w, `<div hx-get="/fragments/skills-list" hx-trigger="load, skillsChanged from:body" hx-swap="innerHTML">
+		<div class="space-y-2 animate-pulse">
+			<div class="h-4 bg-surface-raised rounded w-3/4"></div>
+			<div class="h-4 bg-surface-raised rounded w-1/2"></div>
+			<div class="h-4 bg-surface-raised rounded w-2/3"></div>
+		</div>
 	</div>`)
 }
 
-// fragSkillsList renders the skill index as a list with read /
-// download / delete controls. Auto-refreshed when skillsChanged
-// fires from anywhere (create, edit, delete).
+// fragSkillsList renders the skill index as card rows with lazy-load
+// content expansion. Auto-refreshed on skillsChanged.
 func (s *Server) fragSkillsList(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	idx := agentctx.SkillsIndex("")
 	if len(idx) == 0 {
 		_, _ = io.WriteString(w, emptyState("No skills yet",
-			"Create one with the form above, or via /skill write <name> <body> on Telegram."))
+			"Use the + new skill button above, or goon skill write &lt;name&gt; via Telegram."))
 		return
 	}
-	fmt.Fprintf(w, `<div class="flex items-baseline justify-between mb-3">
-		<h3 class="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-gray-500">
-			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
-			Skills <span class="rounded-full bg-gray-100 dark:bg-surface-sunken text-gray-600 dark:text-gray-300 px-2 py-0.5 text-[10px] font-mono normal-case tracking-normal">%d</span>
-		</h3>
+	fmt.Fprintf(w, `<div class="flex items-center gap-3 mb-3">
+		<span class="text-[11px] font-semibold uppercase tracking-wider text-muted">Skills</span>
+		<span class="text-[10px] font-mono text-muted bg-surface-sunken px-2 py-0.5 rounded-full">%d</span>
 	</div>
-	<div class="space-y-2">`, len(idx))
+	<div id="skills-list" class="space-y-1.5">`, len(idx))
+
 	for _, e := range idx {
-		headline := html.EscapeString(e.Headline)
-		if headline == "" {
-			headline = `<span class="text-gray-400 italic">(no headline)</span>`
+		slug := noteSlug(e.Name)
+		displayName := strings.TrimSuffix(e.Name, ".md")
+		nameEsc := html.EscapeString(displayName)
+		rawNameEsc := html.EscapeString(e.Name)
+		nameQ := url.QueryEscape(e.Name)
+		headlineEsc := html.EscapeString(e.Headline)
+		if headlineEsc == "" {
+			headlineEsc = `<span class="italic text-muted/60">(no headline)</span>`
 		}
-		nameEsc := html.EscapeString(e.Name)
-		nameQ := urlQueryEscape(e.Name)
-		fmt.Fprintf(w, `<details class="group rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-accent/40 open:border-accent/50 open:shadow-card transition">
-			<summary class="flex items-center gap-3 px-4 py-3 cursor-pointer list-none">
-				<svg class="h-4 w-4 text-gray-400 group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-				<div class="flex-1 min-w-0">
-					<div class="font-mono text-sm text-gray-800 dark:text-gray-200 group-open:text-accent group-open:font-semibold truncate">%s</div>
-					<div class="text-xs text-gray-500 truncate">%s</div>
+		fmt.Fprintf(w,
+			`<div data-note-name="%s" data-note-headline="%s"
+				class="group rounded-lg border border-surface-border bg-surface-raised hover:border-accent/40 transition overflow-hidden">
+				<div class="flex items-center gap-3 px-4 py-2.5 cursor-pointer select-none"
+					onclick="goonToggleSkill('%s','%s')">
+					<svg id="skill-chevron-%s" class="h-3.5 w-3.5 text-muted shrink-0 transition-transform duration-150"
+						viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+						<polyline points="9 18 15 12 9 6"/>
+					</svg>
+					<div class="flex-1 min-w-0">
+						<div class="text-xs font-mono text-gray-200 truncate">%s</div>
+						<div class="text-[11px] text-muted truncate">%s</div>
+					</div>
+					<div class="opacity-0 group-hover:opacity-100 flex items-center gap-1 shrink-0 ml-2 transition-opacity"
+						onclick="event.stopPropagation()">
+						<form hx-post="/api/skills/delete" hx-target="#skill-list-result" hx-swap="innerHTML" class="m-0">
+							<input type="hidden" name="name" value="%s">
+							<button type="submit" onclick="return confirm('Delete this skill?')" class="text-[10px] text-muted hover:text-rose-500 px-1.5 py-1 rounded transition" title="delete">✕</button>
+						</form>
+					</div>
 				</div>
-				<form hx-post="/api/skills/delete" hx-confirm="Delete %s?" hx-target="#skill-list-result" hx-swap="innerHTML" class="m-0">
-					<input type="hidden" name="name" value="%s">
-					<button type="submit" class="text-xs text-gray-400 hover:text-rose-500 px-2 py-1 transition" title="delete">✕</button>
-				</form>
-			</summary>
-			<div hx-get="/api/skills/note?name=%s" hx-trigger="toggle from:closest details once" hx-swap="innerHTML" class="px-4 pb-4 -mt-1 text-sm">
-				<div class="space-y-2"><div class="skel h-3 w-1/3"></div><div class="skel h-3 w-full"></div></div>
-			</div>
-		</details>`, nameEsc, headline, nameEsc, nameEsc, nameQ)
+				<div id="skill-body-%s" class="hidden border-t border-surface-border"></div>
+			</div>`,
+			rawNameEsc, html.EscapeString(e.Headline),
+			jsEscape(slug), nameQ,
+			slug,
+			nameEsc, headlineEsc,
+			rawNameEsc,
+			slug,
+		)
 	}
-	fmt.Fprint(w, `</div><div id="skill-list-result" class="mt-3"></div>`)
+	fmt.Fprint(w, `</div>
+	<div id="skill-list-result" class="mt-3"></div>
+	<script>
+	(function(){
+		if (window.goonToggleSkill) return;
+		window.goonToggleSkill = function(slug, nameQ) {
+			var body = document.getElementById('skill-body-' + slug);
+			var chevron = document.getElementById('skill-chevron-' + slug);
+			if (!body) return;
+			var isOpen = !body.classList.contains('hidden');
+			if (isOpen) {
+				body.classList.add('hidden');
+				if (chevron) chevron.style.transform = '';
+			} else {
+				body.classList.remove('hidden');
+				if (chevron) chevron.style.transform = 'rotate(90deg)';
+				if (!body.dataset.loaded) {
+					body.dataset.loaded = '1';
+					body.innerHTML = '<div class="px-4 py-3 space-y-1.5"><div class="skel h-3 w-1/3"></div><div class="skel h-3 w-full"></div></div>';
+					htmx.ajax('GET', '/api/skills/note?name=' + nameQ, {target: '#skill-body-' + slug, swap: 'innerHTML'});
+				}
+			}
+		};
+	})();
+	</script>`)
+}
+
+// handleObsidianSync runs git pull + store reload and returns a one-line
+// status fragment that the web UI swaps into #obsidian-sync-result.
+// Fires HX-Trigger: obsidianSynced so the notes list auto-reloads.
+func (s *Server) handleObsidianSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("HX-Trigger", "obsidianSynced")
+	msg := tools.ObsidianSync()
+	fmt.Fprintf(w, `<p class="pb-3">%s</p>`, html.EscapeString(msg))
+}
+
+// fragObsidianNotes renders the note list grouped by top-level folder.
+// Each note has a ▸ button that expands to show the raw markdown via
+// /api/obsidian/read?note=<path>.
+func (s *Server) fragObsidianNotes(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	notes, err := tools.ObsidianList("")
+	if err != nil {
+		fmt.Fprintf(w, `<p class="text-xs text-red-400">%s</p>`, html.EscapeString(err.Error()))
+		return
+	}
+	if notes == "" {
+		fmt.Fprint(w, `<p class="text-xs text-muted">No notes found — run a sync first.</p>`)
+		return
+	}
+
+	// Group by top-level folder (or "—" for root notes).
+	type entry struct{ name, display string }
+	groups := map[string][]entry{}
+	var order []string
+	seen := map[string]bool{}
+
+	for _, line := range strings.Split(strings.TrimSpace(notes), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, "/", 2)
+		var folder, display string
+		if len(parts) == 2 {
+			folder = parts[0]
+			display = parts[1]
+			if strings.HasSuffix(display, ".md") {
+				display = display[:len(display)-3]
+			}
+		} else {
+			folder = "—"
+			display = line
+			if strings.HasSuffix(display, ".md") {
+				display = display[:len(display)-3]
+			}
+		}
+		if !seen[folder] {
+			seen[folder] = true
+			order = append(order, folder)
+		}
+		groups[folder] = append(groups[folder], entry{name: line, display: display})
+	}
+
+	var b strings.Builder
+	b.WriteString(`<div class="space-y-2 text-xs">`)
+	for _, folder := range order {
+		entries := groups[folder]
+		b.WriteString(`<details class="group">`)
+		fmt.Fprintf(&b,
+			`<summary class="flex items-center gap-1.5 cursor-pointer list-none text-muted hover:text-accent font-medium py-0.5 select-none">
+				<svg class="h-3 w-3 transition-transform group-open:rotate-90" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"/></svg>
+				<span>%s</span>
+				<span class="ml-auto text-[10px] text-gray-500">%d</span>
+			</summary>
+			<ul class="mt-1 ml-4 space-y-0.5 border-l border-surface-border pl-3">`,
+			html.EscapeString(folder), len(entries))
+		for _, e := range entries {
+			noteQ := url.QueryEscape(e.name)
+			fmt.Fprintf(&b,
+				`<li class="py-0.5">
+					<button
+						hx-get="/api/obsidian/read?note=%s"
+						hx-target="#obsidian-note-reader"
+						hx-swap="innerHTML"
+						class="w-full text-left truncate text-ink hover:text-accent transition cursor-pointer">
+						%s
+					</button>
+				</li>`,
+				noteQ, html.EscapeString(e.display))
+		}
+		b.WriteString(`</ul></details>`)
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<div id="obsidian-note-reader" class="mt-3 empty:hidden"></div>`)
+	fmt.Fprint(w, b.String())
+}
+
+// handleObsidianRead returns one Obsidian note in an editable panel swapped
+// into #obsidian-note-reader. The panel has a Save button (POST to
+// /api/obsidian/write) and a Push button (POST to /api/obsidian/push).
+func (s *Server) handleObsidianRead(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	note := strings.TrimSpace(r.URL.Query().Get("note"))
+	if note == "" {
+		fmt.Fprint(w, `<p class="text-xs text-red-400">note parameter missing</p>`)
+		return
+	}
+	body, err := tools.ObsidianRead(note)
+	if err != nil {
+		fmt.Fprintf(w, `<p class="text-xs text-red-400">%s</p>`, html.EscapeString(err.Error()))
+		return
+	}
+	noteQ := url.QueryEscape(note)
+	fmt.Fprintf(w,
+		`<div class="rounded-lg border border-surface-border bg-surface p-3 mt-3" id="obsidian-editor">
+			<div class="flex items-center justify-between mb-2 gap-2">
+				<span class="text-[10px] font-mono text-muted truncate flex-1">%s</span>
+				<button onclick="document.getElementById('obsidian-editor').remove()"
+					class="text-[10px] text-gray-500 hover:text-accent shrink-0">✕</button>
+			</div>
+			<form hx-post="/api/obsidian/write?note=%s"
+				hx-target="#obsidian-save-result"
+				hx-swap="innerHTML"
+				hx-encoding="multipart/form-data">
+				<textarea name="body"
+					class="w-full text-[11px] text-gray-200 bg-transparent border border-surface-border rounded p-2 font-mono resize-y min-h-[16rem] focus:outline-none focus:border-accent/60"
+					spellcheck="false">%s</textarea>
+				<div class="flex items-center gap-2 mt-2">
+					<button type="submit"
+						class="text-[11px] px-3 py-1 rounded bg-accent/20 hover:bg-accent/30 text-accent border border-accent/30 transition">
+						save
+					</button>
+					<span id="obsidian-save-result" class="text-[10px] text-gray-500 ml-1"></span>
+				</div>
+			</form>
+		</div>`,
+		html.EscapeString(note), noteQ, html.EscapeString(body))
+}
+
+// handleObsidianWrite saves the posted body to the vault note named in the
+// query param. Returns a short status fragment for #obsidian-save-result.
+func (s *Server) handleObsidianWrite(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	note := strings.TrimSpace(r.URL.Query().Get("note"))
+	if note == "" {
+		fmt.Fprint(w, `<span class="text-red-400">note param missing</span>`)
+		return
+	}
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		r.ParseForm() //nolint:errcheck
+	}
+	body := r.FormValue("body")
+	if err := tools.ObsidianWrite(note, body); err != nil {
+		fmt.Fprintf(w, `<span class="text-red-400">%s</span>`, html.EscapeString(err.Error()))
+		return
+	}
+	fmt.Fprint(w, `<span class="text-green-400">saved ✓</span>`)
+}
+
+// handleObsidianPush commits and pushes pending vault changes.
+// Returns a short status fragment for #obsidian-save-result.
+func (s *Server) handleObsidianPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	// First save if the form body was forwarded (it won't be from the push
+	// button alone — that's fine, push just commits whatever's on disk).
+	msg := tools.ObsidianPush()
+	safe := html.EscapeString(msg)
+	if strings.HasPrefix(msg, "git") && strings.Contains(msg, "failed") {
+		fmt.Fprintf(w, `<span class="text-red-400">%s</span>`, safe)
+		return
+	}
+	fmt.Fprintf(w, `<span class="text-green-400">%s</span>`, safe)
 }

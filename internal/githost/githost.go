@@ -24,7 +24,8 @@ type PR struct {
 	Number    int        `json:"number"`
 	URL       string     `json:"url"`
 	Title     string     `json:"title"`
-	Branch    string     `json:"branch"`
+	Branch    string     `json:"branch"`            // head / source branch
+	Base      string     `json:"base,omitempty"`    // target / base branch (e.g. "main")
 	Author    string     `json:"author,omitempty"`
 	State     string     `json:"state,omitempty"` // "open" | "closed" | "merged"
 	Body      string     `json:"body,omitempty"`

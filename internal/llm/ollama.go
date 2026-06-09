@@ -10,9 +10,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/usage"
 )
 
 // OllamaConfig configures the Ollama HTTP client.
@@ -33,7 +33,7 @@ func NewOllama(cfg OllamaConfig) *Ollama {
 	hc := cfg.HTTP
 	if hc == nil {
 		// Local models can be slow on first inference — give them headroom.
-		hc = logx.InstrumentClient("ollama", &http.Client{Timeout: 120 * time.Second})
+		hc = logx.InstrumentClient("ollama", &http.Client{Timeout: httpTimeout()})
 	}
 	return &Ollama{cfg: cfg, http: hc}
 }
@@ -51,14 +51,18 @@ type ollamaChatRequest struct {
 }
 
 type ollamaChatResponse struct {
-	Model   string  `json:"model"`
-	Message Message `json:"message"`
-	Done    bool    `json:"done"`
-	Error   string  `json:"error,omitempty"`
+	Model           string  `json:"model"`
+	Message         Message `json:"message"`
+	Done            bool    `json:"done"`
+	PromptEvalCount int     `json:"prompt_eval_count"`
+	EvalCount       int     `json:"eval_count"`
+	Error           string  `json:"error,omitempty"`
 }
 
 // Generate calls /api/chat (non-streaming).
 func (o *Ollama) Generate(ctx context.Context, messages []Message, opts Options) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), o.cfg.Model)
+	defer usage.EndActivity(actID)
 	body := ollamaChatRequest{
 		Model:    o.cfg.Model,
 		Messages: messages,
@@ -113,6 +117,7 @@ func (o *Ollama) Generate(ctx context.Context, messages []Message, opts Options)
 	if cr.Message.Content == "" {
 		return "", errors.New("ollama: empty message content")
 	}
+	usage.Global().Record(o.cfg.Model, cr.PromptEvalCount, cr.EvalCount)
 	return cr.Message.Content, nil
 }
 
@@ -120,6 +125,8 @@ func (o *Ollama) Generate(ctx context.Context, messages []Message, opts Options)
 // line — we forward each chunk's message.content to onChunk and assemble the
 // full response.
 func (o *Ollama) Stream(ctx context.Context, messages []Message, opts Options, onChunk func(string)) (string, error) {
+	actID := usage.StartActivity(usage.LabelFrom(ctx), o.cfg.Model)
+	defer usage.EndActivity(actID)
 	body := ollamaChatRequest{
 		Model:    o.cfg.Model,
 		Messages: messages,
@@ -181,6 +188,8 @@ func (o *Ollama) Stream(ctx context.Context, messages []Message, opts Options, o
 			}
 		}
 		if ch.Done {
+			// The terminal object carries the token counts.
+			usage.Global().Record(o.cfg.Model, ch.PromptEvalCount, ch.EvalCount)
 			break
 		}
 	}

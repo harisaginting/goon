@@ -116,7 +116,7 @@ data: {"candidates":[{"content":{"parts":[{"text":"lo"}]}}]}
 data: [DONE]
 `
 	var chunks []string
-	full, err := parseGeminiSSE(strings.NewReader(stream), func(s string) {
+	full, _, _, err := parseGeminiSSE(strings.NewReader(stream), func(s string) {
 		chunks = append(chunks, s)
 	})
 	if err != nil {
@@ -127,6 +127,27 @@ data: [DONE]
 	}
 	if len(chunks) != 2 || chunks[0] != "hel" || chunks[1] != "lo" {
 		t.Errorf("chunks: %#v", chunks)
+	}
+}
+
+// TestParseGeminiSSE_Usage verifies the parser surfaces usageMetadata token
+// counts from the final streamed chunk.
+func TestParseGeminiSSE_Usage(t *testing.T) {
+	stream := `data: {"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}
+
+data: {"candidates":[{"content":{"parts":[{"text":"!"}]}}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":5,"totalTokenCount":16}}
+
+data: [DONE]
+`
+	full, prompt, completion, err := parseGeminiSSE(strings.NewReader(stream), nil)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if full != "hi!" {
+		t.Errorf("text = %q", full)
+	}
+	if prompt != 11 || completion != 5 {
+		t.Errorf("usage = (prompt=%d,completion=%d), want (11,5)", prompt, completion)
 	}
 }
 

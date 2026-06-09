@@ -30,8 +30,11 @@ type GitHub struct {
 	Repos    []string
 	Label    string
 	Assignee string
-	APIURL   string
-	HTTP     *http.Client
+	// State is the GitHub Issues state filter: "open", "closed", or "all".
+	// Defaults to "open". Set via GITHUB_STATE env var.
+	State  string
+	APIURL string
+	HTTP   *http.Client
 }
 
 // NewGitHubFromEnv constructs a GitHub board from environment variables.
@@ -54,11 +57,19 @@ func NewGitHubFromEnv() (*GitHub, error) {
 	if api == "" {
 		api = "https://api.github.com"
 	}
+	state := strings.ToLower(strings.TrimSpace(os.Getenv("GITHUB_STATE")))
+	switch state {
+	case "open", "closed", "all":
+		// valid values — keep as-is
+	default:
+		state = "open"
+	}
 	return &GitHub{
 		Token:    tok,
 		Repos:    repos,
 		Label:    os.Getenv("GITHUB_LABEL"),
 		Assignee: os.Getenv("GITHUB_ASSIGNEE"),
+		State:    state,
 		APIURL:   strings.TrimRight(api, "/"),
 		HTTP:     logx.InstrumentClient("github-board", &http.Client{Timeout: 20 * time.Second}),
 	}, nil
@@ -97,7 +108,7 @@ func (g *GitHub) List(ctx context.Context) ([]Ticket, error) {
 	var all []Ticket
 	for _, repo := range g.Repos {
 		q := url.Values{}
-		q.Set("state", "open")
+		q.Set("state", g.State)
 		q.Set("per_page", fmt.Sprintf("%d", ghPageSize))
 		if g.Label != "" {
 			q.Set("labels", g.Label)

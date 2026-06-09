@@ -74,6 +74,13 @@ const legacySoulFilename = "PINNED.md"
 // Deprecated: use SoulFilename.
 const PinnedFilename = SoulFilename
 
+// LearnedFilename is goon's self-learning notebook. The daily standby
+// reflection writes durable findings here, and answers to "learning"
+// questions are appended here too. It's defined in this low-level package
+// so both internal/memory and internal/learnings can reference it without
+// an import cycle. The agent reads it on every run.
+const LearnedFilename = "LEARNED.md"
+
 // New opens (and creates) a Store. When dir is empty it falls back to
 // $GOON_MEMORY_DIR, then <storage.Root()>/memory (i.e.
 // ./storage/memory by default). The directory is created with 0o755

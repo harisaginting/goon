@@ -3,19 +3,21 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
 
-// withConfigFile points goon's config file to a temp dir for the duration of
-// the test by setting XDG_CONFIG_HOME.
+// withConfigFile redirects goon's config file to a temp path for the duration
+// of the test by setting GOON_CONFIG_FILE. Returns the temp path.
 func withConfigFile(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	t.Setenv("XDG_CONFIG_HOME", dir)
-	return filepath.Join(dir, "goon", ".env")
+	path := filepath.Join(dir, "config.json")
+	t.Setenv("GOON_CONFIG_FILE", path)
+	return path
 }
 
 func TestConfig_Path(t *testing.T) {
@@ -72,7 +74,7 @@ func TestConfig_SetEqualsForm(t *testing.T) {
 }
 
 func TestConfig_SetReplacesExisting(t *testing.T) {
-	withConfigFile(t)
+	path := withConfigFile(t)
 	var out bytes.Buffer
 	_ = runConfig(context.Background(), []string{"set", "OPENAI_MODEL", "gpt-1"}, &out, &out)
 	out.Reset()
@@ -84,10 +86,17 @@ func TestConfig_SetReplacesExisting(t *testing.T) {
 	if got := strings.TrimSpace(out.String()); got != "gpt-2" {
 		t.Errorf("expected single replacement to gpt-2, got %q", got)
 	}
-	// File should contain only one OPENAI_MODEL line.
-	data, _ := os.ReadFile(configFilePath())
-	if strings.Count(string(data), "OPENAI_MODEL=") != 1 {
-		t.Fatalf("expected one OPENAI_MODEL= line, got file:\n%s", data)
+	// File should be valid JSON with exactly one OPENAI_MODEL key.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("config.json not valid JSON: %v\n%s", err, data)
+	}
+	if m["OPENAI_MODEL"] != "gpt-2" {
+		t.Errorf("JSON value: got %q want gpt-2", m["OPENAI_MODEL"])
 	}
 }
 
@@ -106,12 +115,8 @@ func TestConfig_ShowMasksSecrets(t *testing.T) {
 	if strings.Contains(got, "sk-abcdef1234567890") {
 		t.Fatalf("show leaked secret:\n%s", got)
 	}
-	if !strings.Contains(got, "sk…890") {
-		t.Logf("show masked output:\n%s", got)
-		// Mask format is "first2…last3"; allow any contains-…
-		if !strings.Contains(got, "…") {
-			t.Fatalf("show should mask secrets with …")
-		}
+	if !strings.Contains(got, "…") {
+		t.Fatalf("show should mask secrets with …:\n%s", got)
 	}
 }
 
@@ -125,20 +130,6 @@ func TestConfig_ShowReveal(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "sk-secret") {
 		t.Fatalf("--reveal should print secret verbatim:\n%s", out.String())
-	}
-}
-
-func TestConfig_ShellEnvBeatsConfigFile(t *testing.T) {
-	withConfigFile(t)
-	var out bytes.Buffer
-	_ = runConfig(context.Background(), []string{"set", "OPENAI_MODEL", "gpt-from-file"}, &out, &out)
-	t.Setenv("OPENAI_MODEL", "gpt-from-shell")
-	out.Reset()
-	if err := runConfig(context.Background(), []string{"get", "OPENAI_MODEL"}, &out, &out); err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if got := strings.TrimSpace(out.String()); got != "gpt-from-shell" {
-		t.Errorf("expected shell env to win, got %q", got)
 	}
 }
 

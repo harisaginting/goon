@@ -29,6 +29,11 @@ func (*RunCommand) Run(ctx context.Context, args map[string]string) (Result, err
 		return Result{ToolName: "run_command"}, errors.New(`run_command: "command" is required`)
 	}
 	c := safety.ShellCommand(ctx, cmd)
+	// Run in the selected repo's checkout when the workflow set one, so
+	// the agent operates on the RIGHT codebase (not goon's launch dir).
+	if d := WorkDirFrom(ctx); d != "" {
+		c.Dir = d
+	}
 	var stdout, stderr bytes.Buffer
 	c.Stdout = &stdout
 	c.Stderr = &stderr
