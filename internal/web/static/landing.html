@@ -6,1261 +6,911 @@
 <title>goon — your autonomous engineer</title>
 <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
-<meta name="theme-color" content="#09090B">
+<meta name="theme-color" content="#1E2433">
 <meta property="og:title" content="goon — your autonomous engineer">
 <meta property="og:description" content="An autonomous AI engineer in a single Go binary. Triages tickets, asks before changing anything, codes it, tests, opens a PR.">
 <meta property="og:image" content="/logo.svg">
 <style>
   /* ============================================================
-     design tokens — dark-only by design
+     design tokens — "day at sea" anime cel palette
      ------------------------------------------------------------
-     primary / accent  → Indigo  #6366F1  (brand, links, CTAs — matches the app)
-     highlight         → Vibrant Amber #F59E0B  (warm pop, used sparingly)
-     background        → Obsidian Black #09090B family
-     muted             → Cool Grey #94A3B8
-     text              → Pure White #FFFFFF
-     The marketing page intentionally mirrors the dashboard palette so
-     visitors who arrive from goon.app/docs land in a familiar visual
-     system the moment they sign in.
+     ink        → #1E2433  bold outlines + body text (cel "line art")
+     paper      → #FBF2DF  warm parchment surfaces
+     sky / sea  → flat cel blues, layered for parallax depth
+     accent     → Indigo #6366F1 (brand — matches the app + docs)
+     All copy is plain product copy; the style lives in the art.
      ============================================================ */
   :root {
-    --bg: #09090B;                 /* Obsidian — page background */
-    --bg-soft: #131318;            /* one step up — cards, callouts */
-    --bg-elev: #1A1A21;            /* two steps up — hovered cards */
-    --bg-glass: rgba(19, 19, 24, 0.65);
-    --fg: #FFFFFF;
-    --fg-soft: #94A3B8;            /* Cool Grey */
-    --fg-mute: #64748B;            /* slightly cooler than --fg-soft */
-    --accent: #6366F1;             /* Indigo — the brand (matches the app) */
-    --accent-2: #818CF8;            /* lifted indigo for gradients */
-    --accent-3: #F59E0B;            /* Vibrant Amber — the warm pop */
-    --accent-warm: #F59E0B;
-    --ok: #34D399;
-    --warn: #F59E0B;
-    --err: #F87171;
-    --border: #27272D;
-    --border-soft: rgba(39, 39, 45, 0.7);
+    --ink:        #1E2433;
+    --ink-soft:   #4A5165;
+    --paper:      #FBF2DF;
+    --paper-deep: #F3E5C3;
+    --paper-edge: #D9C49A;
+    --sky:        #BCE4F6;
+    --sky-high:   #8ECDEB;
+    --sea-1:      #57B7E3;
+    --sea-2:      #2E8FC9;
+    --sea-3:      #1F6FA9;
+    --sea-deep:   #175A8C;
+    --sun:        #FFD66B;
+    --accent:     #6366F1;
+    --accent-deep:#4F52D9;
+    --wood:       #8A5A33;
+    --wood-deep:  #6B4426;
+    --leaf:       #3E9B63;
+    --sand:       #EFD9A0;
+    --night:      #161B26;
+    --night-soft: #232A3A;
+    --on-night:   #EDE7D6;
+    --on-night-mute: #9AA3B5;
+    --ok:         #1E8E5A;
     --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-    --shadow-sm: 0 1px 2px rgba(0,0,0,0.35);
-    --shadow:    0 18px 40px -18px rgba(99, 102, 241, 0.35);
-    --shadow-lg: 0 32px 80px -28px rgba(99, 102, 241, 0.50);
-    --shadow-amber: 0 24px 60px -24px rgba(245, 158, 11, 0.45);
-    color-scheme: dark;
+    color-scheme: light;
   }
 
   * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
   html, body {
     margin: 0; padding: 0;
-    background: var(--bg);
-    color: var(--fg);
+    background: var(--paper);
+    color: var(--ink);
     font-family: var(--sans);
     line-height: 1.6;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
     min-height: 100%;
-    overflow-x: hidden;
+    /* CRITICAL: must be `clip`, NOT `hidden`. overflow-x:hidden turns
+       html/body into a scroll container, which silently kills EVERY
+       position:sticky descendant (the top nav + the journey stage) —
+       the page scrolls past the stage and shows bare sea. `clip` cuts
+       horizontal overflow from the 200%-wide wave bands without
+       creating a scroll container, so sticky keeps working. */
+    overflow-x: clip;
   }
   a { color: inherit; text-decoration: none; }
-  ::selection { background: color-mix(in srgb, var(--accent) 35%, transparent); }
+  ::selection { background: rgba(99, 102, 241, 0.3); }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  :focus:not(:focus-visible) { outline: none; }
+  .skip-link {
+    position: absolute; left: 12px; top: -48px; z-index: 100;
+    background: var(--ink); color: var(--paper);
+    padding: 10px 16px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    transition: top 150ms ease-out;
+  }
+  .skip-link:focus { top: 12px; }
 
   /* ============================================================
-     background mesh
-     ============================================================ */
-  .bg-fx {
-    position: fixed; inset: 0; z-index: -1; pointer-events: none;
-    overflow: hidden;
-    background:
-      radial-gradient(60% 40% at 80% 10%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%),
-      radial-gradient(50% 40% at 5% 60%, color-mix(in srgb, var(--accent-2) 20%, transparent), transparent 60%),
-      radial-gradient(40% 30% at 95% 80%, color-mix(in srgb, var(--accent-3) 14%, transparent), transparent 60%);
-  }
-  .bg-fx::after {
-    content: ''; position: absolute; inset: 0;
-    background-image:
-      linear-gradient(color-mix(in srgb, var(--fg) 6%, transparent) 1px, transparent 1px),
-      linear-gradient(90deg, color-mix(in srgb, var(--fg) 6%, transparent) 1px, transparent 1px);
-    background-size: 56px 56px;
-    mask-image: radial-gradient(ellipse 70% 80% at 50% 25%, #000 25%, transparent 75%);
-    -webkit-mask-image: radial-gradient(ellipse 70% 80% at 50% 25%, #000 25%, transparent 75%);
-    opacity: 0.55;
-  }
-
-  /* ============================================================
-     top nav
+     top nav — dark "ink" bar, matches app brand
      ============================================================ */
   nav.top {
-    position: sticky; top: 0; z-index: 30;
+    position: sticky; top: 0; z-index: 40;
     height: 64px;
-    backdrop-filter: saturate(140%) blur(16px);
-    -webkit-backdrop-filter: saturate(140%) blur(16px);
-    background: color-mix(in srgb, var(--bg) 70%, transparent);
-    border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+    background: rgba(22, 27, 38, 0.92);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(237, 231, 214, 0.12);
     display: flex; align-items: center; padding: 0 28px;
+    color: var(--on-night);
   }
-  nav.top .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.01em; font-size: 16px; }
-  nav.top .brand .logo { color: var(--accent); width: 28px; height: 28px; }
+  nav.top .brand { display: inline-flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: -0.01em; font-size: 17px; min-height: 44px; }
+  nav.top .brand svg { width: 30px; height: 30px; }
   nav.top .spacer { flex: 1; }
-  nav.top a.link { color: var(--fg-soft); margin: 0 14px; font-size: 14px; transition: color 120ms; }
-  nav.top a.link:hover { color: var(--fg); }
-  nav.top a.cta {
-    display: inline-flex; align-items: center; gap: 6px;
-    padding: 8px 14px; border-radius: 8px;
-    background: var(--fg); color: var(--bg);
-    font-weight: 600; font-size: 13.5px;
-    transition: transform 120ms, opacity 120ms;
+  nav.top a.link {
+    color: var(--on-night-mute); margin: 0 4px; font-size: 14px; font-weight: 500;
+    padding: 10px 12px; border-radius: 8px;
+    transition: color 150ms, background-color 150ms;
+    display: inline-flex; align-items: center; min-height: 44px;
   }
-  nav.top a.cta:hover { transform: translateY(-1px); opacity: 0.92; }
+  nav.top a.link:hover { color: var(--on-night); background: rgba(237, 231, 214, 0.08); }
+  nav.top a.cta {
+    display: inline-flex; align-items: center; gap: 7px;
+    margin-left: 10px; padding: 10px 18px; min-height: 44px; border-radius: 10px;
+    background: var(--accent); color: #fff;
+    font-weight: 600; font-size: 14px;
+    border: 2px solid rgba(255,255,255,0.18);
+    transition: transform 150ms ease-out, background-color 150ms;
+  }
+  nav.top a.cta:hover { background: var(--accent-deep); transform: translateY(-1px); }
   @media (max-width: 720px) {
-    nav.top { padding: 0 16px; }
+    nav.top { padding: 0 14px; }
     nav.top a.link.hide-sm { display: none; }
   }
 
   /* ============================================================
-     shared section primitives
-     ============================================================ */
-  main { padding: 0 24px; }
-  .container { max-width: 1080px; margin: 0 auto; }
-  .section { padding: 90px 0; }
-  .section-eyebrow {
-    display: inline-block;
-    padding: 4px 12px; border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--accent);
-    font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
-    margin-bottom: 14px;
-  }
-  .section-title {
-    font-size: clamp(30px, 4.5vw, 46px);
-    line-height: 1.1;
-    letter-spacing: -0.025em;
-    margin: 0 0 14px;
-    font-weight: 700;
-  }
-  .section-lede {
-    color: var(--fg-soft);
-    max-width: 620px;
-    font-size: 17px;
-    margin: 0 auto 48px;
-  }
-  .section-head { text-align: center; }
-  .grad-text {
-    background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
-
-  /* ============================================================
-     hero
+     hero — layered cel sea with parallax + poster card
      ============================================================ */
   .hero {
-    max-width: 1080px; margin: 0 auto;
-    padding: 72px 16px 48px;
-    text-align: center;
     position: relative;
+    min-height: calc(100svh - 64px);
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    padding: 48px 20px 140px;
+    background: linear-gradient(var(--sky-high) 0%, var(--sky) 52%, var(--sea-1) 52.2%, var(--sea-2) 100%);
   }
-  .hero-headline {
-    font-size: clamp(32px, 5.5vw, 56px);
-    line-height: 1.08;
-    letter-spacing: -0.03em;
-    margin: 0 0 16px;
-    font-weight: 800;
-    background: linear-gradient(175deg, var(--fg) 40%, color-mix(in srgb, var(--accent) 55%, var(--fg)) 100%);
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-    animation: fadeUp 700ms 140ms both;
+  .hero .layer {
+    position: absolute; left: 0; right: 0; pointer-events: none;
+    will-change: transform;
   }
-  .hero .badge {
-    display: inline-flex; align-items: center; gap: 8px;
-    padding: 5px 12px; border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--fg); font-size: 12.5px; font-weight: 500;
-    letter-spacing: 0.01em;
-    margin-bottom: 28px;
-    animation: fadeUp 600ms 80ms both;
+  .hero .layer svg { display: block; width: 100%; height: auto; }
+  .layer-sun    { top: 4%; }
+  .layer-clouds-far  { top: 6%; }
+  .layer-clouds-near { top: 14%; }
+  .layer-waves-far  { bottom: 18%; }
+  .layer-waves-mid  { bottom: 8%; }
+  .layer-waves-near { bottom: -2%; }
+  .layer-ship { bottom: 21%; left: 6%; right: auto; width: clamp(150px, 21vw, 280px); }
+  .layer-ship svg { animation: ship-bob 5.2s ease-in-out infinite; transform-origin: 50% 80%; }
+  @keyframes ship-bob {
+    0%, 100% { transform: translateY(0) rotate(-1.2deg); }
+    50%      { transform: translateY(-9px) rotate(1.4deg); }
   }
-  .hero .badge .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 12px var(--accent); animation: pulseDot 2s ease-in-out infinite; }
+  .wave-band { width: 200%; display: flex; }
+  .wave-band svg { width: 50%; height: auto; flex: none; }
+  .waves-far  .wave-band { animation: wave-slide 26s linear infinite; }
+  .waves-mid  .wave-band { animation: wave-slide 17s linear infinite reverse; }
+  .waves-near .wave-band { animation: wave-slide 12s linear infinite; }
+  @keyframes wave-slide { from { transform: translateX(0); } to { transform: translateX(-50%); } }
 
-  .hero .logo-stage {
-    width: min(340px, 88vw);
-    aspect-ratio: 640 / 490;
-    margin: 0 auto 32px;
-    display: grid; place-items: center;
-    color: var(--fg);
-    position: relative;
-    animation: fadeUp 700ms 60ms both;
-  }
-  .hero .logo-stage::before {
-    content: ''; position: absolute; inset: -56px; z-index: -1;
-    background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 45%, transparent), transparent 65%);
-    filter: blur(28px);
-    animation: glowPulse 4s ease-in-out infinite;
-  }
-  .hero .logo-stage::after {
-    content: ''; position: absolute; inset: -20px; z-index: -1;
-    background: radial-gradient(closest-side, color-mix(in srgb, var(--accent-3) 18%, transparent), transparent 70%);
-    filter: blur(18px);
-    animation: glowPulse 6s ease-in-out 1.5s infinite;
-  }
-  .hero .logo-stage svg { width: 100%; height: 100%; }
-
-  /* ---------- big GOON wordmark (extra specificity to override .hero h1) ---------- */
-  .hero .wordmark {
-    font-size: clamp(82px, 17vw, 184px);
-    line-height: 0.9;
-    letter-spacing: -0.055em;
-    margin: 0 auto 10px;
-    font-weight: 900;
+  .poster {
+    position: relative; z-index: 5;
+    width: min(640px, 100%);
+    background: var(--paper);
+    border: 3px solid var(--ink);
+    border-radius: 14px;
+    box-shadow: 8px 10px 0 rgba(30, 36, 51, 0.35);
+    padding: clamp(28px, 5vw, 52px) clamp(22px, 5vw, 56px);
     text-align: center;
-    background: linear-gradient(180deg, var(--fg) 30%, color-mix(in srgb, var(--accent) 55%, var(--fg)) 100%);
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    position: relative;
-    text-transform: lowercase;
-    animation: fadeUp 700ms 100ms both;
-    /* allow descender (g) to render */
-    padding-bottom: 0.06em;
   }
-  .hero .wordmark .ascii-crown {
-    display: inline-block;
-    background: linear-gradient(90deg, var(--accent), var(--accent-2), var(--accent-3));
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-  }
-  .hero .wordmark::after {
-    /* subtle drop-shadow under the wordmark */
-    content: '';
-    position: absolute; left: 50%; bottom: -10px;
-    transform: translateX(-50%);
-    width: 60%; height: 30px;
-    background: radial-gradient(closest-side, color-mix(in srgb, var(--accent) 30%, transparent), transparent 70%);
-    filter: blur(14px);
-    z-index: -1;
+  .poster::before {
+    content: ''; position: absolute; inset: 7px;
+    border: 2px solid var(--paper-edge); border-radius: 8px;
     pointer-events: none;
   }
-  .wordmark-meta {
-    display: flex; gap: 14px; justify-content: center; align-items: center;
-    font-family: var(--mono); font-size: 13px; color: var(--fg-soft);
-    margin-bottom: 28px;
-    animation: fadeUp 700ms 180ms both;
+  .poster .nail {
+    position: absolute; top: -9px; left: 50%; transform: translateX(-50%);
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--ink); border: 3px solid var(--paper);
+    box-shadow: 0 2px 0 rgba(30,36,51,0.3);
   }
-  .wordmark-meta .go-on {
-    padding: 3px 10px; border-radius: 999px;
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    background: color-mix(in srgb, var(--accent) 12%, transparent);
-    color: var(--fg);
-    font-weight: 600;
-    letter-spacing: 0.08em;
-    font-family: var(--sans);
+  .poster .eyebrow {
+    display: inline-block; font-size: 12px; font-weight: 700;
+    letter-spacing: 0.22em; text-transform: uppercase; color: var(--ink-soft);
+    border-top: 2px solid var(--paper-edge); border-bottom: 2px solid var(--paper-edge);
+    padding: 5px 14px; margin-bottom: 18px;
   }
-  .wordmark-meta .go-on .on { color: var(--accent); }
-  .wordmark-meta .sep { color: var(--fg-mute); }
-  @media (max-width: 520px) {
-    .wordmark-meta { flex-direction: column; gap: 6px; }
-    .wordmark-meta .sep { display: none; }
+  .poster h1 {
+    margin: 0 0 14px;
+    font-size: clamp(34px, 6vw, 56px);
+    line-height: 1.06; letter-spacing: -0.03em; font-weight: 800;
   }
-
-  .hero h1 {
-    font-size: clamp(44px, 8vw, 92px);
-    line-height: 1.04;
-    letter-spacing: -0.035em;
-    margin: 0 0 18px;
-    font-weight: 800;
-    background: linear-gradient(180deg, var(--fg) 50%, color-mix(in srgb, var(--fg) 60%, transparent));
-    -webkit-background-clip: text;
-    background-clip: text;
-    color: transparent;
-    animation: fadeUp 700ms 120ms both;
+  .poster h1 .accent { color: var(--accent); }
+  .poster .sub {
+    color: var(--ink-soft); font-size: clamp(15px, 2.2vw, 17.5px);
+    max-width: 46ch; margin: 0 auto 26px;
   }
-  .hero .tagline {
-    max-width: 640px; margin: 0 auto 10px;
-    font-size: clamp(16px, 2vw, 20px);
-    color: var(--fg-soft);
-    font-weight: 400;
-    line-height: 1.6;
-    animation: fadeUp 700ms 220ms both;
-  }
-  .hero .subtag {
-    max-width: 540px; margin: 0 auto 36px;
-    font-size: 14px;
-    color: var(--fg-mute);
-    letter-spacing: 0.02em;
-    animation: fadeUp 700ms 300ms both;
-  }
-
-  .cta-row {
-    display: flex; gap: 12px; justify-content: center; flex-wrap: wrap;
-    animation: fadeUp 700ms 360ms both;
-  }
+  .poster .ctas { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; }
   .btn {
     display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-    padding: 14px 22px; border-radius: 10px;
-    font-size: 15px; font-weight: 600;
-    transition: transform 140ms, box-shadow 140ms, background 140ms, color 140ms, border-color 140ms;
-    border: 1px solid transparent;
-    cursor: pointer; font-family: var(--sans);
-    min-width: 178px;
+    min-height: 48px; padding: 12px 24px; border-radius: 12px;
+    font-size: 15.5px; font-weight: 700; cursor: pointer;
+    border: 3px solid var(--ink);
+    transition: transform 150ms ease-out, box-shadow 150ms ease-out, background-color 150ms;
+    box-shadow: 3px 4px 0 rgba(30,36,51,0.9);
   }
-  .btn.primary {
-    background: var(--fg);
-    color: var(--bg);
-    box-shadow: 0 10px 30px -10px color-mix(in srgb, var(--fg) 60%, transparent);
-  }
-  .btn.primary:hover { transform: translateY(-2px); box-shadow: 0 14px 36px -12px color-mix(in srgb, var(--fg) 60%, transparent); }
-  .btn.secondary {
-    background: color-mix(in srgb, var(--bg-elev) 80%, transparent);
-    color: var(--fg);
-    border-color: var(--border);
-    backdrop-filter: blur(8px);
-  }
-  .btn.secondary:hover { transform: translateY(-2px); background: var(--bg-elev); border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
-  .btn svg { width: 16px; height: 16px; }
+  .btn:hover  { transform: translate(-1px, -2px); box-shadow: 5px 6px 0 rgba(30,36,51,0.9); }
+  .btn:active { transform: translate(1px, 1px);  box-shadow: 1px 2px 0 rgba(30,36,51,0.9); }
+  .btn.primary   { background: var(--accent); color: #fff; }
+  .btn.primary:hover { background: var(--accent-deep); }
+  .btn.secondary { background: var(--paper); color: var(--ink); }
+  .btn.secondary:hover { background: var(--paper-deep); }
+  .poster .trust { margin: 22px 0 0; font-size: 13px; color: var(--ink-soft); }
+  .poster .trust strong { color: var(--ink); }
 
-  /* ---------- stats strip ---------- */
-  .stats {
-    display: grid; grid-template-columns: repeat(4, 1fr);
-    gap: 14px;
-    max-width: 720px; margin: 56px auto 0;
-    animation: fadeUp 800ms 440ms both;
+  .hero .scroll-hint {
+    position: absolute; bottom: 26px; left: 50%; transform: translateX(-50%);
+    z-index: 6; color: #fff; font-size: 13px; font-weight: 600;
+    display: flex; flex-direction: column; align-items: center; gap: 4px;
+    text-shadow: 0 1px 4px rgba(23, 90, 140, 0.8);
   }
-  .stat {
-    text-align: center;
-    padding: 18px 14px;
-    border: 1px solid var(--border-soft);
-    border-radius: 12px;
-    background: color-mix(in srgb, var(--bg-elev) 60%, transparent);
-    backdrop-filter: blur(8px);
-  }
-  .stat .num {
-    font-size: clamp(22px, 3vw, 28px);
-    font-weight: 700;
-    background: linear-gradient(180deg, var(--fg), color-mix(in srgb, var(--accent) 60%, var(--fg)));
-    -webkit-background-clip: text; background-clip: text; color: transparent;
-    line-height: 1;
-    letter-spacing: -0.02em;
-  }
-  .stat .label { font-size: 11.5px; color: var(--fg-soft); margin-top: 6px; letter-spacing: 0.04em; text-transform: uppercase; }
-  @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .scroll-hint svg { animation: hint-dip 1.8s ease-in-out infinite; }
+  @keyframes hint-dip { 0%,100% { transform: translateY(0);} 50% { transform: translateY(6px);} }
 
   /* ============================================================
-     terminal mockup
+     journey — sticky scroll-driven voyage
      ============================================================ */
-  .terminal {
-    max-width: 760px; margin: 60px auto 0;
-    border-radius: 12px;
-    background: var(--bg-soft);
-    border: 1px solid var(--border);
+  .journey-wrap { background: linear-gradient(var(--sea-2), var(--sea-3) 70%, var(--sea-deep)); }
+  #journey { position: relative; height: 430svh; }
+  .journey-stage {
+    position: sticky; top: 64px;
+    height: calc(100svh - 64px);
     overflow: hidden;
-    box-shadow: var(--shadow-lg);
+    display: flex; flex-direction: column;
   }
-  .terminal .head {
-    display: flex; align-items: center; gap: 8px;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-soft) 50%, var(--bg));
+  .journey-head {
+    text-align: center; padding: clamp(18px, 4vh, 44px) 20px 0;
+    color: #fff; position: relative; z-index: 3;
   }
-  .terminal .head .dots { display: flex; gap: 6px; }
-  .terminal .head .dots span { width: 11px; height: 11px; border-radius: 50%; background: var(--fg-mute); opacity: 0.5; }
-  .terminal .head .title { font-family: var(--mono); font-size: 12px; color: var(--fg-mute); margin: 0 auto; }
-  .terminal .tabs { display: flex; gap: 4px; padding: 8px 12px 0; background: var(--bg-soft); border-bottom: 1px solid var(--border); }
-  .terminal .tab {
-    padding: 7px 14px; font-size: 12px; font-family: var(--mono); color: var(--fg-soft);
-    border: 1px solid transparent; border-radius: 6px 6px 0 0; cursor: pointer;
-    transition: color 120ms, background 120ms;
-    background: none;
+  .journey-head .eyebrow {
+    display: inline-block; font-size: 11.5px; font-weight: 700; letter-spacing: 0.2em;
+    text-transform: uppercase; color: var(--sun);
+    margin-bottom: 8px;
   }
-  .terminal .tab:hover { color: var(--fg); background: color-mix(in srgb, var(--bg-elev) 50%, transparent); }
-  .terminal .tab.active { color: var(--fg); background: var(--bg-soft); border-color: var(--border); border-bottom-color: var(--bg-soft); margin-bottom: -1px; }
-  .terminal pre {
-    margin: 0; padding: 18px 22px;
-    background: transparent;
-    color: var(--fg);
-    font-family: var(--mono);
-    font-size: 13.5px;
-    line-height: 1.75;
-    overflow-x: auto;
-    text-align: left;
-    min-height: 240px;
+  .journey-head h2 {
+    margin: 0; font-size: clamp(26px, 4.2vw, 40px);
+    letter-spacing: -0.02em; font-weight: 800; line-height: 1.12;
+    text-shadow: 0 2px 0 rgba(23, 90, 140, 0.45);
   }
-  .terminal .panel { display: none; }
-  .terminal .panel.active { display: block; }
-  .terminal .prompt { color: var(--accent); }
-  .terminal .arg    { color: var(--accent-2); }
-  .terminal .out    { color: var(--fg-soft); }
-  .terminal .ok     { color: var(--ok); }
-  .terminal .warn   { color: var(--warn); }
-  .terminal .label  { color: var(--accent-3); }
+  .journey-sea { position: relative; flex: 1; min-height: 0; }
+  .journey-sea > svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 
-  /* ============================================================
-     "how it works" — 4 step journey
-     ============================================================ */
-  .journey {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px;
-    position: relative;
+  .vcards {
+    position: relative; z-index: 4;
+    padding: 0 20px calc(18px + env(safe-area-inset-bottom, 0px));
+    display: grid; place-items: end center;
   }
-  .journey::before {
-    content: ''; position: absolute;
-    top: 36px; left: 6%; right: 6%; height: 2px;
-    background: linear-gradient(90deg, transparent, color-mix(in srgb, var(--accent) 60%, transparent) 15%, color-mix(in srgb, var(--accent-2) 60%, transparent) 50%, color-mix(in srgb, var(--accent-3) 60%, transparent) 85%, transparent);
-    z-index: 0;
+  .vcard {
+    background: var(--paper);
+    border: 3px solid var(--ink); border-radius: 14px;
+    box-shadow: 6px 7px 0 rgba(15, 35, 56, 0.5);
+    width: min(560px, 100%);
+    padding: 18px 22px 20px;
   }
-  .step {
-    position: relative; z-index: 1;
-    border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
-    backdrop-filter: blur(8px);
-    border-radius: 14px;
-    padding: 22px 20px 20px;
-    text-align: left;
-    transition: transform 200ms, border-color 200ms;
+  .vcard .step {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 6px;
   }
-  .step:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--accent) 50%, var(--border)); }
-  .step .num {
-    width: 36px; height: 36px;
-    border-radius: 10px;
-    display: grid; place-items: center;
-    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 25%, transparent), color-mix(in srgb, var(--accent-2) 20%, transparent));
-    border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
-    color: var(--accent);
-    font-family: var(--mono); font-size: 14px; font-weight: 700;
-    margin-bottom: 14px;
+  .vcard .step .dotnum {
+    display: inline-grid; place-items: center;
+    width: 22px; height: 22px; border-radius: 50%;
+    background: var(--accent); color: #fff; font-size: 12px; letter-spacing: 0;
   }
-  .step h3 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; letter-spacing: -0.005em; }
-  .step p { margin: 0; color: var(--fg-soft); font-size: 14px; line-height: 1.55; }
-  .step .hint { display: inline-flex; align-items: center; gap: 6px; margin-top: 10px; padding: 3px 8px; border-radius: 6px; background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); font-family: var(--mono); font-size: 11px; }
-  @media (max-width: 900px) {
-    .journey { grid-template-columns: 1fr 1fr; }
-    .journey::before { display: none; }
+  .vcard h3 { margin: 0 0 6px; font-size: 20px; font-weight: 800; letter-spacing: -0.015em; }
+  .vcard p  { margin: 0; color: var(--ink-soft); font-size: 15px; }
+  .vcard .gate-tag {
+    display: inline-flex; align-items: center; gap: 6px;
+    margin-top: 10px; padding: 4px 10px; border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12); color: var(--accent-deep);
+    border: 1.5px solid rgba(99, 102, 241, 0.45);
+    font-size: 12px; font-weight: 700;
   }
-  @media (max-width: 580px) {
-    .journey { grid-template-columns: 1fr; }
-  }
-
-  /* ============================================================
-     state-machine flow strip
-     ============================================================ */
-  .flow-pipe {
-    display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
-    font-family: var(--mono); font-size: 13px;
-  }
-  .flow-pipe .pill {
-    padding: 8px 14px; border-radius: 999px;
-    border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 70%, transparent);
-    color: var(--fg-soft);
-  }
-  .flow-pipe .pill.gate {
-    color: var(--warn);
-    border-color: color-mix(in srgb, var(--warn) 50%, var(--border));
-    background: color-mix(in srgb, var(--warn) 12%, transparent);
-  }
-  .flow-pipe .pill.done {
-    color: var(--ok);
-    border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
-    background: color-mix(in srgb, var(--ok) 10%, transparent);
-  }
-  .flow-pipe .arrow { color: var(--fg-mute); align-self: center; }
-
-  /* ============================================================
-     three-layer memory diagram
-     ============================================================ */
-  .layers {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
-  }
-  .layer {
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 26px 22px;
-    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
-    position: relative; overflow: hidden;
-    transition: transform 200ms;
-  }
-  .layer:hover { transform: translateY(-3px); }
-  .layer::before {
-    content: ''; position: absolute; inset: -1px -1px auto -1px; height: 3px;
-  }
-  .layer.knowledge::before { background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
-  .layer.skills::before    { background: linear-gradient(90deg, var(--accent-3), var(--ok)); }
-  .layer .head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-  .layer .badge {
-    font-family: var(--mono); font-size: 11px;
-    padding: 3px 8px; border-radius: 6px;
-    background: color-mix(in srgb, var(--bg) 50%, transparent);
-    border: 1px solid var(--border-soft);
-    color: var(--fg-soft);
-  }
-  .layer h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.005em; }
-  .layer p { color: var(--fg-soft); font-size: 14px; margin: 0 0 12px; line-height: 1.55; }
-  .layer .file { font-family: var(--mono); font-size: 11.5px; color: var(--fg-mute); }
-  @media (max-width: 900px) { .layers { grid-template-columns: 1fr; } }
-
-  /* ============================================================
-     pluggable matrix
-     ============================================================ */
-  .matrix {
-    display: grid; grid-template-columns: repeat(4, 1fr); gap: 18px;
-  }
-  .matrix-col {
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 22px 20px;
-    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
-  }
-  .matrix-col .col-label {
-    font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
-    color: var(--fg-mute); margin-bottom: 14px;
-  }
-  .matrix-col ul { list-style: none; padding: 0; margin: 0; }
-  .matrix-col li {
-    display: flex; align-items: center; gap: 8px;
-    padding: 7px 0; font-size: 14px; color: var(--fg);
-    border-bottom: 1px solid var(--border-soft);
-  }
-  .matrix-col li:last-child { border-bottom: none; }
-  .matrix-col li .check {
-    width: 14px; height: 14px; flex-shrink: 0;
-    color: var(--ok);
-  }
-  .matrix-col li .check svg { width: 100%; height: 100%; }
-  @media (max-width: 900px) { .matrix { grid-template-columns: 1fr 1fr; } }
-  @media (max-width: 520px) { .matrix { grid-template-columns: 1fr; } }
-
-  /* ============================================================
-     features grid (existing)
-     ============================================================ */
-  .feature-grid {
-    display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 18px;
-  }
-  @media (max-width: 900px) { .feature-grid { grid-template-columns: 1fr; } }
-  .feature {
-    border: 1px solid var(--border);
-    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
-    backdrop-filter: blur(8px);
-    border-radius: 14px;
-    padding: 26px 24px;
-    transition: border-color 200ms, transform 200ms;
-  }
-  .feature:hover { border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); transform: translateY(-3px); }
-  .feature .icon {
-    width: 38px; height: 38px;
-    border-radius: 10px;
-    display: grid; place-items: center;
-    background: color-mix(in srgb, var(--accent) 18%, transparent);
-    color: var(--accent);
-    margin-bottom: 16px;
-  }
-  .feature .icon svg { width: 19px; height: 19px; }
-  .feature h3 { margin: 0 0 6px; font-size: 17px; font-weight: 600; letter-spacing: -0.005em; }
-  .feature p { margin: 0; color: var(--fg-soft); font-size: 14.5px; line-height: 1.55; }
-
-  /* ============================================================
-     three surfaces
-     ============================================================ */
-  .surfaces {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px;
-  }
-  .surface {
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    background: color-mix(in srgb, var(--bg-elev) 85%, transparent);
-    overflow: hidden;
-    transition: transform 200ms, border-color 200ms;
-  }
-  .surface:hover { transform: translateY(-3px); border-color: color-mix(in srgb, var(--accent) 55%, var(--border)); }
-  .surface .mock {
-    height: 170px;
-    background: linear-gradient(135deg, color-mix(in srgb, var(--bg) 80%, transparent), var(--bg-soft));
-    border-bottom: 1px solid var(--border-soft);
-    padding: 12px;
-    overflow: hidden;
-    position: relative;
-    font-family: var(--mono); font-size: 11px; line-height: 1.6;
-    color: var(--fg-soft);
-  }
-  .surface .mock .cli-line { color: var(--fg); }
-  .surface .mock .cli-line .pf { color: var(--accent); }
-  .surface .mock .cli-line .ok { color: var(--ok); }
-  .surface .mock-web {
-    display: grid; grid-template-columns: 60px 1fr; gap: 4px; height: 100%;
-  }
-  .surface .mock-web .sb { background: color-mix(in srgb, var(--accent) 14%, transparent); border-radius: 4px; padding: 6px 4px; }
-  .surface .mock-web .sb div { height: 6px; background: color-mix(in srgb, var(--accent) 30%, transparent); border-radius: 2px; margin-bottom: 5px; }
-  .surface .mock-web .sb div:nth-child(2) { background: color-mix(in srgb, var(--accent) 50%, transparent); }
-  .surface .mock-web .panes { display: flex; flex-direction: column; gap: 4px; }
-  .surface .mock-web .panes div { background: color-mix(in srgb, var(--bg-elev) 90%, transparent); border-radius: 4px; flex: 1; padding: 6px; font-size: 10px; }
-  .surface .mock-tg .bubble {
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
-    border-radius: 10px 10px 10px 2px;
-    padding: 7px 10px; margin: 4px 0;
-    font-family: var(--sans); font-size: 11.5px; max-width: 80%;
-  }
-  .surface .mock-tg .bubble.me {
-    background: color-mix(in srgb, var(--ok) 18%, transparent);
-    border-radius: 10px 10px 2px 10px;
-    margin-left: auto;
-  }
-  .surface .body { padding: 18px 20px 22px; }
-  .surface h3 { margin: 0 0 6px; font-size: 16.5px; font-weight: 600; }
-  .surface p { color: var(--fg-soft); font-size: 13.5px; margin: 0 0 10px; line-height: 1.55; }
-  .surface .tag-row { display: flex; flex-wrap: wrap; gap: 4px; }
-  .surface .tag {
-    font-family: var(--mono); font-size: 10.5px;
-    padding: 2px 7px; border-radius: 6px;
-    background: color-mix(in srgb, var(--bg) 50%, transparent);
-    border: 1px solid var(--border-soft);
-    color: var(--fg-soft);
-  }
-  @media (max-width: 900px) { .surfaces { grid-template-columns: 1fr; } }
-
-  /* ============================================================
-     safety section — two-column
-     ============================================================ */
-  .safety {
-    display: grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items: center;
-  }
-  .safety .copy h2 { font-size: clamp(28px, 4vw, 38px); margin: 0 0 14px; letter-spacing: -0.02em; font-weight: 700; }
-  .safety .copy > p { color: var(--fg-soft); font-size: 16px; margin: 0 0 18px; }
-  .safety .copy ul { padding-left: 0; list-style: none; margin: 0; }
-  .safety .copy li {
-    display: flex; align-items: flex-start; gap: 10px;
-    padding: 10px 0; border-bottom: 1px solid var(--border-soft);
-  }
-  .safety .copy li:last-child { border-bottom: none; }
-  .safety .copy li .checkmark {
-    width: 20px; height: 20px; flex-shrink: 0; margin-top: 1px;
-    border-radius: 6px;
-    background: color-mix(in srgb, var(--ok) 22%, transparent);
-    color: var(--ok);
-    display: grid; place-items: center;
-  }
-  .safety .copy li .checkmark svg { width: 12px; height: 12px; }
-  .safety .copy li strong { display: block; font-weight: 600; }
-  .safety .copy li .det { color: var(--fg-soft); font-size: 14px; }
-  .safety .visual {
-    background: linear-gradient(135deg, color-mix(in srgb, var(--accent) 14%, transparent), color-mix(in srgb, var(--accent-2) 10%, transparent));
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 20px;
-    box-shadow: var(--shadow);
-  }
-  .safety .visual .gate {
-    border: 1px solid var(--border-soft);
-    background: var(--bg-soft);
-    border-radius: 10px;
-    padding: 14px 16px;
-    margin-bottom: 10px;
-  }
-  .safety .visual .gate .lbl { font-family: var(--mono); font-size: 11px; color: var(--warn); margin-bottom: 4px; }
-  .safety .visual .gate .q { font-size: 14px; margin: 0 0 10px; color: var(--fg); }
-  .safety .visual .gate .opts { display: flex; gap: 6px; flex-wrap: wrap; }
-  .safety .visual .gate .opt {
-    padding: 5px 11px; border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--bg-elev);
-    font-size: 12px; color: var(--fg-soft);
-  }
-  .safety .visual .gate .opt.primary { background: var(--accent); color: var(--bg); border-color: var(--accent); }
-  .safety .visual .gate .opt.danger  { color: var(--err); border-color: color-mix(in srgb, var(--err) 35%, var(--border)); }
-  @media (max-width: 900px) { .safety { grid-template-columns: 1fr; } }
-
-  /* ============================================================
-     bottom CTA
-     ============================================================ */
-  section.bottom-cta {
-    max-width: 880px; margin: 100px auto 80px;
-    padding: 60px 36px;
-    border-radius: 24px;
-    text-align: center;
-    background:
-      linear-gradient(135deg, color-mix(in srgb, var(--accent) 20%, transparent), color-mix(in srgb, var(--accent-2) 16%, transparent));
-    border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
-    position: relative;
-    overflow: hidden;
-  }
-  section.bottom-cta::before {
-    content: ''; position: absolute; inset: 0; z-index: 0;
-    background: radial-gradient(closest-side at 30% 100%, color-mix(in srgb, var(--accent-3) 30%, transparent), transparent 60%);
+  /* JS on: cards stack in one grid cell and crossfade */
+  .js .vcards .vcard {
+    grid-area: 1 / 1;
+    opacity: 0; transform: translateY(14px);
+    transition: opacity 240ms ease-out, transform 240ms ease-out;
     pointer-events: none;
   }
-  section.bottom-cta h2 {
-    font-size: clamp(26px, 3.8vw, 38px);
-    letter-spacing: -0.02em;
-    margin: 0 0 14px;
-    font-weight: 700;
-    position: relative;
+  .js .vcards .vcard.landed { opacity: 1; transform: translateY(0); pointer-events: auto; }
+  /* JS off: everything visible, stacked — page still fully readable */
+  .no-js #journey { height: auto; }
+  .no-js .journey-stage { position: static; height: auto; }
+  .no-js .vcards { grid-template-columns: 1fr; place-items: stretch; gap: 14px; padding-bottom: 40px; }
+  .no-js .journey-sea { min-height: 320px; }
+
+  .voyage-progress {
+    position: relative; z-index: 4;
+    display: flex; gap: 10px; justify-content: center; align-items: center;
+    padding: 12px 0 14px;
   }
-  section.bottom-cta p {
-    color: var(--fg-soft);
-    max-width: 480px; margin: 0 auto 28px;
-    font-size: 16px;
-    position: relative;
+  .voyage-progress button {
+    width: 30px; height: 30px; border-radius: 50%;
+    border: 2.5px solid rgba(255,255,255,0.85);
+    background: rgba(23, 90, 140, 0.55);
+    cursor: pointer; padding: 0;
+    display: grid; place-items: center;
+    transition: background-color 150ms, transform 150ms;
   }
-  section.bottom-cta .cta-row { position: relative; }
+  .voyage-progress button::after {
+    content: ''; width: 8px; height: 8px; border-radius: 50%;
+    background: rgba(255,255,255,0.85);
+    transition: background-color 150ms;
+  }
+  .voyage-progress button:hover { transform: scale(1.12); }
+  .voyage-progress button[aria-current="step"] { background: var(--sun); border-color: #fff; }
+  .voyage-progress button[aria-current="step"]::after { background: var(--ink); }
+  .no-js .voyage-progress { display: none; }
 
   /* ============================================================
-     footer
+     features — poster-card grid on parchment
      ============================================================ */
+  .features { background: var(--paper); position: relative; padding: 90px 24px 80px; }
+  .features::before {
+    content: ''; position: absolute; top: -2px; left: 0; right: 0; height: 26px;
+    background: var(--sea-deep);
+    clip-path: polygon(0 0, 100% 0, 100% 30%, 96% 80%, 88% 35%, 80% 85%, 72% 40%, 64% 88%, 56% 38%, 48% 84%, 40% 36%, 32% 86%, 24% 42%, 16% 84%, 8% 38%, 0 80%);
+  }
+  .container { max-width: 1080px; margin: 0 auto; }
+  .section-head { text-align: center; margin-bottom: 48px; }
+  .section-head .eyebrow {
+    display: inline-block; font-size: 11.5px; font-weight: 700; letter-spacing: 0.2em;
+    text-transform: uppercase; color: var(--accent-deep);
+    background: rgba(99, 102, 241, 0.1); border: 1.5px solid rgba(99, 102, 241, 0.4);
+    padding: 5px 14px; border-radius: 999px; margin-bottom: 14px;
+  }
+  .section-head h2 { margin: 0 0 12px; font-size: clamp(28px, 4.4vw, 42px); letter-spacing: -0.025em; font-weight: 800; line-height: 1.1; }
+  .section-head p  { margin: 0 auto; max-width: 56ch; color: var(--ink-soft); font-size: 16.5px; }
+  .feature-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 18px; }
+  .fcard {
+    background: #fff;
+    border: 2.5px solid var(--ink); border-radius: 14px;
+    padding: 22px 22px 24px;
+    box-shadow: 4px 5px 0 rgba(30,36,51,0.18);
+    transition: transform 180ms ease-out, box-shadow 180ms ease-out;
+  }
+  .fcard:hover { transform: translateY(-4px); box-shadow: 6px 9px 0 rgba(30,36,51,0.22); }
+  .fcard .icon {
+    width: 46px; height: 46px; border-radius: 12px;
+    display: grid; place-items: center; margin-bottom: 14px;
+    background: rgba(99, 102, 241, 0.1); border: 2px solid rgba(99, 102, 241, 0.35);
+    color: var(--accent-deep);
+  }
+  .fcard .icon svg { width: 24px; height: 24px; }
+  .fcard h3 { margin: 0 0 6px; font-size: 17.5px; font-weight: 800; letter-spacing: -0.01em; }
+  .fcard p  { margin: 0; font-size: 14.5px; color: var(--ink-soft); }
+  .js .reveal { opacity: 0; transform: translateY(18px); transition: opacity 320ms ease-out, transform 320ms ease-out; }
+  .js .reveal.in { opacity: 1; transform: translateY(0); }
+
+  /* ============================================================
+     install — night sea, chest opens, copy command
+     ============================================================ */
+  .install {
+    position: relative; overflow: hidden;
+    background: linear-gradient(var(--night) 0%, #11304A 78%, #0E4368 100%);
+    color: var(--on-night);
+    padding: 110px 24px 96px;
+    text-align: center;
+  }
+  .install .stars span {
+    position: absolute; width: 3px; height: 3px; border-radius: 50%;
+    background: #FFE9A8; opacity: 0.8;
+  }
+  .install h2 { margin: 0 0 10px; font-size: clamp(28px, 4.4vw, 42px); font-weight: 800; letter-spacing: -0.025em; }
+  .install .lede { color: var(--on-night-mute); max-width: 52ch; margin: 0 auto 36px; font-size: 16.5px; }
+  .chest-wrap { width: 150px; margin: 0 auto 26px; }
+  .chest-wrap svg { width: 100%; height: auto; }
+  #chest-lid { transform-origin: 18px 64px; transition: transform 600ms cubic-bezier(0.2, 1.4, 0.4, 1); }
+  #chest-glow { opacity: 0; transition: opacity 500ms ease-out 150ms; }
+  .chest-open #chest-lid { transform: rotate(-38deg); }
+  .chest-open #chest-glow { opacity: 1; }
+  .cmd {
+    display: flex; align-items: stretch; justify-content: center; gap: 0;
+    width: min(620px, 100%); margin: 0 auto 26px;
+    border: 2.5px solid rgba(237, 231, 214, 0.35); border-radius: 12px;
+    background: rgba(9, 12, 20, 0.7); overflow: hidden;
+  }
+  .cmd code {
+    flex: 1; font-family: var(--mono); font-size: clamp(12px, 2.4vw, 14.5px);
+    color: #D9F2E6; padding: 16px 18px; text-align: left;
+    overflow-x: auto; white-space: nowrap;
+  }
+  .cmd button {
+    flex: none; min-width: 92px; cursor: pointer;
+    border: none; border-left: 2.5px solid rgba(237, 231, 214, 0.35);
+    background: var(--accent); color: #fff;
+    font-family: var(--sans); font-size: 14px; font-weight: 700;
+    transition: background-color 150ms;
+  }
+  .cmd button:hover { background: var(--accent-deep); }
+  .cmd button.copied { background: var(--ok); }
+  .install .ctas { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .install .btn.secondary { background: transparent; color: var(--on-night); border-color: var(--on-night); box-shadow: 3px 4px 0 rgba(237,231,214,0.4); }
+  .install .btn.secondary:hover { background: rgba(237, 231, 214, 0.1); box-shadow: 5px 6px 0 rgba(237,231,214,0.4); }
+
   footer {
-    max-width: 1080px; margin: 0 auto;
-    padding: 32px 24px 56px;
-    border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
-    display: flex; justify-content: space-between; align-items: center;
-    color: var(--fg-mute); font-size: 13px;
-    flex-wrap: wrap; gap: 12px;
+    background: var(--night); color: var(--on-night-mute);
+    border-top: 1px solid rgba(237, 231, 214, 0.12);
+    padding: 26px 24px calc(26px + env(safe-area-inset-bottom, 0px));
+    display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; justify-content: center;
+    font-size: 13.5px;
   }
-  footer .links a { color: var(--fg-soft); margin-left: 16px; transition: color 120ms; }
-  footer .links a:hover { color: var(--fg); }
-  footer .brand-foot { display: inline-flex; align-items: center; gap: 8px; }
-  footer .brand-foot svg { color: var(--accent); }
+  footer a { padding: 8px 4px; min-height: 44px; display: inline-flex; align-items: center; transition: color 150ms; }
+  footer a:hover { color: var(--on-night); }
 
   /* ============================================================
-     animations + reveals
+     reduced motion — full static page, nothing lost
      ============================================================ */
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(14px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-  @keyframes glowPulse {
-    0%, 100% { opacity: 0.55; transform: scale(1); }
-    50%      { opacity: 0.95; transform: scale(1.08); }
-  }
-  @keyframes pulseDot {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50%      { opacity: 0.4; transform: scale(0.85); }
-  }
-  .reveal { opacity: 0; transform: translateY(14px); transition: opacity 700ms ease-out, transform 700ms cubic-bezier(0.16, 1, 0.3, 1); }
-  .reveal.in { opacity: 1; transform: none; }
-
   @media (prefers-reduced-motion: reduce) {
-    *, *::before, *::after { animation: none !important; transition: none !important; }
-    .reveal { opacity: 1; transform: none; }
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+    #journey { height: auto !important; }
+    .journey-stage { position: static; height: auto; }
+    .js .vcards { grid-template-columns: 1fr; place-items: stretch; gap: 14px; padding-bottom: 40px; }
+    .js .vcards .vcard { opacity: 1; transform: none; pointer-events: auto; position: static; grid-area: auto; }
+    .voyage-progress { display: none; }
+    .journey-sea { min-height: 300px; }
+    .js .reveal { opacity: 1; transform: none; }
   }
 </style>
 </head>
-<body>
+<body class="no-js">
+<a class="skip-link" href="#main">Skip to content</a>
 
-<div class="bg-fx" aria-hidden="true"></div>
-
-<nav class="top">
-  <a href="/" class="brand">
-    <svg class="logo" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-      <path d="M3.5 11.5 C3.5 20 20.5 20 20.5 11.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
-      <circle cx="7.5" cy="9" r="2.4" fill="currentColor"/>
-      <circle cx="7.5" cy="9" r="1.1" fill="white" opacity="0.85"/>
-      <circle cx="7.85" cy="9" r="0.48" fill="currentColor"/>
-      <circle cx="16.5" cy="9" r="2.4" fill="currentColor"/>
-      <circle cx="16.5" cy="9" r="1.1" fill="white" opacity="0.85"/>
-      <circle cx="16.15" cy="9" r="0.48" fill="currentColor"/>
+<nav class="top" aria-label="Main">
+  <a href="/" class="brand" aria-label="goon home">
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M3.5 11.5 C3.5 20 20.5 20 20.5 11.5" fill="none" stroke="#6366F1" stroke-width="2.4" stroke-linecap="round"/>
+      <circle cx="7.5" cy="9" r="2.4" fill="#6366F1"/><circle cx="7.5" cy="9" r="1.1" fill="#fff"/>
+      <circle cx="16.5" cy="9" r="2.4" fill="#6366F1"/><circle cx="16.5" cy="9" r="1.1" fill="#fff"/>
     </svg>
+    goon
   </a>
-  <div class="spacer"></div>
-  <a class="link hide-sm" href="#how">How it works</a>
+  <span class="spacer"></span>
+  <a class="link hide-sm" href="#journey">How it works</a>
   <a class="link hide-sm" href="#features">Features</a>
   <a class="link hide-sm" href="/docs">Docs</a>
   <a class="link hide-sm" href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
-  <a class="cta" href="/app">
-    Go to app
-    <svg viewBox="0 0 20 20" fill="currentColor" width="14" height="14" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
+  <a class="cta" href="/app">Open dashboard
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
   </a>
 </nav>
 
-<main>
+<main id="main">
 
-  <!-- =========================================================
-       HERO
-       ========================================================= -->
-  <section class="hero">
-    <span class="badge"><span class="dot"></span> autonomous · open source · zero deps</span>
+<!-- ================= hero ================= -->
+<section class="hero" aria-label="Introduction">
 
-    <div class="logo-stage" aria-hidden="true">
-      <svg viewBox="0 0 640 490" xmlns="http://www.w3.org/2000/svg">
-        <!-- smile -->
-        <path d="M 54 210 C 54 456 586 456 586 210" fill="none" stroke="currentColor" stroke-width="27" stroke-linecap="round"/>
-        <!-- left eye — outer ring + dark cutout + pupil -->
-        <circle cx="215" cy="192" r="63" fill="currentColor"/>
-        <circle cx="215" cy="192" r="48" style="fill:var(--bg)"/>
-        <circle cx="224" cy="192" r="22" fill="currentColor"/>
-        <!-- right eye -->
-        <circle cx="415" cy="192" r="63" fill="currentColor"/>
-        <circle cx="415" cy="192" r="48" style="fill:var(--bg)"/>
-        <circle cx="406" cy="192" r="22" fill="currentColor"/>
-        <!-- G -->
-        <path d="M 116 175 A 56 56 0 1 0 116 209" fill="none" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-        <line x1="88" y1="194" x2="116" y2="194" stroke="currentColor" stroke-width="16" stroke-linecap="round"/>
-        <!-- N -->
-        <rect x="487" y="128" width="26" height="128" rx="13" fill="currentColor"/>
-        <line x1="500" y1="128" x2="572" y2="256" stroke="currentColor" stroke-width="26" stroke-linecap="round"/>
-        <rect x="559" y="128" width="26" height="128" rx="13" fill="currentColor"/>
-      </svg>
-    </div>
+  <div class="layer layer-sun" data-speed="0.12" aria-hidden="true">
+    <svg viewBox="0 0 1200 220" preserveAspectRatio="xMaxYMin meet">
+      <g transform="translate(1020,90)">
+        <g stroke="#FFC94D" stroke-width="10" stroke-linecap="round" opacity="0.85">
+          <line x1="-86" y1="0" x2="-64" y2="0"/><line x1="64" y1="0" x2="86" y2="0"/>
+          <line x1="0" y1="-86" x2="0" y2="-64"/><line x1="0" y1="64" x2="0" y2="86"/>
+          <line x1="-61" y1="-61" x2="-45" y2="-45"/><line x1="45" y1="45" x2="61" y2="61"/>
+          <line x1="61" y1="-61" x2="45" y2="-45"/><line x1="-45" y1="45" x2="-61" y2="61"/>
+        </g>
+        <circle r="46" fill="#FFD66B" stroke="#1E2433" stroke-width="4"/>
+        <circle r="34" fill="#FFE9A8"/>
+      </g>
+    </svg>
+  </div>
 
-    <h1 class="hero-headline">Your autonomous <span class="grad-text">engineer</span>.</h1>
-    <p class="tagline">An AI engineer in a single Go binary. It picks up tickets, asks before changing anything, codes it, tests, opens the PR.</p>
-    <p class="subtag">Pluggable LLM · Jira / GitHub · CLI, web UI, or Telegram.</p>
+  <div class="layer layer-clouds-far" data-speed="0.2" aria-hidden="true">
+    <svg viewBox="0 0 1200 160">
+      <g fill="#FFFFFF" stroke="#1E2433" stroke-width="3.5" opacity="0.95">
+        <path d="M120 96 q-26 0 -26 -20 q0 -22 24 -22 q6 -22 32 -22 q26 0 32 18 q26 -4 30 16 q4 22 -22 26 q-8 4 -70 4 Z"/>
+        <path d="M560 70 q-20 0 -20 -16 q0 -17 19 -17 q5 -17 25 -17 q20 0 25 14 q20 -3 23 12 q3 17 -17 20 q-6 4 -55 4 Z"/>
+      </g>
+    </svg>
+  </div>
 
-    <div class="cta-row">
-      <a class="btn primary" href="/app">
-        Go to app
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
-      </a>
-      <a class="btn secondary" href="/docs">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
-        Documentation
-      </a>
-    </div>
+  <div class="layer layer-clouds-near" data-speed="0.34" aria-hidden="true">
+    <svg viewBox="0 0 1200 160">
+      <g fill="#FFFFFF" stroke="#1E2433" stroke-width="4">
+        <path d="M880 110 q-30 0 -30 -24 q0 -26 28 -26 q8 -26 38 -26 q30 0 38 22 q30 -5 34 18 q5 26 -26 30 q-10 6 -82 6 Z"/>
+        <path d="M260 130 q-22 0 -22 -18 q0 -19 21 -19 q6 -19 28 -19 q22 0 28 16 q22 -3 25 13 q4 19 -19 22 q-7 5 -61 5 Z"/>
+      </g>
+    </svg>
+  </div>
 
-    <div class="stats">
-      <div class="stat"><div class="num">0</div><div class="label">third-party deps</div></div>
-      <div class="stat"><div class="num">5</div><div class="label">LLM providers</div></div>
-      <div class="stat"><div class="num">3</div><div class="label">surfaces</div></div>
-      <div class="stat"><div class="num">9</div><div class="label">indexed langs</div></div>
-    </div>
-  </section>
-
-  <!-- =========================================================
-       TERMINAL DEMO — 3 tabs
-       ========================================================= -->
-  <div class="container reveal" id="demo">
-    <div class="terminal" aria-label="example session">
-      <div class="head">
-        <div class="dots"><span></span><span></span><span></span></div>
-        <div class="title">~/projects/myapp · goon</div>
-      </div>
-      <div class="tabs" role="tablist">
-        <button class="tab active" role="tab" data-tab="t1">one-shot</button>
-        <button class="tab"        role="tab" data-tab="t2">daemon</button>
-        <button class="tab"        role="tab" data-tab="t3">telegram</button>
-      </div>
-
-      <div class="panel active" data-panel="t1">
-        <pre><span class="prompt">$</span> goon <span class="arg">"fix the failing auth test in user-service"</span>
-<span class="label">→ triage</span>     read 4 files · 1 stale import found
-<span class="label">→ plan</span>       regenerate mocks · update import path · rerun tests
-<span class="label">→ approve plan?</span> <span class="ok">yes</span>
-<span class="label">→ execute</span>    7 lines changed across 2 files
-<span class="label">→ test</span>       go test ./internal/user/... <span class="ok">PASS</span>
-<span class="label">→ verify</span>     diff applied, no orphan imports
-<span class="ok">✓ PR opened: github.com/you/repo/pull/482</span></pre>
-      </div>
-
-      <div class="panel" data-panel="t2">
-        <pre><span class="prompt">$</span> goon start
-<span class="out">  workflow: default · polling jira every 5m</span>
-<span class="out">  bot:      enabled · 1 chat authorized</span>
-<span class="out">  web:      http://localhost:8080</span>
-
-<span class="label">[15:02:11]</span> picked PROJ-482 · "fix flaky auth test"
-<span class="label">[15:02:14]</span> triage complete · awaiting <span class="warn">confirm_repo</span>
-<span class="label">[15:04:33]</span> answer: repo = harisaginting/user-service
-<span class="label">[15:04:34]</span> plan ready · awaiting <span class="warn">approve_plan</span>
-<span class="label">[15:06:01]</span> answer: yes
-<span class="label">[15:06:02]</span> executing... test... verify...
-<span class="ok">✓ [15:07:48] PR opened · notified via telegram</span></pre>
-      </div>
-
-      <div class="panel" data-panel="t3">
-        <pre><span class="prompt">you</span>   /mine
-<span class="label">goon</span>  Tickets assigned to you:
-        <span class="ok">PROJ-482</span> fix flaky auth test         · in progress
-        <span class="ok">PROJ-501</span> upgrade pg driver to v5      · todo
-        <span class="ok">PROJ-509</span> rename "tenant" → "workspace" · todo
-
-<span class="prompt">you</span>   /ticket PROJ-501 comment "I'll take this after 482 lands"
-<span class="label">goon</span>  <span class="ok">✓ comment posted on PROJ-501</span>
-
-<span class="prompt">you</span>   /prs
-<span class="label">goon</span>  Open PRs in followed repos:
-        #482 fix flaky auth test  (you · awaiting review)</pre>
-      </div>
+  <div class="layer layer-waves-far waves-far" data-speed="0.4" aria-hidden="true">
+    <div class="wave-band">
+      <svg viewBox="0 0 1200 90" preserveAspectRatio="none"><path d="M0 50 Q75 18 150 50 T300 50 T450 50 T600 50 T750 50 T900 50 T1050 50 T1200 50 V90 H0 Z" fill="#2E8FC9" stroke="#1E2433" stroke-width="4"/></svg>
+      <svg viewBox="0 0 1200 90" preserveAspectRatio="none"><path d="M0 50 Q75 18 150 50 T300 50 T450 50 T600 50 T750 50 T900 50 T1050 50 T1200 50 V90 H0 Z" fill="#2E8FC9" stroke="#1E2433" stroke-width="4"/></svg>
     </div>
   </div>
 
-  <!-- =========================================================
-       HOW IT WORKS — 4 step journey
-       ========================================================= -->
-  <section class="section container reveal" id="how">
-    <div class="section-head">
-      <span class="section-eyebrow">how it works</span>
-      <h2 class="section-title">A real engineer's loop, automated.</h2>
-      <p class="section-lede">Goon doesn't just generate code — it follows the same loop a senior would. Read, plan, ask, execute, verify, ship. You stay in the loop at the moments that matter.</p>
+  <div class="layer layer-ship" data-speed="0.46" aria-hidden="true">
+    <svg viewBox="0 0 240 200">
+      <line x1="120" y1="22" x2="120" y2="128" stroke="#6B4426" stroke-width="7" stroke-linecap="round"/>
+      <path d="M120 30 L120 96 L66 90 Q88 62 66 36 Z" fill="#FBF2DF" stroke="#1E2433" stroke-width="5" stroke-linejoin="round"/>
+      <path d="M84 60 L116 62 L116 74 L82 72 Q86 66 84 60 Z" fill="#6366F1" opacity="0.9"/>
+      <path d="M120 22 L162 32 L120 44 Z" fill="#E24B4A" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"/>
+      <path d="M34 128 L206 128 L182 168 Q120 180 58 168 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="5" stroke-linejoin="round"/>
+      <path d="M34 128 L206 128 L198 142 L42 142 Z" fill="#A9713F" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"/>
+      <circle cx="84" cy="155" r="6" fill="#FBF2DF" stroke="#1E2433" stroke-width="3"/>
+      <circle cx="124" cy="157" r="6" fill="#FBF2DF" stroke="#1E2433" stroke-width="3"/>
+      <circle cx="162" cy="153" r="6" fill="#FBF2DF" stroke="#1E2433" stroke-width="3"/>
+    </svg>
+  </div>
+
+  <div class="layer layer-waves-mid waves-mid" data-speed="0.55" aria-hidden="true">
+    <div class="wave-band">
+      <svg viewBox="0 0 1200 100" preserveAspectRatio="none"><path d="M0 55 Q60 20 120 55 T240 55 T360 55 T480 55 T600 55 T720 55 T840 55 T960 55 T1080 55 T1200 55 V100 H0 Z" fill="#1F6FA9" stroke="#1E2433" stroke-width="4"/></svg>
+      <svg viewBox="0 0 1200 100" preserveAspectRatio="none"><path d="M0 55 Q60 20 120 55 T240 55 T360 55 T480 55 T600 55 T720 55 T840 55 T960 55 T1080 55 T1200 55 V100 H0 Z" fill="#1F6FA9" stroke="#1E2433" stroke-width="4"/></svg>
+    </div>
+  </div>
+
+  <div class="poster" data-speed="0.06">
+    <span class="nail" aria-hidden="true"></span>
+    <span class="eyebrow">Autonomous engineer · single Go binary</span>
+    <h1>Ships the ticket.<br><span class="accent">Asks before it acts.</span></h1>
+    <p class="sub">goon triages your board, confirms the repo with you, gets its plan approved, then codes, tests, and opens the pull request — while you watch from a live dashboard.</p>
+    <div class="ctas">
+      <a class="btn primary" href="/app">Open dashboard</a>
+      <a class="btn secondary" href="/docs">Read the docs</a>
+    </div>
+    <p class="trust">Zero external dependencies · works with <strong>Jira, GitHub, GitLab, Bitbucket</strong> · any LLM provider</p>
+  </div>
+
+  <div class="layer layer-waves-near waves-near" data-speed="0.7" aria-hidden="true">
+    <div class="wave-band">
+      <svg viewBox="0 0 1200 110" preserveAspectRatio="none"><path d="M0 60 Q50 22 100 60 T200 60 T300 60 T400 60 T500 60 T600 60 T700 60 T800 60 T900 60 T1000 60 T1100 60 T1200 60 V110 H0 Z" fill="#175A8C" stroke="#1E2433" stroke-width="4"/></svg>
+      <svg viewBox="0 0 1200 110" preserveAspectRatio="none"><path d="M0 60 Q50 22 100 60 T200 60 T300 60 T400 60 T500 60 T600 60 T700 60 T800 60 T900 60 T1000 60 T1100 60 T1200 60 V110 H0 Z" fill="#175A8C" stroke="#1E2433" stroke-width="4"/></svg>
+    </div>
+  </div>
+
+  <div class="scroll-hint" aria-hidden="true">
+    scroll
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>
+  </div>
+</section>
+
+<!-- ================= journey ================= -->
+<div class="journey-wrap">
+<section id="journey" aria-label="How it works">
+  <div class="journey-stage">
+    <div class="journey-head">
+      <span class="eyebrow">How it works</span>
+      <h2>A real engineer's loop — keep scrolling to sail it.</h2>
     </div>
 
-    <div class="journey">
-      <div class="step">
-        <div class="num">1</div>
-        <h3>It picks up a ticket</h3>
-        <p>Polls Jira or GitHub Issues every few minutes. Picks one ticket per tick, learns repo mappings as you confirm them — next time it auto-skips that question.</p>
-        <span class="hint">poll · triage</span>
-      </div>
-      <div class="step">
-        <div class="num">2</div>
-        <h3>It asks before touching code</h3>
-        <p>Two gates: <em>which repo?</em> and <em>is this plan right?</em> Approve, reject, or edit the plan inline. Rejected plans re-plan with your feedback (up to 3 attempts).</p>
-        <span class="hint">approval gates</span>
-      </div>
-      <div class="step">
-        <div class="num">3</div>
-        <h3>It actually ships the work</h3>
-        <p>Edits files, runs tests, verifies the diff, updates its own markdown notes about what it learned. Every shell command goes through the safety validator.</p>
-        <span class="hint">execute · test · verify</span>
-      </div>
-      <div class="step">
-        <div class="num">4</div>
-        <h3>You get a PR</h3>
-        <p>Real PR on GitHub / GitLab / Bitbucket. Review from the web UI or Telegram — approve, comment, request changes. Goon learns from the review for next time.</p>
-        <span class="hint">open PR · notify</span>
-      </div>
+    <div class="journey-sea">
+      <svg viewBox="0 0 1000 520" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+        <path id="route-base" d="M70 120 C 240 40, 380 60, 500 140 C 620 220, 560 320, 430 350 C 300 380, 280 450, 430 470 C 580 490, 780 440, 930 330"
+              fill="none" stroke="rgba(255,255,255,0.35)" stroke-width="5" stroke-dasharray="2 16" stroke-linecap="round"/>
+        <path id="route-trail" d="M70 120 C 240 40, 380 60, 500 140 C 620 220, 560 320, 430 350 C 300 380, 280 450, 430 470 C 580 490, 780 440, 930 330"
+              fill="none" stroke="#FFD66B" stroke-width="5" stroke-linecap="round"/>
+
+        <g class="isl" transform="translate(70,120)">
+          <ellipse cx="0" cy="16" rx="52" ry="18" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"/>
+          <path d="M-10 8 L-10 -26 M-10 -26 q-24 -12 -38 2 q18 -2 24 8 M-10 -26 q22 -14 36 0 q-17 -3 -24 9" fill="none" stroke="#2C6E47" stroke-width="6" stroke-linecap="round"/>
+          <rect x="8" y="-12" width="26" height="20" rx="3" fill="#FBF2DF" stroke="#1E2433" stroke-width="3.5"/>
+          <line x1="12" y1="-5" x2="30" y2="-5" stroke="#1E2433" stroke-width="2"/>
+          <line x1="12" y1="1" x2="26" y2="1" stroke="#1E2433" stroke-width="2"/>
+        </g>
+        <g class="isl" transform="translate(500,140)">
+          <ellipse cx="0" cy="16" rx="50" ry="17" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"/>
+          <path d="M-22 16 L-22 -18 L18 -18 L18 16" fill="#A9713F" stroke="#1E2433" stroke-width="4"/>
+          <path d="M-30 -18 L26 -18 L20 -32 L-24 -32 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="4"/>
+          <rect x="-12" y="-8" width="18" height="24" rx="2" fill="#FBF2DF" stroke="#1E2433" stroke-width="3"/>
+          <line x1="34" y1="14" x2="34" y2="-34" stroke="#1E2433" stroke-width="4" stroke-linecap="round"/>
+          <path d="M34 -34 L58 -28 L34 -20 Z" fill="#E8833A" stroke="#1E2433" stroke-width="3.5" stroke-linejoin="round"/>
+        </g>
+        <g class="isl" transform="translate(430,350)">
+          <ellipse cx="0" cy="16" rx="50" ry="17" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"/>
+          <rect x="-30" y="-22" width="44" height="34" rx="4" fill="#FBF2DF" stroke="#1E2433" stroke-width="4"/>
+          <line x1="-22" y1="-10" x2="6" y2="-10" stroke="#1E2433" stroke-width="2.5"/>
+          <line x1="-22" y1="-2" x2="2" y2="-2" stroke="#1E2433" stroke-width="2.5"/>
+          <line x1="-22" y1="6" x2="6" y2="6" stroke="#1E2433" stroke-width="2.5"/>
+          <path d="M20 4 l7 7 l14 -16" fill="none" stroke="#1E8E5A" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+        </g>
+        <g class="isl" transform="translate(430,470)">
+          <ellipse cx="0" cy="14" rx="48" ry="16" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"/>
+          <path d="M-26 10 L-8 -30 L4 -10 L16 -34 L34 10 Z" fill="#7BA05B" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"/>
+          <path d="M-14 -16 l8 -8 M22 -20 l-6 -8" stroke="#1E2433" stroke-width="3" stroke-linecap="round"/>
+        </g>
+        <g class="isl" transform="translate(930,330)">
+          <ellipse cx="0" cy="18" rx="54" ry="18" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"/>
+          <rect x="-26" y="-16" width="52" height="30" rx="5" fill="#A9713F" stroke="#1E2433" stroke-width="4"/>
+          <path d="M-26 -16 q0 -18 26 -18 q26 0 26 18 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="4"/>
+          <rect x="-5" y="-6" width="10" height="12" rx="2" fill="#FFD66B" stroke="#1E2433" stroke-width="3"/>
+        </g>
+
+        <g id="voyage-ship">
+          <g transform="translate(-30,-34) scale(0.28)">
+            <line x1="120" y1="22" x2="120" y2="128" stroke="#6B4426" stroke-width="9" stroke-linecap="round"/>
+            <path d="M120 30 L120 96 L66 90 Q88 62 66 36 Z" fill="#FBF2DF" stroke="#1E2433" stroke-width="7" stroke-linejoin="round"/>
+            <path d="M120 22 L162 32 L120 44 Z" fill="#E24B4A" stroke="#1E2433" stroke-width="6" stroke-linejoin="round"/>
+            <path d="M34 128 L206 128 L182 168 Q120 180 58 168 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="7" stroke-linejoin="round"/>
+          </g>
+        </g>
+      </svg>
     </div>
 
-    <div style="margin-top: 48px;">
-      <p style="text-align:center; color:var(--fg-soft); margin-bottom: 18px; font-size: 14px;">Under the hood it's an explicit state machine — every stage is observable, hookable, and resumable.</p>
-      <div class="flow-pipe">
-        <span class="pill">poll board</span>
-        <span class="arrow">→</span>
-        <span class="pill">triage</span>
-        <span class="arrow">→</span>
-        <span class="pill gate">confirm repo</span>
-        <span class="arrow">→</span>
-        <span class="pill gate">approve plan</span>
-        <span class="arrow">→</span>
-        <span class="pill">execute</span>
-        <span class="arrow">→</span>
-        <span class="pill">test</span>
-        <span class="arrow">→</span>
-        <span class="pill">verify</span>
-        <span class="arrow">→</span>
-        <span class="pill">update memory</span>
-        <span class="arrow">→</span>
-        <span class="pill done">open PR</span>
-      </div>
-    </div>
-  </section>
-
-  <!-- =========================================================
-       SAFETY / APPROVAL GATES
-       ========================================================= -->
-  <section class="section container reveal">
-    <div class="safety">
-      <div class="copy">
-        <span class="section-eyebrow">safe by default</span>
-        <h2>You stay in control. Always.</h2>
-        <p>Autonomy without surprise. Goon pauses on the decisions that matter — and gives you everything you need to say yes.</p>
-        <ul>
-          <li>
-            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
-            <span><strong>Edit-the-plan approval</strong><span class="det">Reject and rewrite — goon re-plans with your feedback, not just a "no."</span></span>
-          </li>
-          <li>
-            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
-            <span><strong>Shell-command blocklist</strong><span class="det">Regex validator catches <code>rm&nbsp;-rf</code>, <code>sudo</code>, history rewrites — hooks are checked too.</span></span>
-          </li>
-          <li>
-            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
-            <span><strong>Strict-JSON tool contract</strong><span class="det">No prompt-injection foot-guns. Every tool call is validated against a schema before it runs.</span></span>
-          </li>
-          <li>
-            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
-            <span><strong>Dry-run mode</strong><span class="det">Set the executor to dry-run; goon plans normally but no mutation runs. Read-only tools still execute.</span></span>
-          </li>
-          <li>
-            <span class="checkmark"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span>
-            <span><strong>Pause / resume anywhere</strong><span class="det">CLI, web, or Telegram. Daemon parks; in-flight work keeps its state.</span></span>
-          </li>
-        </ul>
-      </div>
-
-      <div class="visual">
-        <div class="gate">
-          <div class="lbl">confirm_repo · PROJ-482</div>
-          <p class="q">Which repo should I work in?</p>
-          <div class="opts">
-            <span class="opt primary">harisaginting/user-service</span>
-            <span class="opt">harisaginting/auth-lib</span>
-            <span class="opt">other…</span>
-          </div>
-        </div>
-        <div class="gate">
-          <div class="lbl">approve_plan · attempt 1</div>
-          <p class="q">3 steps — regenerate mocks, update import path, rerun tests. OK to proceed?</p>
-          <div class="opts">
-            <span class="opt primary">yes</span>
-            <span class="opt">edit plan</span>
-            <span class="opt danger">no, re-plan</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- =========================================================
-       THREE-LAYER MEMORY
-       ========================================================= -->
-  <section class="section container reveal">
-    <div class="section-head">
-      <span class="section-eyebrow">memory</span>
-      <h2 class="section-title">A brain in two layers.</h2>
-      <p class="section-lede">Goon isn't a stateless chatbot. It keeps two persistent stores of markdown the LLM reads and writes — so today's ticket starts smarter than yesterday's.</p>
+    <div class="voyage-progress" role="group" aria-label="Journey steps">
+      <button type="button" data-stop="0" aria-label="Step 1: watches your board"></button>
+      <button type="button" data-stop="1" aria-label="Step 2: you confirm the repo"></button>
+      <button type="button" data-stop="2" aria-label="Step 3: you approve the plan"></button>
+      <button type="button" data-stop="3" aria-label="Step 4: it does the work"></button>
+      <button type="button" data-stop="4" aria-label="Step 5: pull request and a ping"></button>
     </div>
 
-    <div class="layers">
-      <div class="layer knowledge">
-        <div class="head">
-          <h3>Knowledge</h3>
-          <span class="badge">soul · always loaded</span>
-        </div>
-        <p>What goon should always remember. SOUL.md holds character and project facts together; HISTORY.md is the running log of past runs; topic notes are looked up on demand. Grows as it works.</p>
-        <div class="file">./storage/memory/*.md</div>
+    <div class="vcards">
+      <div class="vcard" data-at="0">
+        <span class="step"><span class="dotnum">1</span> watch</span>
+        <h3>Watches your board</h3>
+        <p>The daemon polls Jira, GitHub Issues, or tasks you create locally — picks one ticket per cycle and starts the loop. No webhooks to host, no CI to wire up.</p>
       </div>
-      <div class="layer skills">
-        <div class="head">
-          <h3>Skills</h3>
-          <span class="badge">specialties · on-demand</span>
-        </div>
-        <p>Specialized playbooks: "how we deploy", "how migrations work here". Loaded only when relevant — keeps tokens lean.</p>
-        <div class="file">./storage/skills/*.md</div>
+      <div class="vcard" data-at="1">
+        <span class="step"><span class="dotnum">2</span> confirm</span>
+        <h3>You confirm the repo</h3>
+        <p>Before anything runs, goon asks which repository this ticket belongs to. Nothing executes in a checkout you didn't approve.</p>
+        <span class="gate-tag">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          approval gate — your call
+        </span>
       </div>
-    </div>
-  </section>
-
-  <!-- =========================================================
-       PLUGGABLE MATRIX
-       ========================================================= -->
-  <section class="section container reveal">
-    <div class="section-head">
-      <span class="section-eyebrow">pluggable everything</span>
-      <h2 class="section-title">Use what you already use.</h2>
-      <p class="section-lede">Swap any layer with one env var. No code change, no adapter to write, no vendor lock. The same binary works on your laptop and your CI.</p>
-    </div>
-
-    <div class="matrix">
-      <div class="matrix-col">
-        <div class="col-label">LLM provider</div>
-        <ul>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> OpenAI</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Anthropic</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Gemini</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Ollama (local)</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> mock (for CI)</li>
-        </ul>
+      <div class="vcard" data-at="2">
+        <span class="step"><span class="dotnum">3</span> approve</span>
+        <h3>You approve the plan</h3>
+        <p>It triages the ticket into concrete steps and shows you the plan first. Edit steps, reject for a re-plan, or approve — one click from the dashboard or Telegram.</p>
+        <span class="gate-tag">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+          approval gate — your call
+        </span>
       </div>
-      <div class="matrix-col">
-        <div class="col-label">Ticket board</div>
-        <ul>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Jira (Cloud + DC)</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitHub Issues</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Confluence read</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Mock (tests)</li>
-          <li style="opacity:0.5;"><span class="check" style="color:var(--fg-mute)"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/></svg></span> Linear · soon</li>
-        </ul>
+      <div class="vcard" data-at="3">
+        <span class="step"><span class="dotnum">4</span> execute</span>
+        <h3>It does the work</h3>
+        <p>The agent codes inside your local checkout, runs your tests, and verifies the result — every shell command screened by a safety validator first.</p>
       </div>
-      <div class="matrix-col">
-        <div class="col-label">Git host</div>
-        <ul>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitHub</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> GitLab</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Bitbucket</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> PR review on each</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Auto-learned mapping</li>
-        </ul>
-      </div>
-      <div class="matrix-col">
-        <div class="col-label">Notification</div>
-        <ul>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Telegram bot</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Web UI dashboard</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> SSE live events</li>
-          <li><span class="check"><svg viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M16.7 5.3a1 1 0 010 1.4l-8 8a1 1 0 01-1.4 0l-4-4a1 1 0 011.4-1.4L8 12.6l7.3-7.3a1 1 0 011.4 0z" clip-rule="evenodd"/></svg></span> Custom hooks</li>
-          <li style="opacity:0.5;"><span class="check" style="color:var(--fg-mute)"><svg viewBox="0 0 20 20" fill="currentColor"><circle cx="10" cy="10" r="4"/></svg></span> Slack · soon</li>
-        </ul>
+      <div class="vcard" data-at="4">
+        <span class="step"><span class="dotnum">5</span> ship</span>
+        <h3>A pull request and a ping</h3>
+        <p>goon pushes a branch, opens the PR on GitHub, GitLab, or Bitbucket, and notifies you on Telegram. Review the diff right in the dashboard before you merge.</p>
       </div>
     </div>
-  </section>
+  </div>
+</section>
+</div>
 
-  <!-- =========================================================
-       THREE SURFACES
-       ========================================================= -->
-  <section class="section container reveal">
-    <div class="section-head">
-      <span class="section-eyebrow">three surfaces</span>
-      <h2 class="section-title">Wherever you live, goon lives there too.</h2>
-      <p class="section-lede">CLI for quick hits at your desk. Web for review and visibility. Telegram for when you're on the train. Same memory backend, same state, no sync layer to worry about.</p>
+<!-- ================= features ================= -->
+<section class="features" id="features" aria-label="Features">
+  <div class="container">
+    <div class="section-head reveal">
+      <span class="eyebrow">Built to ship</span>
+      <h2>Everything aboard a single binary.</h2>
+      <p>No runtime, no containers, no external dependencies — drop one Go binary next to your repos and it gets to work.</p>
     </div>
-
-    <div class="surfaces">
-      <div class="surface">
-        <div class="mock">
-          <div class="cli-line"><span class="pf">$</span> goon "summarize the .go files in cmd/"</div>
-          <div class="cli-line">→ read 7 files</div>
-          <div class="cli-line">→ cmd/root.go: subcommand dispatch</div>
-          <div class="cli-line">→ cmd/start.go: daemon launcher</div>
-          <div class="cli-line">→ cmd/memory.go: memory subcommands</div>
-          <div class="cli-line"><span class="ok">✓ done</span></div>
-        </div>
-        <div class="body">
-          <h3>CLI</h3>
-          <p>One-shot agent or background daemon. Pipeline configurable in <code>workflow.json</code>. Perfect for scripts and CI.</p>
-          <div class="tag-row">
-            <span class="tag">goon "&lt;task&gt;"</span>
-            <span class="tag">goon start</span>
-            <span class="tag">workflow.json</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="surface">
-        <div class="mock">
-          <div class="mock-web">
-            <div class="sb"><div></div><div></div><div></div><div></div></div>
-            <div class="panes">
-              <div>Live workflow · PROJ-482</div>
-              <div>2 pending questions · 5 tickets</div>
-              <div style="background:color-mix(in srgb, var(--accent) 14%, transparent); color: var(--accent);">approve plan?</div>
-            </div>
-          </div>
-        </div>
-        <div class="body">
-          <h3>Web UI</h3>
-          <p>htmx + Tailwind dashboard. Browse files, edit plans inline, chat with the agent, manage memory layers. Live via SSE.</p>
-          <div class="tag-row">
-            <span class="tag">/app</span>
-            <span class="tag">⌘K palette</span>
-            <span class="tag">file editor</span>
-          </div>
-        </div>
-      </div>
-
-      <div class="surface">
-        <div class="mock mock-tg">
-          <div class="bubble">👑 goon: PROJ-482 awaiting approve_plan</div>
-          <div class="bubble me">/answer yes</div>
-          <div class="bubble">✓ resumed · executing now</div>
-          <div class="bubble me">/prs</div>
-        </div>
-        <div class="body">
-          <h3>Telegram</h3>
-          <p>Full CLI parity in chat. <code>/tickets</code>, <code>/mine</code>, <code>/prs</code>, <code>/review</code>. Plain text talks to the model with tool use.</p>
-          <div class="tag-row">
-            <span class="tag">/auth</span>
-            <span class="tag">/answer</span>
-            <span class="tag">/review</span>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- =========================================================
-       FEATURES GRID
-       ========================================================= -->
-  <section class="section container reveal" id="features">
-    <div class="section-head">
-      <span class="section-eyebrow">why goon</span>
-      <h2 class="section-title">Built to actually ship code.</h2>
-      <p class="section-lede">Not a chatbot, not a copilot — an engineer that takes a ticket and brings back a PR. Six things make it different.</p>
-    </div>
-
     <div class="feature-grid">
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><polyline points="21 3 21 9 15 9"/></svg></div>
-        <h3>Resumable state machine</h3>
-        <p>The workflow is an explicit state machine. Paused gates persist to disk; restart the daemon and it picks up exactly where it left off.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><path d="M3.27 6.96 12 12.01l8.73-5.05M12 22.08V12"/></svg></span>
+        <h3>Zero dependencies</h3>
+        <p>Pure Go standard library. One binary, one <code>workflow.json</code>, and a folder of repos — that's the whole install.</p>
       </div>
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></div>
-        <h3>Codebase indexing</h3>
-        <p>Symbol index + content search across 9 languages. Built lazily on first <code>search_code</code> call, cached per-process. Uses ripgrep when available.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></span>
+        <h3>Approval gates</h3>
+        <p>Repo choice and plan approval pause the pipeline until you answer. Auto-approve flags exist when you're ready to trust it.</p>
       </div>
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M2 12h20M12 2a14 14 0 0 1 0 20M12 2a14 14 0 0 0 0 20"/></svg></div>
-        <h3>Browser tools</h3>
-        <p><code>fetch_url</code> + <code>web_search</code> let the agent read docs and error messages autonomously instead of guessing from training data.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.2 2.2M16.9 16.9l2.2 2.2M19.1 4.9l-2.2 2.2M7.1 16.9l-2.2 2.2"/></svg></span>
+        <h3>Any LLM provider</h3>
+        <p>OpenAI, Anthropic, Gemini, or local Ollama — switch with one env var, or route each role (plan, code, review, chat) to a different model.</p>
       </div>
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
-        <h3>Single binary, zero deps</h3>
-        <p>Pure Go stdlib. No Python, no Node, no Docker, no Tree-sitter. Drop the binary on any machine — Linux, macOS, Windows — and run.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 18v2M16 18v2"/></svg></span>
+        <h3>Live dashboard</h3>
+        <p>Watch workflows advance stage by stage, answer gates, review diffs, edit pipelines, and track token usage — light and dark.</p>
       </div>
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg></div>
-        <h3>Auto-recovery</h3>
-        <p>Rejected plans don't fail — they re-plan with your feedback. Capped at 3 attempts so it never spins forever.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-8.5 8.5 8.5 8.5 0 0 1-3.5-.76L3 21l1.76-6A8.5 8.5 0 1 1 21 11.5z"/></svg></span>
+        <h3>Telegram crew channel</h3>
+        <p>Approve plans, ask questions, run commands, and get PR notifications from your phone — the whole loop works away from your desk.</p>
       </div>
-      <div class="feature">
-        <div class="icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div>
-        <h3>Secrets stay local</h3>
-        <p>Subprocess env is scrubbed of every <code>*_TOKEN / *_API_KEY / *_SECRET</code> before passthrough. Telegram chats can't accidentally leak credentials.</p>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 0 1 7 7c0 2.5-1.5 4.5-3 6l-1 5h-6l-1-5c-1.5-1.5-3-3.5-3-6a7 7 0 0 1 7-7z"/><path d="M9 21h6"/></svg></span>
+        <h3>Learns your project</h3>
+        <p>Every run distills durable notes — repo maps, conventions, past decisions — so the next ticket starts smarter than the last.</p>
+      </div>
+      <div class="fcard reveal">
+        <span class="icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></span>
+        <h3>Code in the browser</h3>
+        <p>Pick a directory and run an agentic coding session right in the dashboard — read, edit, run commands, stream each step live. Claude Code in a tab.</p>
       </div>
     </div>
-  </section>
+  </div>
+</section>
 
-  <!-- =========================================================
-       BOTTOM CTA
-       ========================================================= -->
-  <section class="bottom-cta reveal">
-    <h2>Let <span class="grad-text">goon</span> handle the ticket.</h2>
-    <p>Open the dashboard, point it at your board, and watch it pick up its first one. Go ON — stop reading, start shipping.</p>
-    <div class="cta-row">
-      <a class="btn primary" href="/app">
-        Go to app
-        <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 10a1 1 0 011-1h11.6l-3.8-3.8a1 1 0 111.4-1.4l5.5 5.5a1 1 0 010 1.4l-5.5 5.5a1 1 0 11-1.4-1.4l3.8-3.8H4a1 1 0 01-1-1z"/></svg>
-      </a>
-      <a class="btn secondary" href="/docs">
-        <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h9l3 3v9a1 1 0 01-1 1H4a1 1 0 01-1-1V5a1 1 0 011-1z"/><path d="M13 4v3h3"/></svg>
-        Documentation
-      </a>
-    </div>
-  </section>
+<!-- ================= install ================= -->
+<section class="install" id="install" aria-label="Install">
+  <div class="stars" aria-hidden="true">
+    <span style="top:12%;left:8%"></span><span style="top:22%;left:18%"></span><span style="top:9%;left:33%"></span>
+    <span style="top:18%;left:55%"></span><span style="top:8%;left:71%"></span><span style="top:24%;left:86%"></span>
+    <span style="top:38%;left:12%"></span><span style="top:34%;left:92%"></span><span style="top:42%;left:44%"></span>
+  </div>
+  <div class="chest-wrap reveal" id="chest">
+    <svg viewBox="0 0 140 110" aria-hidden="true">
+      <g id="chest-glow">
+        <circle cx="70" cy="48" r="34" fill="#FFD66B" opacity="0.25"/>
+        <g stroke="#FFD66B" stroke-width="3" stroke-linecap="round">
+          <line x1="70" y1="6" x2="70" y2="18"/><line x1="38" y1="16" x2="44" y2="26"/><line x1="102" y1="16" x2="96" y2="26"/>
+        </g>
+        <circle cx="56" cy="52" r="5" fill="#FFD66B" stroke="#1E2433" stroke-width="2"/>
+        <circle cx="70" cy="48" r="5" fill="#FFE9A8" stroke="#1E2433" stroke-width="2"/>
+        <circle cx="84" cy="52" r="5" fill="#FFD66B" stroke="#1E2433" stroke-width="2"/>
+      </g>
+      <g id="chest-lid">
+        <path d="M18 64 L18 52 q0 -22 52 -22 q52 0 52 22 L122 64 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="4.5" stroke-linejoin="round"/>
+        <line x1="42" y1="34" x2="42" y2="62" stroke="#1E2433" stroke-width="3"/>
+        <line x1="98" y1="34" x2="98" y2="62" stroke="#1E2433" stroke-width="3"/>
+      </g>
+      <path d="M18 64 L122 64 L118 100 Q70 108 22 100 Z" fill="#A9713F" stroke="#1E2433" stroke-width="4.5" stroke-linejoin="round"/>
+      <rect x="62" y="62" width="16" height="18" rx="3" fill="#FFD66B" stroke="#1E2433" stroke-width="3.5"/>
+      <circle cx="70" cy="70" r="2.6" fill="#1E2433"/>
+    </svg>
+  </div>
+  <h2 class="reveal">Set sail in one line.</h2>
+  <p class="lede reveal">Install the binary, point it at your board and your LLM key, and the first ticket gets picked up on the next poll.</p>
+  <div class="cmd reveal">
+    <code id="install-cmd">go install github.com/harisaginting/goon@latest</code>
+    <button type="button" id="copy-btn" aria-label="Copy install command">Copy</button>
+  </div>
+  <div class="ctas reveal">
+    <a class="btn primary" href="/app">Open dashboard</a>
+    <a class="btn secondary" href="/docs">Read the docs</a>
+  </div>
+</section>
 
 </main>
 
 <footer>
-  <div class="brand-foot">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
-      <path d="M3 19 L4 8 L7 13 L9 5 L11 12 L12 4 L13 12 L15 5 L17 13 L20 8 L21 19 Z"/>
-    </svg>
-    <span>goon · single binary, zero dependencies</span>
-  </div>
-  <div class="links">
-    <a href="/app">Dashboard</a>
-    <a href="/docs">Docs</a>
-    <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
-  </div>
+  <a href="/app">Dashboard</a>
+  <a href="/docs">Docs</a>
+  <a href="https://github.com/harisaginting/goon" target="_blank" rel="noopener">GitHub</a>
+  <span>goon — an autonomous engineer in a single Go binary</span>
 </footer>
 
 <script>
-(function() {
-  // ---- terminal tabs ----
-  const tabs = document.querySelectorAll('.terminal .tab');
-  tabs.forEach((t) => {
-    t.addEventListener('click', () => {
-      const target = t.getAttribute('data-tab');
-      document.querySelectorAll('.terminal .tab').forEach((x) => x.classList.toggle('active', x === t));
-      document.querySelectorAll('.terminal .panel').forEach((p) => p.classList.toggle('active', p.getAttribute('data-panel') === target));
+(function () {
+  'use strict';
+  var doc = document.documentElement;
+  document.body.classList.remove('no-js');
+  document.body.classList.add('js');
+
+  var reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  /* ---------- reveal-on-enter (features, install) ---------- */
+  var revealEls = Array.prototype.slice.call(document.querySelectorAll('.reveal'));
+  if ('IntersectionObserver' in window && !reduce) {
+    var ro = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e, idx) {
+        if (e.isIntersecting) {
+          var el = e.target;
+          var siblings = el.parentElement ? Array.prototype.indexOf.call(el.parentElement.children, el) : 0;
+          el.style.transitionDelay = Math.min(siblings * 40, 200) + 'ms';
+          el.classList.add('in');
+          ro.unobserve(el);
+        }
+      });
+    }, { threshold: 0.15 });
+    revealEls.forEach(function (el) { ro.observe(el); });
+  } else {
+    revealEls.forEach(function (el) { el.classList.add('in'); });
+  }
+
+  /* ---------- treasure chest opens once ---------- */
+  var chest = document.getElementById('chest');
+  if (chest) {
+    if ('IntersectionObserver' in window && !reduce) {
+      var co = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          if (e.isIntersecting) { chest.classList.add('chest-open'); co.disconnect(); }
+        });
+      }, { threshold: 0.5 });
+      co.observe(chest);
+    } else {
+      chest.classList.add('chest-open');
+    }
+  }
+
+  /* ---------- copy install command ---------- */
+  var copyBtn = document.getElementById('copy-btn');
+  var cmdEl = document.getElementById('install-cmd');
+  if (copyBtn && cmdEl) {
+    copyBtn.addEventListener('click', function () {
+      var text = cmdEl.textContent.trim();
+      var done = function () {
+        copyBtn.textContent = 'Copied';
+        copyBtn.classList.add('copied');
+        setTimeout(function () {
+          copyBtn.textContent = 'Copy';
+          copyBtn.classList.remove('copied');
+        }, 1800);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, done);
+      } else {
+        var ta = document.createElement('textarea');
+        ta.value = text; document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); } catch (err) {}
+        document.body.removeChild(ta);
+        done();
+      }
+    });
+  }
+
+  if (reduce) {
+    /* static journey: all cards visible (CSS handles layout); ship parked at the end */
+    var routeR = document.getElementById('route-trail');
+    var shipR = document.getElementById('voyage-ship');
+    if (routeR && shipR && routeR.getTotalLength) {
+      var L = routeR.getTotalLength();
+      var p = routeR.getPointAtLength(L);
+      shipR.setAttribute('transform', 'translate(' + p.x + ',' + p.y + ')');
+    }
+    Array.prototype.forEach.call(document.querySelectorAll('.vcard'), function (c) { c.classList.add('landed'); });
+    return;
+  }
+
+  /* ---------- parallax hero + scroll-driven journey ---------- */
+  var hero = document.querySelector('.hero');
+  var layers = Array.prototype.slice.call(document.querySelectorAll('.hero [data-speed]'));
+  var journey = document.getElementById('journey');
+  var routeTrail = document.getElementById('route-trail');
+  var ship = document.getElementById('voyage-ship');
+  var cards = Array.prototype.slice.call(document.querySelectorAll('.vcard'));
+  var dots = Array.prototype.slice.call(document.querySelectorAll('.voyage-progress button'));
+  var routeLen = routeTrail && routeTrail.getTotalLength ? routeTrail.getTotalLength() : 0;
+  var stops = [0.04, 0.27, 0.5, 0.73, 0.97];
+
+  if (routeTrail && routeLen) {
+    routeTrail.style.strokeDasharray = String(routeLen);
+    routeTrail.style.strokeDashoffset = String(routeLen);
+  }
+
+  var ticking = false;
+
+  function clamp01(v) { return v < 0 ? 0 : (v > 1 ? 1 : v); }
+
+  function setActiveStop(i) {
+    cards.forEach(function (c, k) { c.classList.toggle('landed', k === i); });
+    dots.forEach(function (d, k) {
+      if (k === i) { d.setAttribute('aria-current', 'step'); }
+      else { d.removeAttribute('aria-current'); }
+    });
+  }
+
+  function update() {
+    ticking = false;
+    var y = window.pageYOffset || doc.scrollTop;
+    var vh = window.innerHeight;
+
+    /* hero parallax — only while the hero is on screen */
+    if (hero && y < hero.offsetHeight + 80) {
+      layers.forEach(function (l) {
+        var sp = parseFloat(l.getAttribute('data-speed')) || 0;
+        l.style.transform = 'translate3d(0,' + (y * sp).toFixed(1) + 'px,0)';
+      });
+    }
+
+    /* journey progress 0..1 across the tall section */
+    if (journey && routeTrail && routeLen && ship) {
+      var rect = journey.getBoundingClientRect();
+      var total = journey.offsetHeight - vh;
+      if (total > 0) {
+        var p = clamp01((-rect.top) / total);
+        var d = p * routeLen;
+        var pt = routeTrail.getPointAtLength(d);
+        var ahead = routeTrail.getPointAtLength(Math.min(d + 12, routeLen));
+        var tilt = Math.atan2(ahead.y - pt.y, ahead.x - pt.x) * 57.29578;
+        if (tilt > 22) { tilt = 22; } if (tilt < -22) { tilt = -22; }
+        ship.setAttribute('transform', 'translate(' + pt.x.toFixed(1) + ',' + pt.y.toFixed(1) + ') rotate(' + tilt.toFixed(1) + ')');
+        routeTrail.style.strokeDashoffset = String(routeLen * (1 - p));
+        var active = 0;
+        for (var i = 0; i < stops.length; i++) {
+          if (p >= stops[i] - 0.06) { active = i; }
+        }
+        setActiveStop(active);
+      }
+    }
+  }
+
+  function onScroll() {
+    if (!ticking) { ticking = true; window.requestAnimationFrame(update); }
+  }
+
+  /* progress dots jump to that point of the voyage */
+  dots.forEach(function (d) {
+    d.addEventListener('click', function () {
+      var i = parseInt(d.getAttribute('data-stop'), 10) || 0;
+      var vh = window.innerHeight;
+      var top = journey.getBoundingClientRect().top + (window.pageYOffset || doc.scrollTop);
+      var target = top + stops[i] * (journey.offsetHeight - vh);
+      window.scrollTo({ top: target, behavior: 'smooth' });
     });
   });
 
-  // ---- scroll reveal ----
-  if (!('IntersectionObserver' in window)) {
-    document.querySelectorAll('.reveal').forEach((el) => el.classList.add('in'));
-    return;
-  }
-  const io = new IntersectionObserver((entries) => {
-    entries.forEach((e) => {
-      if (e.isIntersecting) {
-        e.target.classList.add('in');
-        io.unobserve(e.target);
-      }
-    });
-  }, { rootMargin: '0px 0px -10% 0px', threshold: 0.08 });
-  document.querySelectorAll('.reveal').forEach((el) => io.observe(el));
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  update();
 })();
 </script>
-
 </body>
 </html>

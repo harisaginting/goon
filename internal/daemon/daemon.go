@@ -79,6 +79,10 @@ type Daemon struct {
 	// waiting for the next ticker. Buffer=1 with select-default in
 	// Wake() means we coalesce bursts without blocking the sender.
 	wakeCh chan struct{}
+	// runNowCh carries an automation name to run immediately (the web
+	// "run now" button), handled in Run()'s select like wakeCh. Buffered
+	// so the sender never blocks.
+	runNowCh chan string
 }
 
 // New wires a Daemon. LLM / Board / Host may be nil — Reconfigure can fill
@@ -92,7 +96,8 @@ func New(opts Options) *Daemon {
 		llm:    opts.LLM,
 		board:  opts.Board,
 		host:   opts.Host,
-		wakeCh: make(chan struct{}, 1),
+		wakeCh:   make(chan struct{}, 1),
+		runNowCh: make(chan string, 8),
 	}
 }
 
@@ -109,6 +114,75 @@ func (d *Daemon) Wake() {
 	case d.wakeCh <- struct{}{}:
 	default:
 		// already a pending wake — fine, the next tick handles it
+	}
+}
+
+// RunAutomationNow asks the loop to run one automation by name immediately,
+// regardless of its schedule. Non-blocking; drops the request if the buffer is
+// full (the user can click again). Safe to call from any goroutine.
+func (d *Daemon) RunAutomationNow(name string) {
+	if d == nil || d.runNowCh == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	select {
+	case d.runNowCh <- name:
+	default:
+		// buffer full — a batch of run-now requests is already queued
+	}
+}
+
+// automationEngine builds an Engine for scheduled / manual automation runs, or
+// returns ok=false when no LLM provider is configured (automations run an agent
+// and need one). Shared by scheduleTick and runAutomationByName.
+func (d *Daemon) automationEngine() (*workflow.Engine, bool) {
+	prov, board, host := d.Snapshot()
+	if prov == nil {
+		return nil, false
+	}
+	return &workflow.Engine{
+		LLM: prov, Tools: d.opts.Tools, Executor: d.opts.Executor,
+		Memory: d.opts.Memory, Board: board, Host: host,
+		Stdout: d.opts.Stdout, Stderr: d.opts.Stderr, Debug: d.opts.Debug,
+		VerifyRunsOverride: d.opts.VerifyRunsOverride,
+	}, true
+}
+
+// runAutomationByName runs a single automation now (web "run now"). Unlike the
+// scheduler it ignores Due() and the enabled flag — an explicit click means
+// "run it" — but it still respects pause and runs under the same lock as
+// pollAndRun/scheduleTick so engine runs never overlap.
+func (d *Daemon) runAutomationByName(ctx context.Context, name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.opts.Memory == nil {
+		return
+	}
+	if st := d.opts.Memory.GetStatus(); st.Paused {
+		fmt.Fprintf(d.opts.Stderr, "[schedule] run-now %q skipped — daemon paused\n", name)
+		return
+	}
+	var cfg workflow.WorkflowConfig
+	found := false
+	for _, a := range workflow.LoadAutomations() {
+		if a.Config.Name == name || workflow.AutomationSlug(a.Config.Name) == workflow.AutomationSlug(name) {
+			cfg = a.Config
+			found = true
+			break
+		}
+	}
+	if !found {
+		fmt.Fprintf(d.opts.Stderr, "[schedule] run-now: automation %q not found\n", name)
+		return
+	}
+	eng, ok := d.automationEngine()
+	if !ok {
+		fmt.Fprintf(d.opts.Stderr, "[schedule] run-now %q skipped — no LLM provider\n", name)
+		return
+	}
+	d.opts.Memory.MarkScheduledRun(cfg.Name, time.Now())
+	fmt.Fprintf(d.opts.Stdout, "[schedule] running automation %q now (manual)\n", cfg.Name)
+	if _, err := eng.RunJob(ctx, cfg); err != nil {
+		fmt.Fprintf(d.opts.Stderr, "[schedule] automation %q failed: %v\n", cfg.Name, err)
 	}
 }
 
@@ -380,6 +454,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 	t := time.NewTicker(d.opts.PollInterval)
 	defer t.Stop()
+	// Independent minute ticker for scheduled automations (cron / interval),
+	// so schedule granularity doesn't depend on PollInterval.
+	sched := time.NewTicker(time.Minute)
+	defer sched.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -387,11 +465,57 @@ func (d *Daemon) Run(ctx context.Context) error {
 		case <-t.C:
 			// Scheduled tick respects the circuit-breaker backoff window.
 			d.pollAndRun(ctx, false)
+		case <-sched.C:
+			d.scheduleTick(ctx)
 		case <-d.wakeCh:
 			// User just answered a gate question, saved config, or
 			// resumed — run immediately, bypassing the backoff window,
 			// because an explicit nudge means "try now".
 			d.pollAndRun(ctx, true)
+		case name := <-d.runNowCh:
+			// Web "run now" on an automation — run that one immediately,
+			// ignoring its schedule.
+			d.runAutomationByName(ctx, name)
+		}
+	}
+}
+
+// scheduleTick fires every due automation (scheduled workflows under
+// storage/workflows/) once. It runs them sequentially under the same lock as
+// pollAndRun so engine runs never overlap. Automations need an LLM but no
+// board; a paused daemon skips them.
+func (d *Daemon) scheduleTick(ctx context.Context) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.opts.Memory == nil {
+		return
+	}
+	if st := d.opts.Memory.GetStatus(); st.Paused {
+		return
+	}
+	autos := workflow.LoadAutomations()
+	if len(autos) == 0 {
+		return
+	}
+	eng, ok := d.automationEngine()
+	if !ok {
+		return // automations run an agent — need an LLM provider
+	}
+	now := time.Now()
+	for _, a := range autos {
+		cfg := a.Config
+		if !cfg.IsScheduled() || !cfg.IsEnabled() {
+			continue
+		}
+		// Fire every automation whose minute matches (cron only matches its own
+		// minute, so we can't defer to a later tick), sequentially.
+		if !cfg.Trigger.Due(d.opts.Memory.LastScheduledRun(cfg.Name), now) {
+			continue
+		}
+		d.opts.Memory.MarkScheduledRun(cfg.Name, now)
+		fmt.Fprintf(d.opts.Stdout, "[schedule] firing automation %q (%s)\n", cfg.Name, cfg.Trigger.ScheduleHint())
+		if _, err := eng.RunJob(ctx, cfg); err != nil {
+			fmt.Fprintf(d.opts.Stderr, "[schedule] automation %q failed: %v\n", cfg.Name, err)
 		}
 	}
 }
@@ -544,6 +668,33 @@ func (d *Daemon) pollAndRun(ctx context.Context, forced bool) {
 			// and the mutex short-held, but a bulk-approve still flows
 			// through quickly.
 			if _, more := d.opts.Memory.ResumableWorkflow(); more {
+				d.Wake()
+			}
+			return
+		}
+	}
+
+	// Manual pick — a ticket the user explicitly queued from the Tickets
+	// tab (with repos pre-assigned). Runs ahead of the recency-based
+	// auto-pick so "Pick" feels immediate. One per tick; wake again if more.
+	if tid, _, ok := d.opts.Memory.NextPick(); ok {
+		d.opts.Memory.ClearPick(tid)
+		if t, err := d.resolveTicket(ctx, board, tid); err != nil {
+			fmt.Fprintf(d.opts.Stderr, "[poll] cannot run picked ticket %s: %v\n", tid, err)
+		} else if !d.opts.Memory.HasOpenWorkflowFor(t.ID) && !d.opts.Memory.HasCompletedWorkflowFor(t.ID) {
+			fmt.Fprintf(d.opts.Stdout, "[poll] manual pick %s — %s\n", t.Key, t.Title)
+			st = d.opts.Memory.GetStatus()
+			st.LastTicket = t.ID
+			d.opts.Memory.SetStatus(st)
+			wf, runErr := eng.Run(usage.WithLabel(ctx, "workflow "+t.Key), t)
+			st = d.opts.Memory.GetStatus()
+			st.ActiveWorkflow = wf.ID
+			d.opts.Memory.SetStatus(st)
+			if runErr != nil {
+				fmt.Fprintf(d.opts.Stderr, "[poll] workflow %s failed: %v\n", wf.ID, runErr)
+			}
+			d.afterRun(runErr)
+			if _, _, more := d.opts.Memory.NextPick(); more {
 				d.Wake()
 			}
 			return

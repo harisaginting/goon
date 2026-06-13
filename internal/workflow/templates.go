@@ -69,14 +69,51 @@ func StarterTemplates() ([]StarterTemplate, error) {
 // canvas. Returns nil if the embedded seed is unavailable (should never
 // happen — it's compiled in).
 func BuiltinStageSeed() []StageConfig {
-	ts, err := StarterTemplates()
-	if err != nil || len(ts) == 0 {
-		return nil
+	// BuiltinRoleGraph builds a fresh slice on every call, so the editor can
+	// freely mutate the returned seed without corrupting anything cached.
+	return BuiltinRoleGraph()
+}
+
+// AutomationStarters returns ready-to-save scheduled-automation scaffolds for
+// the "new automation" picker. Each is a small executor → notify graph on a
+// sensible default schedule; the user edits the task, message, and schedule.
+func AutomationStarters() []StarterTemplate {
+	enabled := true
+	mk := func(key, label, desc string, trig Trigger, stages []StageConfig) StarterTemplate {
+		return StarterTemplate{Key: key, Label: label, Desc: desc, Config: WorkflowConfig{
+			Version: 2, Name: label, Description: desc,
+			Trigger: trig, Enabled: &enabled, Stages: stages,
+		}}
 	}
-	// First template is "default" by construction (see starterMeta order).
-	stages := ts[0].Config.Stages
-	// Defensive copy so callers can't mutate the cached parse.
-	return append([]StageConfig(nil), stages...)
+	return []StarterTemplate{
+		mk("health-check", "Service health check",
+			"Run health checks on a schedule and alert on failure.",
+			Trigger{Type: "schedule", Every: "15m"},
+			[]StageConfig{
+				{Name: "check", Type: RoleExecutor, OnNext: StringList{"report"},
+					Task: "Run the project's health checks: curl/HTTP the key endpoints (or run the health script) and inspect the results. Summarise what is UP and what is DOWN in a few lines; if everything is healthy, say so briefly."},
+				{Name: "report", Type: RoleNotify,
+					Message: "🩺 Health check\n{{.Stages.check}}"},
+			}),
+		mk("standup-digest", "Daily standup digest",
+			"Summarise recent activity into a short standup each weekday morning.",
+			Trigger{Type: "schedule", Cron: "0 9 * * 1-5"},
+			[]StageConfig{
+				{Name: "gather", Type: RoleExecutor, OnNext: StringList{"post"},
+					Task: "Produce a short daily standup: what shipped recently and what is in progress. Use run_command to read recent git log across the repos and check goon's HISTORY.md / memory notes. Reply with 5-8 plain, skimmable bullet lines."},
+				{Name: "post", Type: RoleNotify,
+					Message: "☀️ Standup\n{{.Stages.gather}}"},
+			}),
+		mk("email-digest", "Email digest",
+			"Read recent email on a schedule, summarise it, and notify. Needs a mail tool/CLI available to goon's agent.",
+			Trigger{Type: "schedule", Cron: "0 8 * * *"},
+			[]StageConfig{
+				{Name: "read", Type: RoleExecutor, OnNext: StringList{"digest"},
+					Task: "Fetch recent/unread email (via the configured mail tool or CLI) and summarise senders, subjects, and anything that needs a reply. Keep it tight. If no mail tool is available, say so plainly."},
+				{Name: "digest", Type: RoleNotify,
+					Message: "📬 Email digest\n{{.Stages.read}}"},
+			}),
+	}
 }
 
 // Validate checks a workflow config for problems that would make the daemon

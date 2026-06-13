@@ -24,6 +24,13 @@ type configKey struct {
 // knownConfigKeys is the canonical list shown by `goon config show`.
 var knownConfigKeys = []configKey{
 	{Name: "GOON_LLM_PROVIDER", Default: "openai", Group: "agent"},
+	// Per-role model routing. Each is "provider:model" | "provider" |
+	// "model"; empty inherits GOON_LLM_PROVIDER. Lets you run e.g. a strong
+	// model for code and a cheap one for chat when several are configured.
+	{Name: "GOON_LLM_CHAT", Group: "agent"},
+	{Name: "GOON_LLM_PLAN", Group: "agent"},
+	{Name: "GOON_LLM_CODE", Group: "agent"},
+	{Name: "GOON_LLM_REVIEW", Group: "agent"},
 	{Name: "GOON_MAX_STEPS", Default: "5", Group: "agent"},
 	{Name: "GOON_STORAGE_DIR", Default: "./storage", Group: "agent"},
 	{Name: "GOON_MEMORY_PATH", Default: "$GOON_STORAGE_DIR/memory.json", Group: "agent"},

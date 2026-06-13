@@ -220,12 +220,15 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 		Validator: safety.Default(),
 	}
 
-	// --- Declarative stages mode ---------------------------------------------
-	// When the user provides cfg.Stages, the built-in pipeline is replaced
-	// wholesale with their declared sequence. Approval gates do NOT fire here
-	// — declarative pipelines are an explicit opt-in to a fully-custom flow.
+	// --- Role-graph mode (default) -------------------------------------------
+	// When cfg.Stages is present, run the role-graph executor (graph.go). This
+	// is goon's DEFAULT — LoadConfig injects BuiltinRoleGraph() when a config
+	// omits stages, so production reaches this path. The role-graph reuses the
+	// Engine plumbing below (triage, repo resolution, PR, hooks) and pauses at
+	// a human reviewer via the same gate/resume mechanism. The linear pipeline
+	// further down only runs for an explicit stage-less Config (tests / legacy).
 	if len(cfg.Stages) > 0 {
-		return e.runStages(ctx, wf, t, cfg, hr, branch)
+		return e.runGraph(ctx, wf, t, cfg, hr, branch)
 	}
 
 	pctx := &phaseCtx{
@@ -309,6 +312,55 @@ func (e *Engine) Run(ctx context.Context, t boards.Ticket) (memory.Workflow, err
 		_ = e.Board.Transition(ctx, t.ID, boards.StatusInReview)
 	}
 	return wf, nil
+}
+
+// RunJob runs an automation (a scheduled or manual workflow) ONCE against a
+// synthetic job instead of a board ticket: no repo, no PR, reviewers auto-
+// approve so it runs fully unattended. The run is recorded as a Workflow so it
+// shows in the dashboard's run history. Returns the final record.
+func (e *Engine) RunJob(ctx context.Context, cfg WorkflowConfig) (memory.Workflow, error) {
+	name := strings.TrimSpace(cfg.Name)
+	if name == "" {
+		name = "automation"
+	}
+	if len(cfg.Stages) == 0 {
+		return memory.Workflow{}, fmt.Errorf("automation %q has no stages to run", name)
+	}
+	// Unattended: a scheduled job can't wait for a human, so reviewers
+	// auto-approve. (A user who wants a gate runs it from the board instead.)
+	cfg.AutoApprove = true
+
+	now := time.Now()
+	title := strings.TrimSpace(cfg.Description)
+	if title == "" {
+		title = name + " (scheduled)"
+	}
+	t := boards.Ticket{
+		ID:      fmt.Sprintf("auto/%s/%d", sanitizeBranchSegment(name), now.Unix()),
+		Source:  "schedule",
+		Key:     name,
+		Title:   title,
+		Project: "automation",
+	}
+	branch := branchName(cfg.BranchPrefix, name)
+	noRepo := false
+	wf := memory.Workflow{
+		ID:        "wf-" + sanitizeBranchSegment(name) + "-" + strconv.FormatInt(now.Unix(), 10),
+		TicketID:  t.ID,
+		TicketKey: t.Key,
+		Title:     t.Title,
+		StartedAt: now,
+		State:     memory.WFExecuting,
+		Approvals: map[string]string{},
+		NeedsRepo: &noRepo,
+	}
+	e.save(wf)
+	logx.Info("automation.run", "name", name, "wf", wf.ID, "schedule", cfg.Trigger.ScheduleHint())
+	if e.Stdout != nil {
+		fmt.Fprintf(e.Stdout, "[automation] running %q (%s)\n", name, cfg.Trigger.ScheduleHint())
+	}
+	hr := &HookRunner{Stdout: e.Stdout, Stderr: e.Stderr, Validator: safety.Default()}
+	return e.runGraph(ctx, wf, t, cfg, hr, branch)
 }
 
 // openOrInitWorkflow looks up an open workflow for the ticket and returns it
@@ -554,6 +606,34 @@ func (e *Engine) phaseConfirmRepo(ctx context.Context, wf *memory.Workflow, t bo
 	}
 	if existing := approvalAnswer(wf, "confirm_repo"); existing != "" {
 		return nil
+	}
+	// Manual pick: the user assigned repos for this exact ticket from the
+	// Tickets tab. Honor them verbatim (over triage's guess) and skip the
+	// gate — they already chose. Only local checkouts are accepted so the
+	// execute phase has a working tree; remote-only slugs are resolved via
+	// REPOSITORY.md. Falls through to the normal gate if none resolve.
+	if wf.PendingQuestionID == "" && e.Memory != nil {
+		if assigned, ok := e.Memory.AssignedRepos(t.ID); ok {
+			var locals []string
+			for _, r := range assigned {
+				switch {
+				case isLocalCheckout(r):
+					locals = append(locals, r)
+				default:
+					if ent, ok := repository.Lookup(r); ok && isLocalCheckout(ent.Local) {
+						locals = append(locals, ent.Local)
+					}
+				}
+			}
+			if len(locals) > 0 {
+				wf.Repo = locals[0]
+				wf.Repos = locals
+				ensureApproval(wf, "confirm_repo", "manual:pick")
+				wf.State = memory.WFPlanning
+				e.save(*wf)
+				return nil
+			}
+		}
 	}
 	// Explicit per-project rule: if the user previously chose to REMEMBER
 	// a repo for this project (via the gate's "remember" opt-in), auto-
@@ -1577,6 +1657,14 @@ func (e *Engine) triage(ctx context.Context, t boards.Ticket) (TriageResult, err
 // instead of guessing project keys. This is what makes triage able to
 // classify needs_repo correctly — without the registry it can't tell
 // whether "publish a blog post" should touch the docs repo or no repo.
+// llmFor returns the provider routed to a role (GOON_LLM_PLAN / _CODE /
+// _REVIEW), falling back to the engine's default provider e.LLM when the
+// role isn't configured or fails to build. So when no per-role model is
+// set, behaviour is identical to before.
+func (e *Engine) llmFor(role string) llm.Provider {
+	return llm.NewForRoleOr(role, e.LLM)
+}
+
 func (e *Engine) triageWithFeedback(ctx context.Context, t boards.Ticket, feedback string) (TriageResult, error) {
 	if e.LLM == nil {
 		return TriageResult{}, errors.New("triage: no LLM provider configured")
@@ -1644,7 +1732,7 @@ description:
 </ticket>
 `, feedbackBlock, registryBlock, suggestedRepo, t.Key, t.Title, snippet(t.Description, 1500))
 
-	out, err := e.LLM.Generate(ctx, []llm.Message{
+	out, err := e.llmFor(llm.RolePlan).Generate(ctx, []llm.Message{
 		{Role: llm.RoleUser, Content: prompt},
 	}, llm.Options{
 		Temperature: 0.1,
@@ -1723,7 +1811,7 @@ func (e *Engine) executeStep(ctx context.Context, repoDir, ticketKey, step strin
 		ctx = tools.WithWorkDir(ctx, repoDir)
 	}
 	a := agent.New(agent.Options{
-		LLM:      e.LLM,
+		LLM:      e.llmFor(llm.RoleCode),
 		Tools:    e.Tools,
 		Executor: e.Executor,
 		Memory:   e.Memory,
@@ -1769,7 +1857,7 @@ func (e *Engine) runTests(ctx context.Context, repo, override string) error {
 // ticket".
 func (e *Engine) verifyOnce(ctx context.Context, t boards.Ticket) error {
 	a := agent.New(agent.Options{
-		LLM: e.LLM, Tools: e.Tools, Executor: e.Executor, Memory: e.Memory,
+		LLM: e.llmFor(llm.RoleReview), Tools: e.Tools, Executor: e.Executor, Memory: e.Memory,
 		Stdout: e.Stdout, Stderr: e.Stderr, Debug: e.Debug,
 	})
 	prompt := fmt.Sprintf("Verify the implementation for ticket %s is correct. List any defects via finish.\n<ticket_title>%s</ticket_title>",
@@ -1867,91 +1955,9 @@ func sanitizePlanStep(title string) string {
 	return title
 }
 
-// runStages drives the user-defined pipeline declared in cfg.Stages. The
-// built-in phases are bypassed entirely. Hooks still fire at the equivalent
-// boundaries (before/after each named stage), the PR is opened if a stage
-// is named "pr" — or always at the end when cfg.PRTitleTemplate is set —
-// and the notify step runs at the very end if a notify channel is wired.
-func (e *Engine) runStages(ctx context.Context, wf memory.Workflow, t boards.Ticket, cfg WorkflowConfig, hr *HookRunner, branch string) (memory.Workflow, error) {
-	// Declarative stages also benefit from the learned repo cache.
-	repo := e.pickRepoForTicket(t)
-	wf.Repo = repo
-	wf.State = memory.WFExecuting
-	e.save(wf)
-
-	hctx := FromTicket(t, repo, branch, nil)
-
-	// before_triage fires once at the start of the declarative pipeline so
-	// users with existing hook configs get the same setup behavior they had.
-	if err := hr.Run(ctx, HookBeforeTriage, cfg.Hook(HookBeforeTriage), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "before_triage", err)
-	}
-
-	runner := &StageRunner{
-		LLM:      e.LLM,
-		Tools:    e.Tools,
-		Executor: e.Executor,
-		Memory:   e.Memory,
-		Stdout:   e.Stdout,
-		Stderr:   e.Stderr,
-		Debug:    e.Debug,
-	}
-	state, err := runner.RunStages(ctx, cfg, t, branch, repo)
-	if err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "stages", err)
-	}
-
-	// Mirror any "steps" output into wf.Plan so the web UI / status command
-	// keep showing per-step progress for stages whose JSON returned a list.
-	if plan := planFromState(state); len(plan) > 0 {
-		wf.Plan = plan
-		e.save(wf)
-	}
-
-	// after_execute fires after every declared stage has run.
-	hctx = FromTicket(t, repo, branch, wf.Plan)
-	if err := hr.Run(ctx, HookAfterExecute, cfg.Hook(HookAfterExecute), hctx); err != nil {
-		e.runFailureHook(ctx, hr, cfg, hctx, err)
-		return e.fail(wf, "after_execute", err)
-	}
-
-	// PR + notify still run if the user has them configured. They're optional
-	// for non-engineering pipelines (marketing, sales, ops) — skipping is
-	// triggered by the absence of e.Host or by setting pr_title_template:""
-	// AND no GitHub/GitLab tokens.
-	if e.Host != nil && (cfg.PRTitleTemplate != "" || cfg.PRBodyTemplate != "") {
-		wf.State = memory.WFOpeningPR
-		e.save(wf)
-		if err := hr.Run(ctx, HookBeforePR, cfg.Hook(HookBeforePR), hctx); err != nil {
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "before_pr", err)
-		}
-		pr, err := e.openPR(ctx, t, wf, repo, cfg)
-		if err != nil {
-			e.runFailureHook(ctx, hr, cfg, hctx, err)
-			return e.fail(wf, "opening_pr", err)
-		}
-		wf.PRURL = pr.URL
-		wf.Branch = pr.Branch
-		if err := hr.Run(ctx, HookAfterPR, cfg.Hook(HookAfterPR), hctx); err != nil {
-			fmt.Fprintf(e.Stderr, "after_pr hook failed (non-fatal): %v\n", err)
-		}
-	}
-
-	wf.State = memory.WFNotifying
-	e.save(wf)
-	e.notify(ctx, t, wf)
-
-	wf.State = memory.WFDone
-	e.save(wf)
-	if e.Board != nil && wf.PRURL != "" {
-		_ = e.Board.Comment(ctx, t.ID, fmt.Sprintf("✓ goon completed this ticket. PR: %s", wf.PRURL))
-		_ = e.Board.Transition(ctx, t.ID, boards.StatusInReview)
-	}
-	return wf, nil
-}
+// The declarative pipeline is now executed by runGraph (graph.go) — the
+// role-graph engine that reuses the Engine plumbing above (triage, repo
+// resolution, PR, hooks) and pauses at a human reviewer via gate/resume.
 
 // planFromState scans the StageRunner state for any output named "plan" or
 // containing a "steps" key, and converts it to []memory.PlanStep so the web

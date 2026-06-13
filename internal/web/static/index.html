@@ -302,11 +302,69 @@
   /* ── Workflow running state indicator ────────────────────────────── */
   /* Used by the status pill — a muted indigo ring, no glow */
   .brand-active { box-shadow: 0 0 0 1px rgb(var(--c-accent) / 0.4); }
+
+  /* ── Voyage theme glyphs (decorative layer — labels stay plain) ──── */
+  /* Tiny nautical icons (ship/anchor/storm/chest…) used next to normal
+     status text. Pure CSS animation → SSE fragment re-renders are safe.
+     All stroke currentColor so they adapt to both themes for free. */
+  .goon-glyph { display: inline-block; vertical-align: -0.18em; flex: none; }
+  .goon-bob   { animation: goonBob 3.2s ease-in-out infinite; }
+  @keyframes goonBob {
+    0%, 100% { transform: translateY(0)    rotate(-2deg); }
+    50%      { transform: translateY(-2px) rotate(2deg); }
+  }
+  /* Stage route strip (workflow detail): dotted sea route + island dots */
+  .stage-route { position: relative; }
+  .stage-route .route-line {
+    position: absolute; left: 14px; right: 14px; top: 11px; height: 0;
+    border-top: 2px dotted rgb(var(--c-muted) / 0.45);
+  }
+  /* Animated dashed "flow" wires for server-rendered SVG route maps
+     (pipeline band on the Workflows tab). Pure CSS — SSE-safe. */
+  .goon-dash { stroke-dasharray: 6 7; animation: goonDash 1.1s linear infinite; }
+  @keyframes goonDash { to { stroke-dashoffset: -13; } }
+  @media (prefers-reduced-motion: reduce) { .goon-dash { animation: none; } }
 </style>
 </head>
 
 <body class="h-full bg-surface text-ink font-sans"
       hx-ext="morph">
+
+<!-- Voyage glyph sprite — decorative nautical icons referenced by the
+     server-rendered fragments via <use href="#goon-i-…">. One consistent
+     outline family, stroke=currentColor so they theme automatically. -->
+<svg style="display:none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+  <symbol id="goon-i-ship" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M12 3v10"/><path d="M12 4c3 1.5 4.5 4 4 8h-4"/><path d="M12 4c-2.5 1.2-3.8 3.2-3.5 6"/>
+    <path d="M3 14h18l-2.5 5h-13z"/>
+  </symbol>
+  <symbol id="goon-i-anchor" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="5" r="2.4"/><path d="M12 7.4V21"/><path d="M4 13c0 5 3.5 8 8 8s8-3 8-8"/><path d="M9 13H4M20 13h-5"/>
+  </symbol>
+  <symbol id="goon-i-storm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6.5 13a4 4 0 0 1 .6-7.9A5 5 0 0 1 16.7 6 4 4 0 0 1 17 13.9"/><path d="M13 11l-3 5h4l-3 5"/>
+  </symbol>
+  <symbol id="goon-i-chest" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 11V9a3 3 0 0 1 3-3h10a3 3 0 0 1 3 3v2"/><path d="M4 11h16v8H4z"/><path d="M11 11h2v4h-2z"/>
+  </symbol>
+  <symbol id="goon-i-chest-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M4 12l-1.5-5A3 3 0 0 1 5.4 4h13.2a3 3 0 0 1 2.9 3L20 12"/><path d="M4 12h16v8H4z"/><circle cx="12" cy="15.5" r="1.4"/>
+    <path d="M9 2.5l1 2M15 2.5l-1 2M12 1.5V4"/>
+  </symbol>
+  <symbol id="goon-i-flag" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M6 21V4"/><path d="M6 4h11l-2.5 3.5L17 11H6"/>
+  </symbol>
+  <symbol id="goon-i-island" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 19c2-2.5 6-4 9-4s7 1.5 9 4"/><path d="M12 15V8"/><path d="M12 8c-1.8-2.5-4.5-3-6.5-1.8 2 .2 3.4 1 4.5 2.3M12 8c1.8-2.5 4.5-3 6.5-1.8-2 .2-3.4 1-4.5 2.3"/>
+  </symbol>
+  <symbol id="goon-i-coins" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6"/><path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6"/>
+  </symbol>
+  <symbol id="goon-i-wheel" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.2"/>
+    <path d="M12 5V2M12 22v-3M5 12H2M22 12h-3M7.05 7.05 4.9 4.9M19.1 19.1l-2.15-2.15M16.95 7.05 19.1 4.9M4.9 19.1l2.15-2.15"/>
+  </symbol>
+</svg>
 
 <!-- ===================================================================
      Shell: slim header + persistent sidebar + main content area.
@@ -509,6 +567,16 @@
 
       <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-1.5 rounded-md
                      text-sm text-muted hover:text-ink hover:bg-surface-raised/60 transition"
+              role="tab" data-page-target="code">
+        <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/>
+        </svg>
+        <span>Code</span>
+      </button>
+
+      <button class="page-nav w-full text-left flex items-center gap-2.5 px-3 py-1.5 rounded-md
+                     text-sm text-muted hover:text-ink hover:bg-surface-raised/60 transition"
               role="tab" data-page-target="setup">
         <svg class="h-3.5 w-3.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor"
              stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -615,6 +683,10 @@
              hx-get="/fragments/tab-files" hx-trigger="reveal once" hx-swap="innerHTML">
       <div class="space-y-3"><div class="skel h-4 w-32"></div><div class="skel h-20 w-full"></div><div class="skel h-3 w-2/3"></div></div>
     </section>
+    <section data-page="code" class="page hidden" data-loaded="false"
+             hx-get="/fragments/tab-code" hx-trigger="reveal once" hx-swap="innerHTML">
+      <div class="space-y-3"><div class="skel h-4 w-32"></div><div class="skel h-20 w-full"></div><div class="skel h-3 w-2/3"></div></div>
+    </section>
     <section data-page="setup" class="page hidden" data-loaded="false"
              hx-get="/fragments/tab-config" hx-trigger="reveal once" hx-swap="innerHTML">
       <div class="space-y-3"><div class="skel h-4 w-32"></div><div class="skel h-20 w-full"></div><div class="skel h-3 w-2/3"></div></div>
@@ -675,6 +747,7 @@
     chat:      'Chat — goon',
     memory:    'Memory — goon',
     files:     'Files — goon',
+    code:      'Code — goon',
     setup:     'Setup — goon',
   };
 
@@ -811,6 +884,7 @@
     { label: 'Chat',              hint: 'c', run: () => navTo('chat') },
     { label: 'Memory',            hint: 'm', run: () => navTo('memory') },
     { label: 'Files',             hint: 'f', run: () => navTo('files') },
+    { label: 'Code',              hint: 'agentic coding',           run: () => navTo('code') },
     { label: 'Setup',             hint: 's', run: () => navTo('setup') },
     { label: 'Refresh tickets',   hint: 'POST /api/refresh',        run: doRefresh },
     { label: 'Pause daemon',      hint: 'POST /api/daemon/pause',   run: () => doDaemon('pause') },

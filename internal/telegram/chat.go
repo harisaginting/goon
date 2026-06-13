@@ -114,7 +114,7 @@ func (b *Bot) handleChat(ctx context.Context, chatID int64, text string) {
 	b.chatHistMu.Unlock()
 
 	result, err := agentctx.ChatTurn(ctx, agentctx.ChatTurnOptions{
-		LLM:          b.opts.LLM,
+		LLM:          llm.NewForRoleOr(llm.RoleChat, b.opts.LLM),
 		Memory:       b.opts.Memory,
 		Board:        b.opts.Board,
 		Host:         b.opts.Host,

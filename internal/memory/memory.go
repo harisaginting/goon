@@ -257,6 +257,11 @@ type storeFile struct {
 	// doesn't trigger an immediate extra reflection.
 	LastReflectAt time.Time `json:"last_reflect_at,omitempty"`
 
+	// ScheduledRuns records when each scheduled automation (by workflow name)
+	// last fired, so the daemon's scheduler doesn't double-run inside a minute
+	// and the UI can show last/next run.
+	ScheduledRuns map[string]time.Time `json:"scheduled_runs,omitempty"`
+
 	// RepoChoices is a legacy per-project repo cache kept only for
 	// backwards-compat with old memory.json files. It is no longer
 	// consulted for repo selection — that's driven per-ticket by triage +
@@ -286,6 +291,16 @@ type storeFile struct {
 	// Jira/GitHub tickets but never require an external connection. The
 	// NextLocalID counter monotonically increments so IDs are stable.
 	LocalTickets []LocalTicket `json:"local_tickets,omitempty"`
+
+	// PickQueue holds ticket IDs the user explicitly queued from the
+	// Tickets tab ("Pick" button). The daemon drains these BEFORE its
+	// recency-based auto-pick, so a manual pick runs next. FIFO.
+	PickQueue []string `json:"pick_queue,omitempty"`
+
+	// TicketRepos is the per-ticket repo assignment made at pick time
+	// (local checkout paths). confirm_repo honors these verbatim and
+	// skips the gate — the user already chose which repo(s) to use.
+	TicketRepos map[string][]string `json:"ticket_repos,omitempty"`
 	NextLocalID  int           `json:"next_local_id,omitempty"`
 }
 
@@ -360,6 +375,9 @@ func New(path string) (*Memory, error) {
 		}
 		if m.store.Ignored == nil {
 			m.store.Ignored = map[string]time.Time{}
+		}
+		if m.store.ScheduledRuns == nil {
+			m.store.ScheduledRuns = map[string]time.Time{}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("memory: read %s: %w", path, err)
@@ -473,6 +491,33 @@ func (m *Memory) AskQuestion(q Question) string {
 	m.pruneQuestions()
 	m.flush()
 	return q.ID
+}
+
+// LastScheduledRun returns when the named automation last ran (zero if never).
+func (m *Memory) LastScheduledRun(name string) time.Time {
+	if m == nil {
+		return time.Time{}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.ScheduledRuns == nil {
+		return time.Time{}
+	}
+	return m.store.ScheduledRuns[name]
+}
+
+// MarkScheduledRun records that the named automation fired at t.
+func (m *Memory) MarkScheduledRun(name string, t time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.ScheduledRuns == nil {
+		m.store.ScheduledRuns = map[string]time.Time{}
+	}
+	m.store.ScheduledRuns[name] = t
+	m.flush()
 }
 
 // pruneQuestions caps the question slice. Caller must hold m.mu.
@@ -951,6 +996,98 @@ func (m *Memory) ClearTickets() int {
 		m.flush()
 	}
 	return n
+}
+
+// RequestPick queues a ticket for manual execution with a pre-assigned set
+// of repos (local checkout paths). The daemon runs it on the next tick,
+// ahead of recency-based auto-pick; confirm_repo honors the repos and skips
+// the gate. Re-queuing the same ticket just refreshes its repo assignment.
+func (m *Memory) RequestPick(ticketID string, repos []string) {
+	if m == nil || strings.TrimSpace(ticketID) == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.store.TicketRepos == nil {
+		m.store.TicketRepos = map[string][]string{}
+	}
+	m.store.TicketRepos[ticketID] = repos
+	found := false
+	for _, id := range m.store.PickQueue {
+		if id == ticketID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		m.store.PickQueue = append(m.store.PickQueue, ticketID)
+	}
+	m.flush()
+}
+
+// NextPick returns the head of the pick queue (the ticket id + its assigned
+// repos) without removing it. ok is false when the queue is empty.
+func (m *Memory) NextPick() (ticketID string, repos []string, ok bool) {
+	if m == nil {
+		return "", nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.store.PickQueue) == 0 {
+		return "", nil, false
+	}
+	id := m.store.PickQueue[0]
+	return id, append([]string(nil), m.store.TicketRepos[id]...), true
+}
+
+// ClearPick removes a ticket from the pick queue (after the daemon has
+// started running it). The repo assignment in TicketRepos is left in place
+// so confirm_repo can still read it during that run.
+func (m *Memory) ClearPick(ticketID string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := m.store.PickQueue[:0]
+	for _, id := range m.store.PickQueue {
+		if id != ticketID {
+			out = append(out, id)
+		}
+	}
+	m.store.PickQueue = out
+	m.flush()
+}
+
+// AssignedRepos returns the repos a user assigned to a ticket at pick time.
+// ok is false when the ticket was never manually picked.
+func (m *Memory) AssignedRepos(ticketID string) (repos []string, ok bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.store.TicketRepos[ticketID]
+	if !ok || len(r) == 0 {
+		return nil, false
+	}
+	return append([]string(nil), r...), true
+}
+
+// IsPickQueued reports whether a ticket is currently waiting in the manual
+// pick queue (used by the UI to show a "queued" badge instead of the form).
+func (m *Memory) IsPickQueued(ticketID string) bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, id := range m.store.PickQueue {
+		if id == ticketID {
+			return true
+		}
+	}
+	return false
 }
 
 // IgnoreTicket marks a ticket key as opted-out of the daemon

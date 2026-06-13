@@ -65,39 +65,46 @@ func TestValidate(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "valid llm + agent",
+			name: "valid executor + reviewer",
 			cfg: WorkflowConfig{Stages: []StageConfig{
-				{Name: "a", Type: "llm", Prompt: "hi"},
-				{Name: "b", Type: "agent", Task: "do"},
+				{Name: "a", Type: "executor", OnNext: StringList{"r"}},
+				{Name: "r", Type: "reviewer", OnApprove: StringList{"end"}},
 			}},
 			wantErr: false,
 		},
 		{
 			name: "duplicate stage names",
 			cfg: WorkflowConfig{Stages: []StageConfig{
+				{Name: "a", Type: "executor"},
+				{Name: "a", Type: "reviewer", OnApprove: StringList{"end"}},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "reviewer without routing",
+			cfg: WorkflowConfig{Stages: []StageConfig{
+				{Name: "r", Type: "reviewer"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "notify without message",
+			cfg: WorkflowConfig{Stages: []StageConfig{
+				{Name: "n", Type: "notify"},
+			}},
+			wantErr: true,
+		},
+		{
+			name: "removed llm type rejected",
+			cfg: WorkflowConfig{Stages: []StageConfig{
 				{Name: "a", Type: "llm", Prompt: "hi"},
-				{Name: "a", Type: "agent", Task: "do"},
-			}},
-			wantErr: true,
-		},
-		{
-			name: "llm missing prompt",
-			cfg: WorkflowConfig{Stages: []StageConfig{
-				{Name: "a", Type: "llm"},
-			}},
-			wantErr: true,
-		},
-		{
-			name: "agent missing task",
-			cfg: WorkflowConfig{Stages: []StageConfig{
-				{Name: "a", Type: "agent"},
 			}},
 			wantErr: true,
 		},
 		{
 			name: "unknown type",
 			cfg: WorkflowConfig{Stages: []StageConfig{
-				{Name: "a", Type: "wat", Prompt: "x"},
+				{Name: "a", Type: "wat"},
 			}},
 			wantErr: true,
 		},

@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/boards"
+	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/githost"
 	"github.com/harisaginting/goon/internal/memory"
 	"github.com/harisaginting/goon/internal/repository"
@@ -203,6 +204,51 @@ func (s *Server) handleTicketUnignore(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("HX-Trigger", "ticketsChanged")
 	s.events.Publish("ticketsChanged")
 	fragOK(w, key+" claimed back — daemon will consider it on the next poll")
+}
+
+// handleTicketPick queues a ticket for the daemon to run next, with the
+// user's chosen repos pre-assigned — so the workflow skips the confirm_repo
+// gate. Repos come from REPOSITORY.md and must have a local checkout.
+func (s *Server) handleTicketPick(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		fragErr(w, "invalid form: "+err.Error())
+		return
+	}
+	id := strings.TrimSpace(r.FormValue("id"))
+	if id == "" {
+		fragErr(w, "ticket id required")
+		return
+	}
+	var locals []string
+	for _, slug := range r.Form["repos"] {
+		slug = strings.TrimSpace(slug)
+		if slug == "" {
+			continue
+		}
+		if ent, ok := repository.Lookup(slug); ok && strings.TrimSpace(ent.Local) != "" {
+			locals = append(locals, ent.Local)
+		}
+	}
+	if len(locals) == 0 {
+		fragErr(w, "pick at least one repo that has a local checkout (map one on the Repositories tab)")
+		return
+	}
+	s.opts.Memory.RequestPick(id, locals)
+	if waker, ok := s.opts.Daemon.(Waker); ok {
+		waker.Wake()
+	}
+	w.Header().Set("HX-Trigger", "ticketsChanged, workflowsChanged")
+	s.events.Publish("ticketsChanged")
+	s.events.Publish("workflowsChanged")
+	paused := ""
+	if st := s.opts.Memory.GetStatus(); st.Paused {
+		paused = " (daemon is paused — resume it to start)"
+	}
+	fragOK(w, fmt.Sprintf("queued for goon with %d repo(s) — approve the plan when it appears in Workflows%s", len(locals), paused))
 }
 
 // handleTicketsClear wipes the cached ticket inventory so the table
@@ -515,7 +561,7 @@ func (s *Server) handlePRDraftReview(w http.ResponseWriter, r *http.Request) {
 		writeMsg("✗ empty diff — nothing to review")
 		return
 	}
-	draft, err := review.DraftReview(ctx, s.opts.LLM, pr, diff)
+	draft, err := review.DraftReview(ctx, llm.NewForRoleOr(llm.RoleReview, s.opts.LLM), pr, diff)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			writeMsg("✗ model timed out drafting the review — try again or focus the request")
@@ -720,6 +766,24 @@ func (s *Server) handleRepositoryList(w http.ResponseWriter, r *http.Request) {
 			</div>
 		</details>`)
 	}
+
+	// ── Add repository panel ────────────────────────────────────────────────
+	// Lazy-loads the git host repo list on open so the user can pick from
+	// a searchable dropdown instead of typing slugs manually.
+	fmt.Fprint(w,
+		`<details id="add-repo-details" class="mb-4 rounded-xl border border-accent/40 bg-accent/5 hover:border-accent/70 transition">`+
+			`<summary class="flex items-center gap-2 px-4 py-2.5 cursor-pointer text-sm font-medium text-accent hover:text-accent/80 transition list-none">`+
+			`<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" class="h-4 w-4 shrink-0"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`+
+			`Add repository`+
+			`<span class="text-[11px] font-normal text-muted ml-1">— pick from your git host or add manually</span>`+
+			`</summary>`+
+			`<div class="px-4 pb-4 pt-2"`+
+			` hx-get="/fragments/repo-add-list"`+
+			` hx-trigger="toggle from:closest details once"`+
+			` hx-swap="innerHTML">`+
+			`<div class="text-xs text-muted py-2">Loading your repositories…</div>`+
+			`</div>`+
+			`</details>`)
 
 	// Stats strip — total tracked / total open PRs / how many are
 	// still uncloned. Lets the user calibrate at a glance.
@@ -1380,6 +1444,137 @@ func (s *Server) handleReposSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fragOK(w, fmt.Sprintf("saved %d repo(s)", len(clean)))
+}
+
+// --- Repo add list (searchable host picker for "Add repository" panel) ----
+
+// handleRepoAddList renders a searchable list of repos from the configured
+// git host. Each row has inline map-local and clone actions — same forms as
+// handleRepoDetail but pre-populated so the user never types a slug manually.
+func (s *Server) handleRepoAddList(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	defaultWS := ""
+	if ws := strings.TrimSpace(os.Getenv("GOON_WORKSPACE_DIR")); ws != "" {
+		defaultWS = ws + string(os.PathSeparator)
+	}
+
+	// Manual-entry fallback — always shown at the top so the user can add a
+	// repo that isn't on the host list (local-only, self-hosted, etc.)
+	fmt.Fprintf(w,
+		`<div class="rounded-lg border border-surface-border bg-surface p-3 space-y-2 mb-3">`+
+			`<div class="text-[11px] uppercase tracking-wider text-muted font-semibold">Map a local checkout manually</div>`+
+			`<form hx-post="/api/repo/map" hx-target="#add-repo-result" hx-swap="innerHTML" class="flex flex-col sm:flex-row gap-2 items-stretch">`+
+			`<input type="text" name="remote" placeholder="owner/repo" autocomplete="off"`+
+			` class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">`+
+			`<input type="text" name="local" placeholder="%spath/to/checkout" autocomplete="off"`+
+			` class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">`+
+			`<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition">save →</button>`+
+			`</form>`+
+			`<div id="add-repo-result" class="text-xs"></div>`+
+			`</div>`,
+		defaultWS)
+
+	if s.opts.Host == nil {
+		fmt.Fprint(w, `<div class="rounded-md bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+			No git host configured — set GOON_GIT_HOST + token on the Setup tab to browse your repos here.
+		</div>`)
+		return
+	}
+	lister, ok := s.opts.Host.(githost.RepoLister)
+	if !ok {
+		fmt.Fprintf(w, `<div class="rounded-md bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+			Repo listing is not supported on %s yet — use the manual form above.
+		</div>`, html.EscapeString(s.opts.Host.Name()))
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	repos, err := lister.ListRepos(ctx)
+	if err != nil {
+		fmt.Fprintf(w, `<div class="rounded-md bg-rose-500/10 border border-rose-500/30 px-3 py-2 text-xs text-rose-700 dark:text-rose-400">Could not list repos: %s</div>`, html.EscapeString(err.Error()))
+		return
+	}
+
+	// Read existing REPOSITORY.md so we can mark already-tracked repos.
+	tracked, _ := repository.Read()
+	trackedSet := map[string]bool{}
+	for _, e := range tracked {
+		trackedSet[strings.ToLower(strings.TrimSpace(e.Remote))] = true
+	}
+
+	fmt.Fprintf(w,
+		`<div class="text-[11px] text-muted mb-2">%d repo(s) from %s — click a row to map or clone it.</div>`+
+			`<input type="text" placeholder="Search repos…" autocomplete="off"`+
+			` oninput="(function(q){document.querySelectorAll('.ral-row').forEach(function(el){el.style.display=el.dataset.slug.includes(q.toLowerCase())?'':'none'})})(this.value)"`+
+			` class="w-full mb-2 rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 text-sm focus:border-accent focus:outline-none">`+
+			`<div class="rounded-xl border border-surface-border bg-surface-raised divide-y divide-surface-border/60 max-h-[420px] overflow-y-auto">`,
+		len(repos), html.EscapeString(s.opts.Host.Name()))
+
+	for _, repo := range repos {
+		alreadyTracked := trackedSet[strings.ToLower(repo.Slug)]
+		trackedBadge := ""
+		if alreadyTracked {
+			trackedBadge = `<span class="text-[10px] rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/30 px-1.5 py-0.5">tracked</span>`
+		}
+		priv := ""
+		if repo.Private {
+			priv = `<span class="text-[10px] text-muted/60">private</span>`
+		}
+		cloneURL := guessCloneURL(repo.Slug, s.opts.Host)
+		if repo.URL != "" {
+			cloneURL = repo.URL
+		}
+		base := shortRepoName(repo.Slug)
+		defaultTarget := defaultWS + base
+		did := domID(repo.Slug)
+
+		fmt.Fprintf(w,
+			`<details class="ral-row group" data-slug="%s">`+
+				`<summary class="flex items-center gap-3 px-4 py-2.5 cursor-pointer hover:bg-surface-sunken/40 transition list-none">`+
+				`<svg class="h-3.5 w-3.5 text-muted group-open:rotate-90 group-open:text-accent transition-transform shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>`+
+				`<span class="font-mono text-sm text-ink flex-1 truncate">%s</span>`+
+				`%s%s`+
+				`</summary>`+
+				`<div class="px-4 pb-3 pt-1 space-y-2 bg-surface-sunken/30">`+
+
+				// Map local path
+				`<form hx-post="/api/repo/map" hx-target="#ral-result-%s" hx-swap="innerHTML" class="flex flex-col sm:flex-row gap-2 items-stretch">`+
+				`<input type="hidden" name="remote" value="%s">`+
+				`<span class="self-center text-[11px] text-muted shrink-0 font-semibold">Map local:</span>`+
+				`<input type="text" name="local" value="%s" placeholder="%spath/to/checkout" autocomplete="off"`+
+				` class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">`+
+				`<button type="submit" class="rounded-md bg-accent text-surface px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition whitespace-nowrap">save mapping →</button>`+
+				`</form>`+
+
+				// Clone
+				`<form hx-post="/api/repo/clone" hx-target="#ral-result-%s" hx-swap="innerHTML" class="flex flex-col sm:flex-row gap-2 items-stretch">`+
+				`<input type="hidden" name="remote" value="%s">`+
+				`<span class="self-center text-[11px] text-muted shrink-0 font-semibold">Clone:</span>`+
+				`<input type="text" name="url" value="%s" autocomplete="off"`+
+				` class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">`+
+				`<input type="text" name="target" value="%s" placeholder="%spath/to/clone/into" autocomplete="off"`+
+				` class="flex-1 font-mono text-xs rounded-md border border-surface-border bg-surface text-ink px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none">`+
+				`<button type="submit" class="rounded-md bg-amber-600 text-white px-3 py-1.5 text-xs font-semibold hover:brightness-110 transition whitespace-nowrap">git clone →</button>`+
+				`</form>`+
+
+				`<div id="ral-result-%s" class="text-xs"></div>`+
+				`</div>`+
+				`</details>`,
+			html.EscapeString(strings.ToLower(repo.Slug)),
+			html.EscapeString(repo.Slug),
+			trackedBadge, priv,
+			did,
+			html.EscapeString(repo.Slug),
+			html.EscapeString(defaultTarget), html.EscapeString(defaultWS),
+			did,
+			html.EscapeString(repo.Slug),
+			html.EscapeString(cloneURL),
+			html.EscapeString(defaultTarget), html.EscapeString(defaultWS),
+			did,
+		)
+	}
+	fmt.Fprint(w, `</div>`)
 }
 
 // --- Workflow plan editor --------------------------------------------------

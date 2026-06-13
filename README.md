@@ -1,22 +1,72 @@
-# goon
+<p align="center">
+  <img src="docs/logo.svg" alt="goon" width="72" height="72">
+</p>
 
-**Autonomous AI engineer.** Picks up your tickets, plans the work, asks before touching anything, codes it, tests it, opens the PR.
+<h1 align="center">goon</h1>
 
-```
-board → triage → confirm repo → approve plan → execute → test → verify → PR
-          LLM        gate            gate        agent    make   LLM×N  GitHub/GitLab/BB
-```
+<p align="center">
+  <strong>Autonomous AI worker for your team.</strong><br>
+  Run any workflow with AI — write code, open PRs, summarize emails, post daily standups, monitor logs, or build any custom automation. Runs as a daemon. Learns your context. Asks before acting.
+</p>
 
-Two gates park the workflow until you say yes — via web, Telegram, or terminal. Reject with feedback and goon re-plans from scratch.
+<p align="center">
+  <a href="https://github.com/harisaginting/goon/releases"><img src="https://img.shields.io/github/v/release/harisaginting/goon?color=6366F1&label=latest" alt="Latest release"></a>
+  <a href="https://github.com/harisaginting/goon/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-6366F1" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Go-1.21%2B-00ADD8?logo=go" alt="Go 1.21+">
+  <img src="https://img.shields.io/badge/zero_dependencies-stdlib_only-10B981" alt="Zero dependencies">
+</p>
 
-> **Goon gets smarter while it works.** While the daemon runs, goon continuously reads your repo, logs, and notes to build its own memory — and asks you to confirm anything it's unsure about. Every completed task sharpens its understanding of your codebase. It remembers what it learned. It knows when to ask.
+<p align="center">
+  <a href="https://harisaginting.github.io/goon/">Website</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#custom-workflow">Custom workflows</a> ·
+  <a href="#how-goon-compares">How it compares</a> ·
+  <a href="docs/">Docs</a>
+</p>
 
 ---
 
-## Install
+Goon is a **general-purpose AI automation daemon**. The built-in pipeline ships code end-to-end, but the same engine runs any workflow you describe in JSON:
+
+| Use case | What goon does |
+|---|---|
+| 🧑‍💻 **Software engineering** | Poll Jira/GitHub → plan → write code → test → open PR |
+| 📧 **Email digest** | Read Gmail → summarize unread threads → post to Telegram |
+| 📋 **Daily standup** | Fetch yesterday's commits + tickets → draft standup → send to Slack |
+| 🔍 **Log monitoring** | Search GCP logs for errors → triage → open incident ticket |
+| 📊 **Weekly report** | Aggregate metrics → write Markdown report → email to team |
+| 🤖 **Any custom job** | Chain LLM, HTTP, agent, notify, and loop stages however you need |
+
+Two gates pause workflows until **you say yes** — via web UI, Telegram, or terminal. Reject with feedback and goon re-plans from scratch.
+
+> **Goon gets smarter while it works.** While the daemon idles, it reads your commits, logs, and notes, distils insights into `LEARNED.md`, and asks you directly when it's unsure. Every run sharpens its understanding of your context.
+
+---
+
+## Why goon?
+
+Most AI tools answer questions or complete one-off tasks. **Goon is different** — it's a long-running daemon you deploy once and it keeps working:
+
+- 🎫 **Reads your board** — polls Jira or GitHub Issues and picks the next task automatically
+- ⚙️ **Runs any workflow** — code, email, reports, monitoring — defined in a single `workflow.json`
+- 🔒 **Asks permission** — human-approval gates before touching anything sensitive
+- 🛠 **Writes and tests** — for code workflows: runs your test suite, retries on failure, verifies output
+- 🔀 **Opens the PR** — branches, commits, pushes to GitHub, GitLab, or Bitbucket
+- 🧠 **Builds memory** — learns your conventions, repo layout, and past decisions across runs
+- 💻 **Codes in your browser** — pick a directory and run an agentic coding session in the dashboard, like Claude Code in a tab
+- 📱 **Mobile-friendly** — approve or reject from Telegram while you're away from your desk
+- 🔌 **Google Workspace** — reads your Calendar, Gmail, Tasks, and GCP logs on demand
+
+---
+
+## Quick start
+
+**One command — no config file required:**
 
 ```sh
 go install github.com/harisaginting/goon@latest
+goon start --web=:8080
+# open http://localhost:8080 → Settings → configure your LLM + board
 ```
 
 Or build from source:
@@ -26,43 +76,24 @@ git clone https://github.com/harisaginting/goon
 cd goon && make install
 ```
 
-**Requires Go 1.21+. Zero runtime dependencies.**
-
----
-
-## Quick start
-
-**Run immediately — no config file needed:**
+**Try the agent immediately without a board:**
 
 ```sh
-go run . start --web=:8080
-# → open http://localhost:8080 → Settings to configure LLM + board + git host
-```
-
-Or if installed:
-
-```sh
-goon start --web=:8080
-```
-
-All settings are saved to `./config.json` through the web UI. Run `goon doctor` after configuring to verify connections.
-
-**Try the agent without a board:**
-
-```sh
-# offline smoke test
+# offline smoke test (no API key needed)
 GOON_LLM_PROVIDER=mock \
 GOON_MOCK_REPLIES='{"tool":"finish","args":{"message":"done"}}' \
-go run . "say hi"
+goon "say hi"
 
-# real task (set LLM key via web UI first, or via CLI)
+# real one-shot tasks
 goon config set GOON_LLM_PROVIDER openai
 goon config set OPENAI_API_KEY sk-...
 
-goon "list every .go file under internal/" --explain   # plan only
+goon "list every .go file under internal/" --explain   # plan only, no execution
 goon "tidy go.mod"                                     # dry-run (default)
 goon "fix the typo in README.md" --auto                # execute automatically
 ```
+
+**Requires Go 1.21+. Zero runtime dependencies.**
 
 ---
 
@@ -72,15 +103,15 @@ All three share the same `./storage/` state — switch freely.
 
 | Interface | Best for | How |
 |---|---|---|
-| **CLI** | One-off tasks, scripts, CI | `goon "task..."` |
-| **Web UI** | Approvals, PRs, workflow editor | `goon start --web=:8080` |
-| **Telegram** | Mobile approvals, PR review, chat | Set `TELEGRAM_BOT_TOKEN` |
+| **Web UI** | Approvals, PRs, workflow editor, chat, in-browser coding (Code tab) | `goon start --web=:8080` |
+| **CLI** | One-off tasks, scripts, CI pipelines | `goon "task..."` |
+| **Telegram** | Mobile approvals, PR review, natural chat | Set `TELEGRAM_BOT_TOKEN` |
 
 ---
 
 ## LLM providers
 
-Pick one in the web UI Settings tab, or via CLI:
+Pick any provider in the web UI Settings tab, or via CLI:
 
 ```sh
 goon config set GOON_LLM_PROVIDER openai     # gpt-4o-mini default
@@ -95,21 +126,18 @@ goon config set GEMINI_API_KEY ...
 goon config set GOON_LLM_PROVIDER ollama     # llama3 default, no key needed
 ```
 
-Override the model: `goon config set OPENAI_MODEL gpt-4o`, etc.
-
-Per-feature routing (optional):
+**Per-role model routing** — route planning, coding, and review to different models:
 
 ```sh
-GOON_TRIAGE_PROVIDER=anthropic  GOON_TRIAGE_MODEL=claude-opus-4-5
-GOON_EXECUTE_PROVIDER=openai    GOON_EXECUTE_MODEL=gpt-4o
-GOON_CHAT_MODEL=gpt-4o-mini
+goon config set GOON_LLM_CODE   anthropic:claude-sonnet-4-5   # writes code
+goon config set GOON_LLM_PLAN   gemini:gemini-2.5-flash       # ticket planning
+goon config set GOON_LLM_CHAT   gpt-4o-mini                   # chat tab
+goon config set GOON_LLM_REVIEW anthropic                     # PR review drafts
 ```
 
 ---
 
 ## Boards & git hosts
-
-Configure via web UI (`goon start --web=:8080` → Settings), or via CLI:
 
 ```sh
 # Jira
@@ -131,38 +159,13 @@ All values persist to `./config.json`. No restart needed — the daemon hot-relo
 
 ---
 
-## Commands
-
-```sh
-goon "<task>" [--run|--auto|--explain]   # one-shot agent
-goon start [--web=:8080]                 # autonomous daemon
-goon stop | pause | resume
-goon status                              # snapshot
-goon doctor                              # live-probe every provider
-goon train                               # answer queued questions
-goon workflow init|show|edit             # manage pipeline
-goon memory list|read|write|search       # manage knowledge notes
-goon repo show|add|scan                  # manage repo registry
-goon review-prs [--telegram]             # AI-draft PR reviews
-goon logs [--follow]
-goon config show|set|get          # read/write ./config.json
-goon update [ref]
-```
-
-**Execution modes:**
-
-| flag | behavior |
-|---|---|
-| (none) | dry-run — plans but never executes |
-| `--run` | executes, asks `y/N` before each mutating step |
-| `--auto` | executes every validated step automatically |
-| `--explain` | plan only, no tool calls |
-
----
-
 ## Custom workflow
 
-Drop `workflow.json` in your repo root. Goon picks it up on the next poll — no restart.
+Goon ships with a built-in software-engineering pipeline, but you can replace it entirely or run multiple named workflows for completely different jobs.
+
+Drop `workflow.json` in your project directory. Goon picks it up on the next poll — no restart.
+
+**Engineering pipeline (default):**
 
 ```jsonc
 {
@@ -179,7 +182,62 @@ Drop `workflow.json` in your repo root. Goon picks it up on the next poll — no
 }
 ```
 
-Replace the built-in pipeline entirely with `stages`:
+**Daily email digest** — reads Gmail, summarizes, sends to Telegram every morning:
+
+```jsonc
+{
+  "name": "email-digest",
+  "auto_approve": true,
+  "stages": [
+    {
+      "name": "fetch_emails",
+      "type": "agent",
+      "task": "Search Gmail for unread emails from the last 24 hours. Return a JSON list of {from, subject, summary}."
+    },
+    {
+      "name": "summarize",
+      "type": "llm",
+      "prompt": "Given these emails: {{.Stages.fetch_emails.result}}\n\nWrite a concise daily digest grouped by topic. Plain text, bullet points."
+    },
+    {
+      "name": "send",
+      "type": "notify",
+      "message": "📬 Daily digest:\n\n{{.Stages.summarize.result}}"
+    }
+  ]
+}
+```
+
+**Log monitoring** — scans GCP logs for errors, opens a ticket if found:
+
+```jsonc
+{
+  "name": "log-monitor",
+  "auto_approve": true,
+  "stages": [
+    {
+      "name": "scan",
+      "type": "agent",
+      "task": "Search GCP logs for ERROR severity in the last hour. Return JSON {has_errors, count, samples[]}."
+    },
+    {
+      "name": "triage",
+      "type": "llm",
+      "json_mode": true,
+      "prompt": "Logs: {{.Stages.scan.result}}\nDecide: should_alert (bool), severity (low/medium/high), summary (string).",
+      "reject_if": "{{eq .Stages.triage.should_alert false}}",
+      "on_reject": "end"
+    },
+    {
+      "name": "alert",
+      "type": "notify",
+      "message": "🚨 {{.Stages.triage.severity}} alert: {{.Stages.triage.summary}}"
+    }
+  ]
+}
+```
+
+**Replace the built-in pipeline entirely with custom stages:**
 
 ```jsonc
 {
@@ -207,35 +265,40 @@ Replace the built-in pipeline entirely with `stages`:
 }
 ```
 
-Stage types: `llm` · `agent` · `notify` · `http`
+Stage types: `llm` · `agent` · `notify` · `http` · `loop`
 
-Routing fields: `on_next` · `on_reject` · `reject_if` · `ask_stage` · `max_loops`
+Routing fields: `on_next` · `on_reject` · `reject_if` · `ask_stage` · `max_loops` · `on_done`
+
+- `on_next` accepts a single stage name **or an array** for fan-out — `"on_next": ["review", "docs"]` runs both branches sequentially.
+- `on_reject` can point at the stage itself for a bounded retry (capped by `max_loops`, default 3).
+- `type: "loop"` is a pure routing node: loops back to `on_next` until `max_loops` iterations, then exits via `on_done`. Build review → fix cycles with a hard cap.
 
 ---
 
-## Memory
+## Memory & self-learning
 
 ```
 ./storage/
 ├── memory.json          runtime state (tickets, queues, daemon status)
 └── memory/
-    ├── SOUL.md           always loaded into the system prompt — put conventions here
+    ├── SOUL.md           always loaded into the system prompt — put your conventions here
     ├── HISTORY.md        one-line log of every completed task
-    ├── REPOSITORY.md     remote→local repo registry
-    └── *.md              topic notes the agent fetches on demand
+    ├── REPOSITORY.md     remote → local repo registry
+    ├── LEARNED.md        insights distilled from idle-time reflection
+    └── *.md              topic notes the agent reads and writes on demand
 ```
 
 ```sh
 goon memory init           # create memory/ and seed SOUL.md
-goon memory edit SOUL.md   # your codebase conventions, rules, context
+goon memory edit SOUL.md   # add your codebase conventions, rules, context
 goon memory read HISTORY.md
 ```
 
-**Goon teaches itself.** While the daemon is idle between tickets, it reads your recent commits, logs, and notes — then distils new insights into `LEARNED.md`. When it encounters something it isn't sure about, it surfaces a question to you directly (web, Telegram, or `goon train`). Your answers become part of its permanent memory.
+While the daemon idles between tickets, it reads recent commits, logs, and notes — then distils insights into `LEARNED.md`. It asks you directly when it's unsure. Your answers become permanent memory.
 
-Opt out: `GOON_AUTO_LEARN=0`. Tune the reflection interval: `GOON_LEARN_INTERVAL_HOURS` (default 24).
+Opt out: `GOON_AUTO_LEARN=0`. Tune the interval: `GOON_LEARN_INTERVAL_HOURS` (default 24).
 
-For a full breakdown of every file and folder under `./storage/` — what each one holds and which you can safely hand-edit — see **[docs/storage.md](docs/storage.md)**.
+See **[docs/storage.md](docs/storage.md)** for a full breakdown of every file.
 
 ---
 
@@ -248,45 +311,35 @@ TELEGRAM_CHAT_ID=...          # optional default chat for outbound notifications
 GOON_AUTO_REVIEW=1            # auto-draft PR reviews for PRs awaiting you
 ```
 
-Authenticate once per chat: `/auth <secret>`. Then use `/status`, `/queue`, `/answer <id> yes`, `/prs`, `/review owner/repo 42`, `/run <task>`, or plain chat.
+Authenticate once: `/auth <secret>`. Then use `/status`, `/queue`, `/answer <id> yes`, `/prs`, `/review owner/repo 42`, `/run <task>`, or plain chat.
 
 ---
 
-## Google Workspace (ask goon about your calendar, mail & logs)
+## Google Workspace
 
-Connect your Google account once and just ask goon, right in the **Chat** tab —
-it routes the sentence to the right tool:
+Connect once and ask goon in the **Chat** tab:
 
-- "what meetings do I have today?" / "am I busy this afternoon?"  → **Calendar**
-- "what are my tasks?" / "what's on my plate today?"  → **Tasks** (+ Jira)
-- "check my email from finance last week" / "open it"  → **Gmail**
-- "get the traceId for the login of username harisa", "search logs for payment
-  failed", "when did user X register?"  → **GCP Cloud Logging**
-
-**Read-only** — goon can look but never send, change, or delete.
+- *"what meetings do I have today?"* → **Calendar**
+- *"what are my tasks?"* → **Tasks** (+ Jira)
+- *"check my email from finance last week"* → **Gmail**
+- *"get the trace for the login of user harisa"* → **GCP Cloud Logging**
 
 ```sh
-# after creating an OAuth client in Google Cloud (see the guide):
 goon config set GOOGLE_OAUTH_CLIENT_ID <id>
 goon config set GOOGLE_OAUTH_CLIENT_SECRET <secret>
 goon config set GOOGLE_CLOUD_PROJECT <project-id>   # only for log search
 goon google auth                                    # one-time browser consent
 ```
 
-Chat tools added: `calendar_today`, `tasks_list`, `gmail_search`, `gmail_get`,
-`gcp_log_search` (each appears only once Google is connected).
+Read-only — goon can look but never send, change, or delete. Zero-dependency: hand-rolled OAuth2 + Calendar/Tasks/Gmail/Logging using only the Go stdlib.
 
-**New to this? Follow the step-by-step, click-by-click guide:**
-👉 **[docs/google-workspace.md](docs/google-workspace.md)** (≈10 min, no coding).
-
-Built zero-dependency: `internal/google` (hand-rolled OAuth2 + Calendar/Tasks/
-Gmail) and `internal/gcplog` (Cloud Logging) use only the Go stdlib.
+👉 **[Step-by-step setup guide (≈10 min)](docs/google-workspace.md)**
 
 ---
 
 ## Parallel agents
 
-The `spawn_agents` tool lets a workflow (or the agent itself) fan out tasks across isolated child processes:
+Fan out tasks across isolated child processes:
 
 ```json
 { "tool": "spawn_agents", "args": { "tasks": "refactor auth\nwrite tests for auth", "wait": "true" } }
@@ -296,23 +349,76 @@ Each child gets its own `GOON_STORAGE_DIR`. Cap concurrency with `GOON_MAX_AGENT
 
 ---
 
+## How goon compares
+
+| | **goon** | OpenHands | Devin | LangChain/LangGraph | Cursor |
+|---|---|---|---|---|---|
+| **Deployment** | Binary, self-hosted | Docker / cloud | SaaS only | Python library | Desktop app |
+| **Zero dependencies** | ✅ stdlib only | ❌ Python + npm | ❌ SaaS | ❌ Python ecosystem | ❌ Electron |
+| **Board integration** | ✅ Jira, GitHub Issues | ❌ manual | ✅ Jira (paid) | ❌ | ❌ |
+| **Approval gates** | ✅ web, Telegram, CLI | partial | ✅ | manual | ❌ |
+| **Opens PRs** | ✅ GitHub, GitLab, BB | ✅ GitHub | ✅ | ❌ | ❌ |
+| **Self-learning** | ✅ HISTORY + reflect | ❌ | limited | ❌ | ❌ |
+| **Custom workflows** | ✅ workflow.json | ❌ | ❌ | ✅ (code) | ❌ |
+| **Multi-LLM routing** | ✅ per-role | ✅ | ❌ | ✅ | ❌ |
+| **Local / offline** | ✅ Ollama | partial | ❌ | ✅ | partial |
+| **Telegram interface** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Pricing** | free / open source | open source | $500+/mo | open source | $20/mo |
+
+**The key difference:** goon is a daemon that runs *continuously* alongside your team, polls your board, and closes tickets end-to-end with your approval at each gate. It persists memory across runs, learns from your codebase, and routes each job to the right model automatically — not a one-shot assistant you invoke manually.
+
+---
+
+## Commands
+
+```sh
+goon "<task>" [--run|--auto|--explain]   # one-shot agent
+goon start [--web=:8080]                 # autonomous daemon
+goon stop | pause | resume
+goon status                              # snapshot of current state
+goon doctor                              # live-probe every provider
+goon train                               # answer queued learning questions
+goon workflow init|show|edit             # manage pipeline
+goon memory list|read|write|search       # manage knowledge notes
+goon repo show|add|scan                  # manage repo registry
+goon review-prs [--telegram]             # AI-draft PR reviews
+goon logs [--follow]
+goon config show|set|get                 # read/write ./config.json
+goon update [ref]
+```
+
+| Mode flag | Behavior |
+|---|---|
+| *(none)* | Dry-run — plans but never executes |
+| `--run` | Executes, asks `y/N` before each mutating step |
+| `--auto` | Executes every validated step automatically |
+| `--explain` | Plan only, no tool calls |
+
+---
+
 ## Build & test
 
 ```sh
-make build          # ./goon
-make check          # vet + go test -race ./...
-make install        # ~/.local/bin/goon
-goon doctor         # verify all providers are reachable
+make build    # ./goon
+make check    # vet + go test -race ./...
+make install  # ~/.local/bin/goon
+goon doctor   # verify all providers are reachable
 ```
 
 ---
 
 ## Extending
 
-- **New tool** — implement `tools.Tool`, register in `DefaultRegistry`. The agent picks it up through the manifest in the system prompt.
+- **New tool** — implement `tools.Tool`, register in `DefaultRegistry`.
 - **New board** — implement `boards.Board` in `internal/boards/`, route in `NewFromEnv`.
 - **New LLM** — implement `llm.Provider` in `internal/llm/`, route in `NewFromEnv`.
 
 ---
 
-MIT
+## Contributing
+
+Issues and PRs welcome. Run `make check` before submitting. See [CLAUDE.md](CLAUDE.md) for architecture notes and coding conventions.
+
+---
+
+<p align="center">MIT · Built with Go · Zero runtime dependencies</p>

@@ -412,30 +412,60 @@ func (b *Bitbucket) listAccessibleRepos(ctx context.Context, limit int) ([]Repo,
 }
 
 // listWorkspaces returns the slugs of every workspace the token can see.
-// Uses /workspaces (the user-context endpoint). For tokens that can't
-// hit this (repo-scoped access tokens), callers should fall back to
-// BITBUCKET_WORKSPACE.
+//
+// Strategy (two-step because Bitbucket token scopes vary):
+//  1. GET /workspaces — works for OAuth + app-password + workspace tokens.
+//  2. GET /user/permissions/workspaces — alternative that some repo-scoped
+//     tokens can access when /workspaces returns 403/410.
+//
+// For tokens that can hit neither endpoint, callers should fall back to
+// the BITBUCKET_WORKSPACE env var.
 func (b *Bitbucket) listWorkspaces(ctx context.Context) ([]string, error) {
-	endpoint := fmt.Sprintf("%s/workspaces?pagelen=100", b.APIURL)
-	raw, err := b.do(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	var resp struct {
-		Values []struct {
-			Slug string `json:"slug"`
-		} `json:"values"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("bitbucket workspaces decode: %w", err)
-	}
-	out := make([]string, 0, len(resp.Values))
-	for _, w := range resp.Values {
-		if w.Slug != "" {
-			out = append(out, w.Slug)
+	// --- primary: /workspaces -------------------------------------------------
+	raw, err := b.do(ctx, http.MethodGet, fmt.Sprintf("%s/workspaces?pagelen=100", b.APIURL), nil)
+	if err == nil {
+		var resp struct {
+			Values []struct {
+				Slug string `json:"slug"`
+			} `json:"values"`
 		}
+		if jerr := json.Unmarshal(raw, &resp); jerr != nil {
+			return nil, fmt.Errorf("bitbucket workspaces decode: %w", jerr)
+		}
+		out := make([]string, 0, len(resp.Values))
+		for _, w := range resp.Values {
+			if w.Slug != "" {
+				out = append(out, w.Slug)
+			}
+		}
+		return out, nil
 	}
-	return out, nil
+	primaryErr := err
+
+	// --- fallback: /user/permissions/workspaces (works for access tokens) ----
+	raw2, err2 := b.do(ctx, http.MethodGet, fmt.Sprintf("%s/user/permissions/workspaces?pagelen=100", b.APIURL), nil)
+	if err2 == nil {
+		var resp2 struct {
+			Values []struct {
+				Workspace struct {
+					Slug string `json:"slug"`
+				} `json:"workspace"`
+			} `json:"values"`
+		}
+		if jerr := json.Unmarshal(raw2, &resp2); jerr != nil {
+			return nil, fmt.Errorf("bitbucket workspaces decode: %w", jerr)
+		}
+		out := make([]string, 0, len(resp2.Values))
+		for _, w := range resp2.Values {
+			if w.Workspace.Slug != "" {
+				out = append(out, w.Workspace.Slug)
+			}
+		}
+		return out, nil
+	}
+
+	// Both endpoints failed — return the primary error so callers can log it.
+	return nil, primaryErr
 }
 
 // GetPRDetails returns the PR + the unified diff text. The diff endpoint
@@ -504,6 +534,27 @@ func (b *Bitbucket) RequestChangesPR(ctx context.Context, repo string, number in
 	return err
 }
 
+// bbSetAuth applies the correct Authorization header based on which
+// credentials are available:
+//
+//	Token only              → Bearer <token>   (workspace / repo access token)
+//	Username + Token        → Basic base64(username:token)  (token-as-password)
+//	Username + AppPassword  → Basic base64(username:app_password)
+func bbSetAuth(req *http.Request, token, username, appPassword string) {
+	switch {
+	case token != "" && username != "":
+		// Token used as a password — some orgs issue these for CI.
+		req.Header.Set("Authorization", "Basic "+
+			base64.StdEncoding.EncodeToString([]byte(username+":"+token)))
+	case token != "":
+		// Workspace or repository access token — must use Bearer.
+		req.Header.Set("Authorization", "Bearer "+token)
+	case username != "" && appPassword != "":
+		req.Header.Set("Authorization", "Basic "+
+			base64.StdEncoding.EncodeToString([]byte(username+":"+appPassword)))
+	}
+}
+
 // fetchDiff GETs a Bitbucket diff URL with text/plain Accept and the same
 // auth as the JSON endpoints.
 func (b *Bitbucket) fetchDiff(ctx context.Context, urlStr string) (string, error) {
@@ -512,13 +563,7 @@ func (b *Bitbucket) fetchDiff(ctx context.Context, urlStr string) (string, error
 		return "", err
 	}
 	req.Header.Set("Accept", "text/plain")
-	switch {
-	case b.Token != "":
-		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.Token)))
-	case b.Username != "" && b.AppPassword != "":
-		req.Header.Set("Authorization", "Basic "+
-			base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.AppPassword)))
-	}
+	bbSetAuth(req, b.Token, b.Username, b.AppPassword)
 	resp, err := b.HTTP.Do(req)
 	if err != nil {
 		return "", err
@@ -540,13 +585,7 @@ func (b *Bitbucket) do(ctx context.Context, method, urlStr string, body io.Reade
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	switch {
-	case b.Token != "":
-		req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.Token)))
-	case b.Username != "" && b.AppPassword != "":
-		req.Header.Set("Authorization", "Basic "+
-			base64.StdEncoding.EncodeToString([]byte(b.Username+":"+b.AppPassword)))
-	}
+	bbSetAuth(req, b.Token, b.Username, b.AppPassword)
 	resp, err := b.HTTP.Do(req)
 	if err != nil {
 		return nil, err

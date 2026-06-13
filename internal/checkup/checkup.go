@@ -578,18 +578,35 @@ func probeBitbucket(ctx context.Context, env Env) Result {
 		return r
 	}
 	// Fallback for access tokens.
+	// NOTE: /repositories?role=member was deprecated by Bitbucket (HTTP 410),
+	// so we no longer probe that endpoint. Instead try alternatives that work
+	// for repo-scoped and workspace-scoped access tokens.
 	if tok != "" && (res.status == 401 || res.status == 403) {
-		res2 := bbProbeCall(ctx, base+"/repositories?role=member&pagelen=1", authHeader)
+		// Try workspace-scoped repos endpoint when BITBUCKET_WORKSPACE is set.
+		if ws := strings.TrimSpace(envOrDefault(env, "BITBUCKET_WORKSPACE", "")); ws != "" {
+			res2 := bbProbeCall(ctx, base+"/repositories/"+ws+"?pagelen=1", authHeader)
+			if res2.ok {
+				r.OK = true
+				r.Detail = "auth OK (access token — workspace scoped)"
+				return r
+			}
+		}
+		// Try the permissions/workspaces endpoint (works for many token types).
+		res2 := bbProbeCall(ctx, base+"/user/permissions/workspaces?pagelen=1", authHeader)
 		if res2.ok {
 			r.OK = true
-			r.Detail = "auth OK (access token — workspace/repo scoped)"
+			r.Detail = "auth OK (access token)"
 			return r
 		}
-		// Both endpoints rejected the credential — surface both
-		// codes so the user can tell whether the token is bad vs
-		// over-scoped.
-		r.Detail = fmt.Sprintf("/user http %d, /repositories http %d: %s",
-			res.status, res2.status, util.Truncate(string(res2.body), 120))
+		// 403 on /user means the token is structurally valid but lacks
+		// account:read scope — repo-level operations will still work.
+		if res.status == 403 {
+			r.OK = true
+			r.Detail = "auth OK (access token — limited to repository scope; set BITBUCKET_WORKSPACE for full access)"
+			return r
+		}
+		r.Detail = fmt.Sprintf("auth failed — /user http %d; set BITBUCKET_WORKSPACE if using a repo-scoped token: %s",
+			res.status, util.Truncate(string(res.body), 120))
 		return r
 	}
 	r.Detail = fmt.Sprintf("http %d: %s", res.status, util.Truncate(string(res.body), 120))

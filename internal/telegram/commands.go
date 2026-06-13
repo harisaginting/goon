@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/harisaginting/goon/internal/agent"
+	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 )
 
@@ -555,7 +556,7 @@ func (b *Bot) cmdRun(ctx context.Context, chatID int64, args []string) {
 
 	var out bytes.Buffer
 	a := agent.New(agent.Options{
-		LLM:      b.opts.LLM,
+		LLM:      llm.NewForRoleOr(llm.RoleCode, b.opts.LLM),
 		Tools:    b.opts.Tools,
 		Executor: b.opts.Executor,
 		Memory:   b.opts.Memory,

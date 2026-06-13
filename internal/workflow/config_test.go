@@ -245,12 +245,16 @@ func TestSaveDefault_WritesEducationalStarter(t *testing.T) {
 			t.Errorf("starter %s hook should have an example command, got empty", k)
 		}
 	}
-	// Description should mention the gates so the user knows what
+	// Description should mention the reviewer gate so the user knows what
 	// auto_approve toggles.
-	for _, want := range []string{"confirm_repo", "approve_plan", "auto_approve"} {
+	for _, want := range []string{"reviewer", "approve", "auto_approve"} {
 		if !strings.Contains(cfg.Description, want) {
 			t.Errorf("starter description missing %q: %q", want, cfg.Description)
 		}
+	}
+	// The starter ships the role-graph stages (matches what LoadConfig injects).
+	if len(cfg.Stages) == 0 {
+		t.Error("starter should include the default role-graph stages")
 	}
 }
 

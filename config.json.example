@@ -18,6 +18,12 @@
   "OLLAMA_BASE_URL": "http://localhost:11434",
   "OLLAMA_MODEL": "llama3",
 
+  "_comment_roles": "Optional per-role model routing. Each value is 'provider:model', 'provider', or just 'model'. Empty = use GOON_LLM_PROVIDER above. Example: code with Claude, chat with a cheap Gemini.",
+  "GOON_LLM_CHAT": "",
+  "GOON_LLM_PLAN": "",
+  "GOON_LLM_CODE": "",
+  "GOON_LLM_REVIEW": "",
+
   "GOON_BOARD": "github",
   "GOON_GIT_HOST": "github",
   "GOON_TICKET_STATUSES": "open,in_progress",

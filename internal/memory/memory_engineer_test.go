@@ -114,6 +114,45 @@ func TestMemory_PersistenceWithEngineerData(t *testing.T) {
 	}
 }
 
+func TestMemory_PickQueue(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := New(filepath.Join(dir, "memory.json"))
+
+	if _, _, ok := m.NextPick(); ok {
+		t.Fatal("empty queue should report no pick")
+	}
+	m.RequestPick("EB-1", []string{"/r/api", "/r/web"})
+	m.RequestPick("EB-2", []string{"/r/api"})
+	// Re-queuing EB-1 must refresh repos, not duplicate the queue entry.
+	m.RequestPick("EB-1", []string{"/r/only"})
+
+	if !m.IsPickQueued("EB-1") || !m.IsPickQueued("EB-2") {
+		t.Fatal("both tickets should be queued")
+	}
+	if repos, ok := m.AssignedRepos("EB-1"); !ok || len(repos) != 1 || repos[0] != "/r/only" {
+		t.Fatalf("EB-1 repos not refreshed: %v", repos)
+	}
+
+	id, repos, ok := m.NextPick()
+	if !ok || id != "EB-1" {
+		t.Fatalf("FIFO head should be EB-1, got %q", id)
+	}
+	if len(repos) != 1 || repos[0] != "/r/only" {
+		t.Fatalf("NextPick repos = %v", repos)
+	}
+	m.ClearPick("EB-1")
+	if m.IsPickQueued("EB-1") {
+		t.Fatal("EB-1 should be cleared from the queue")
+	}
+	// Assignment survives ClearPick (confirm_repo still reads it mid-run).
+	if _, ok := m.AssignedRepos("EB-1"); !ok {
+		t.Fatal("assignment should persist after ClearPick")
+	}
+	if id, _, ok := m.NextPick(); !ok || id != "EB-2" {
+		t.Fatalf("next head should be EB-2, got %q", id)
+	}
+}
+
 func TestMemory_ReconcileTickets(t *testing.T) {
 	dir := t.TempDir()
 	m, _ := New(filepath.Join(dir, "memory.json"))

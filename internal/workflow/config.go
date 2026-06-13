@@ -7,9 +7,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/harisaginting/goon/internal/logx"
+	"github.com/harisaginting/goon/internal/storage"
 )
 
 // WorkflowConfig is the user-customizable description of how the workflow
@@ -86,43 +88,165 @@ type WorkflowConfig struct {
 	// Hooks: phase name -> list of shell commands.
 	Hooks map[string][]string `json:"hooks,omitempty"`
 
-	// Stages, when non-empty, REPLACES the built-in 7-phase pipeline with a
-	// user-defined sequence. Each stage is one of a small set of typed steps
-	// (llm, agent — see StageConfig). Stages run in order, share a state map,
-	// and can reference earlier outputs via templates ({{.Stages.NAME.field}}).
+	// Stages is the role-graph goon runs for each ticket: a set of typed nodes
+	// (analyst | executor | reviewer | loop | notify — see StageConfig) wired by
+	// action. This is goon's DEFAULT pipeline — LoadConfig injects
+	// BuiltinRoleGraph() when a config omits stages, so the graph runs even with
+	// an empty or stage-less workflow.json. Nodes share a state map and can
+	// reference earlier outputs via templates ({{.Stages.NAME.field}}).
 	//
-	// Hooks (before_*/after_*) still fire at the equivalent boundaries when a
-	// stage's name matches a known phase (triage, execute, test, verify, pr).
+	// (The legacy linear phase pipeline still runs when an Engine is handed an
+	// explicit stage-less Config — used by tests and back-compat callers.)
 	Stages []StageConfig `json:"stages,omitempty"`
+
+	// Trigger decides what starts this workflow: "board" (ticket-driven — the
+	// software-factory default) or "schedule" (an automation fired by the
+	// cron/interval in Trigger). Empty/absent = board.
+	Trigger Trigger `json:"trigger,omitempty"`
+
+	// Enabled lets an automation be paused without deleting it. A nil/absent
+	// value means enabled, so existing board pipelines keep running.
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Layout carries editor node positions (keyed by node name, plus the
+	// "__start"/"__finish" lifecycle markers) so a SHARED workflow.json opens
+	// with the same canvas view for whoever loads it. Cosmetic only — the
+	// engine ignores it.
+	Layout map[string]Pos `json:"layout,omitempty"`
 }
 
-// Stage type constants. Keep in sync with the dispatch switch in
-// runner.go (runOne) and the web editor's TYPES metadata.
+// Pos is an editor canvas position in world coordinates.
+type Pos struct {
+	X int `json:"x"`
+	Y int `json:"y"`
+}
+
+// Trigger configures what fires a workflow.
+//
+//	board    — the daemon polls a ticket board and runs the graph per ticket.
+//	schedule — the daemon's scheduler runs the graph on Cron / Every.
+//	manual   — only runs on an explicit "run now".
+type Trigger struct {
+	Type  string `json:"type,omitempty"`  // "board" (default) | "schedule" | "manual"
+	Cron  string `json:"cron,omitempty"`  // 5-field cron, when Type=="schedule"
+	Every string `json:"every,omitempty"` // simple interval alt: "30m" | "1h" | "24h"
+}
+
+// IsScheduled reports whether this workflow is a scheduled automation.
+func (c WorkflowConfig) IsScheduled() bool {
+	return strings.EqualFold(strings.TrimSpace(c.Trigger.Type), "schedule")
+}
+
+// IsEnabled reports whether the workflow should run (nil Enabled == enabled).
+func (c WorkflowConfig) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
+
+// Role constants — the node "roles" in a goon role-graph. A graph is a set
+// of typed nodes wired by ACTION (see Action* below): each role runs, emits
+// one action, and routing follows that action's target list (fan-out
+// supported). Keep in sync with the dispatch switch in graph.go (runNode)
+// and the web editor's TYPES metadata.
+//
+//	analyst  — ask-only knowledge node. Other nodes `ask` it a question; it
+//	           answers (optionally fetching `urls` first to augment goon's
+//	           knowledge). It never routes forward on its own. Action: answer.
+//	executor — does the technical work: code, run commands, open the PR. Runs
+//	           goon's autonomous agent loop inside the assigned repo. Actions:
+//	           next (done → on_next) | ask (consult the analyst, then re-run).
+//	reviewer — judges the executor's work. mode=human pauses and shows a person
+//	           a change summary to approve/reject; mode=llm decides automatically.
+//	           Actions: approve (→ on_approve, fan-out) | reject (→ on_reject,
+//	           usually a loop) | ask (consult the analyst, then re-run).
+//	loop     — pure routing node: bounded loop-back (no model call).
+//	notify   — send a message via the 'telegram' tool.
 const (
-	StageTypeLLM    = "llm"    // one model call (prompt → text/JSON)
-	StageTypeAgent  = "agent"  // goon's autonomous tool-using loop
-	StageTypeNotify = "notify" // send a message via the 'telegram' tool
-	StageTypeHTTP   = "http"   // GET an https URL via the 'fetch_url' tool
+	RoleAnalyst  = "analyst"
+	RoleExecutor = "executor"
+	RoleReviewer = "reviewer"
+	RoleLoop     = "loop"
+	RoleNotify   = "notify"
 )
 
-// StageConfig declares one step in a user-defined pipeline.
+// Action constants — what a node emits after it runs. Routing keys off the
+// action; each action maps to a StringList of targets (so any action can
+// fan out to several nodes that then run sequentially, sharing state).
+const (
+	ActionNext    = "next"    // executor finished → follow on_next
+	ActionAsk     = "ask"     // node needs the analyst → consult it, then re-run this node
+	ActionApprove = "approve" // reviewer approved → follow on_approve (fan-out)
+	ActionReject  = "reject"  // reviewer rejected → follow on_reject (usually a loop)
+	ActionAnswer  = "answer"  // analyst produced an answer (terminal for that node)
+)
+
+// Reviewer modes (StageConfig.Mode).
+const (
+	ReviewerModeHuman = "human" // pause and ask a person to approve/reject (default)
+	ReviewerModeLLM   = "llm"   // an automated model decides approve/reject
+)
+
+// Executor built-in capabilities (StageConfig.Do) — performed with goon's own
+// machinery (git host, PR templates) instead of a freeform agent task.
+const (
+	DoOpenPR = "open_pr" // open/update the PR for the workflow's repo + branch
+)
+
+// StringList unmarshals from either a JSON string ("a") or a JSON array
+// (["a","b"]) so routing fields stay backward compatible while gaining
+// fan-out support. It marshals back to a bare string when it holds
+// exactly one element, keeping existing workflow.json files stable.
+type StringList []string
+
+func (l *StringList) UnmarshalJSON(b []byte) error {
+	s := strings.TrimSpace(string(b))
+	if s == "" || s == "null" {
+		*l = nil
+		return nil
+	}
+	if strings.HasPrefix(s, "[") {
+		var a []string
+		if err := json.Unmarshal(b, &a); err != nil {
+			return err
+		}
+		*l = a
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(b, &one); err != nil {
+		return err
+	}
+	if strings.TrimSpace(one) == "" {
+		*l = nil
+	} else {
+		*l = []string{one}
+	}
+	return nil
+}
+
+func (l StringList) MarshalJSON() ([]byte, error) {
+	if len(l) == 1 {
+		return json.Marshal(l[0])
+	}
+	return json.Marshal([]string(l))
+}
+
+// StageConfig declares one node in a role-graph.
 //
 // Common fields:
 //
-//	name      — unique identifier; later stages reference output as {{.Stages.NAME.…}}
-//	type      — "llm" | "agent" | "notify" | "http"
-//	if        — optional Go-template expression; stage skipped when it renders to "", "false", "no", "0"
-//	repeat    — run the stage this many times (1 if omitted). Useful for verify-style passes.
+//	name      — unique identifier; later nodes reference output as {{.Stages.NAME.…}}
+//	type      — "analyst" | "executor" | "reviewer" | "loop" | "notify"
+//	if        — optional Go-template expression; node skipped when it renders to "", "false", "no", "0"
+//	repeat    — run the node this many times (1 if omitted). Useful for verify-style passes.
 //	on_error  — "fail" (default) | "continue" | "warn"
 //
-// Type-specific fields:
+// Role-specific fields:
 //
-//	llm    : prompt, system, json_mode, temperature, max_tokens, output (named key)
-//	agent  : task, max_steps
-//	notify : message — text sent via the 'telegram' tool. The rendered message
-//	         is also stored under .Stages.<name> so later stages can reference it.
-//	http   : url — an https URL fetched (GET) via the 'fetch_url' tool. The
-//	         response body is stored under .Stages.<name> as a string.
+//	analyst  : prompt, system, json_mode, temperature, max_tokens, output,
+//	           urls — a list of https URLs fetched (GET) before answering so the
+//	           analyst can ground its reply in fresh, project-specific knowledge.
+//	executor : task, max_steps, do (built-in capability, e.g. "open_pr").
+//	reviewer : task (or prompt), mode ("human" default | "llm").
+//	notify   : message — text sent via the 'telegram' tool. The rendered message
+//	           is also stored under .Stages.<name> so later nodes can reference it.
 type StageConfig struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
@@ -130,30 +254,48 @@ type StageConfig struct {
 	Repeat  int    `json:"repeat,omitempty"`
 	OnError string `json:"on_error,omitempty"`
 
-	// ── Routing ────────────────────────────────────────────────────────────────
-	//
-	// By default stages execute in array order. Setting these fields enables
-	// non-linear pipelines: conditional branches, sub-calls, and loops.
-	//
-	//   on_next   — stage name to go to after a successful run. "end" finishes
-	//               the pipeline. Empty = next stage in array order.
-	//   reject_if — Go-template expression evaluated against StageState after
-	//               the stage runs. When it renders to a truthy value (anything
-	//               except "", "false", "no", "0") the stage is REJECTED and
-	//               routing follows on_reject instead of on_next.
-	//   on_reject — stage name to jump to on rejection. "end" aborts the
-	//               pipeline with an error. Empty = "end".
-	//   ask_stage — name of a helper stage to run as an inline sub-call BEFORE
-	//               this stage executes. Its output is available as .Ask in
-	//               the current stage's templates.
-	//   max_loops — max number of times on_reject can loop back to an earlier
-	//               stage before the pipeline hard-fails. Default 3.
+	// Mode selects a reviewer's decision-maker: "human" (pause, show a change
+	// summary, wait for approve/reject) or "llm" (an automated model decides).
+	// Empty defaults to "human" for a reviewer. Ignored by other roles.
+	Mode string `json:"mode,omitempty"`
 
-	OnNext   string `json:"on_next,omitempty"`
-	RejectIf string `json:"reject_if,omitempty"`
-	OnReject string `json:"on_reject,omitempty"`
-	AskStage string `json:"ask_stage,omitempty"`
-	MaxLoops int    `json:"max_loops,omitempty"`
+	// Do names a built-in executor capability performed with goon's own
+	// machinery instead of a freeform agent task. Currently: "open_pr". When
+	// set, `task` is ignored. Ignored by non-executor roles.
+	Do string `json:"do,omitempty"`
+
+	// ── Routing (action → targets) ─────────────────────────────────────────────
+	//
+	// By default nodes execute in array order. Routing fields wire the graph by
+	// ACTION — each maps the named action to the node(s) to run next. Every
+	// target field is a StringList: a single name OR an array for fan-out
+	// (branches run sequentially, sharing state; the first branch's whole chain
+	// completes before the next starts). "end" terminates that branch.
+	//
+	//   on_next    — executor emitted `next` (or any non-routing node finished).
+	//   on_approve — reviewer emitted `approve`. Fan-out lives here, e.g.
+	//                ["open_pr","notify"].
+	//   on_reject  — reviewer emitted `reject` (or a node failed reject_if).
+	//                Usually points at a loop node that sends flow back.
+	//   ask        — name of the analyst node to consult when this node emits
+	//                `ask`. The analyst answers (its reply lands in .Ask) and
+	//                THIS node is re-run with that knowledge, bounded by max_loops.
+	//   reject_if  — advanced: a Go-template expression evaluated after the node
+	//                runs; truthy ("" / "false" / "no" / "0" are falsy) forces a
+	//                reject regardless of role, routing via on_reject.
+	//   max_loops  — for normal nodes: max times on_reject / ask can loop back
+	//                before the graph hard-fails (default 3). For type=loop:
+	//                maximum iterations of the loop body.
+	//   on_done    — type=loop only: node to continue with once max_loops
+	//                iterations are spent. Empty = next in array order.
+
+	OnNext    StringList `json:"on_next,omitempty"`
+	OnApprove StringList `json:"on_approve,omitempty"`
+	OnReject  string     `json:"on_reject,omitempty"`
+	Ask       string     `json:"ask,omitempty"`
+	RejectIf  string     `json:"reject_if,omitempty"`
+	MaxLoops  int        `json:"max_loops,omitempty"`
+	OnDone    string     `json:"on_done,omitempty"`
 
 	// Model override — leave empty to use the process-wide default.
 	// Provider is the provider name (openai | anthropic | gemini | ollama | mock).
@@ -162,23 +304,21 @@ type StageConfig struct {
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model,omitempty"`
 
-	// llm
-	Prompt      string  `json:"prompt,omitempty"`
-	System      string  `json:"system,omitempty"`
-	JSONMode    bool    `json:"json_mode,omitempty"`
-	Temperature float64 `json:"temperature,omitempty"`
-	MaxTokens   int     `json:"max_tokens,omitempty"`
-	Output      string  `json:"output,omitempty"` // override key under .Stages (defaults to Name)
+	// analyst / reviewer(llm)
+	Prompt      string     `json:"prompt,omitempty"`
+	System      string     `json:"system,omitempty"`
+	JSONMode    bool       `json:"json_mode,omitempty"`
+	Temperature float64    `json:"temperature,omitempty"`
+	MaxTokens   int        `json:"max_tokens,omitempty"`
+	Output      string     `json:"output,omitempty"` // override key under .Stages (defaults to Name)
+	URLs        StringList `json:"urls,omitempty"`   // analyst: pages fetched to augment knowledge
 
-	// agent
+	// executor / reviewer
 	Task     string `json:"task,omitempty"`
 	MaxSteps int    `json:"max_steps,omitempty"`
 
 	// notify
 	Message string `json:"message,omitempty"`
-
-	// http
-	URL string `json:"url,omitempty"`
 }
 
 // Hook phase names. Keep in sync with the engine.
@@ -247,12 +387,72 @@ Project: ` + "`{{.Project}}`" + `
 	}
 }
 
+// BuiltinRoleGraph returns goon's DEFAULT role-graph — the autonomous
+// "software house" flow used when a config declares no stages of its own:
+//
+//	execute (executor)            do the work in the ticket's assigned repo
+//	   → review (reviewer/human)  show a person a change summary; approve or reject
+//	        approve → open_pr (executor) + notify   ← fan-out
+//	        reject  → rework (loop ×3) → execute     ← bounded retry
+//
+// There is no repo gate (the ticket arrives already assigned to its repo) and
+// no plan gate — the reviewer is the single human checkpoint, and it judges the
+// finished change, not a guess. Set auto_approve=true (or GOON_AUTO_APPROVE=1)
+// to let the reviewer approve automatically for fully-unattended runs.
+//
+// An analyst node can be added (and wired via `ask`) to give the executor or
+// reviewer an on-demand knowledge oracle; it's omitted here to keep the default
+// minimal.
+func BuiltinRoleGraph() []StageConfig {
+	return []StageConfig{
+		{
+			Name: "execute", Type: RoleExecutor,
+			// Empty task → the executor plans (triage) and implements the plan
+			// in the assigned repo using goon's agent loop.
+			OnNext: StringList{"review"},
+		},
+		{
+			Name: "review", Type: RoleReviewer, Mode: ReviewerModeHuman,
+			Task:      "Review the executor's changes for {{.Key}} ({{.Title}}): correctness, regressions, missing edge cases.",
+			OnApprove: StringList{"open_pr", "notify"},
+			OnReject:  "rework",
+			MaxLoops:  3,
+		},
+		{
+			Name: "rework", Type: RoleLoop, MaxLoops: 3,
+			OnNext: StringList{"execute"}, OnDone: "end",
+		},
+		{
+			Name: "open_pr", Type: RoleExecutor, Do: DoOpenPR,
+			OnNext: StringList{"end"},
+		},
+		{
+			Name: "notify", Type: RoleNotify,
+			Message: "✅ {{.Key}} approved — {{.Title}}{{if .PRURL}}\nPR: {{.PRURL}}{{end}}",
+		},
+	}
+}
+
 // Hook returns the configured commands for a phase, or nil if none.
 func (c WorkflowConfig) Hook(name string) []string {
 	if c.Hooks == nil {
 		return nil
 	}
 	return c.Hooks[name]
+}
+
+// injectDefaultGraph makes the role-graph goon's default pipeline: when a
+// loaded config declares no stages of its own, fill in BuiltinRoleGraph() so
+// the daemon runs the graph even from an empty or stage-less workflow.json. A
+// config that DOES declare stages is left untouched (the user's graph wins).
+//
+// This is intentionally applied in LoadConfig (not DefaultConfig) so the
+// legacy linear engine still runs when an Engine is handed an explicit
+// stage-less Config — the path the workflow_test.go suite exercises.
+func injectDefaultGraph(cfg *WorkflowConfig) {
+	if len(cfg.Stages) == 0 {
+		cfg.Stages = BuiltinRoleGraph()
+	}
 }
 
 // LoadConfig finds and loads the workflow config. Resolution order, first
@@ -296,8 +496,10 @@ func LoadConfig(repoDir string) (WorkflowConfig, string, error) {
 		if err != nil {
 			abs = p
 		}
+		injectDefaultGraph(&cfg)
 		return cfg, abs, nil
 	}
+	injectDefaultGraph(&cfg)
 	return cfg, "", nil
 }
 
@@ -375,6 +577,102 @@ func Announce(repoDir string, w io.Writer) (WorkflowConfig, string) {
 	return cfg, source
 }
 
+// ── Automations (scheduled workflows) ──────────────────────────────────────
+//
+// Beyond the main board pipeline (./workflow.json), goon runs any number of
+// scheduled automations — each one a role-graph with a schedule Trigger,
+// stored as its own JSON under storage/workflows/. The daemon's scheduler
+// loads them and fires the due ones.
+
+// LoadedWorkflow pairs a parsed config with the file it came from.
+type LoadedWorkflow struct {
+	Config WorkflowConfig
+	Path   string
+}
+
+// AutomationsDir is where scheduled automations live — one JSON per workflow.
+func AutomationsDir() string { return storage.Path("workflows") }
+
+// LoadAutomations reads every automation JSON under AutomationsDir(), sorted by
+// file name for stable order. A bad/unparseable file is skipped (one broken
+// automation must not break the rest). Stages are NOT injected here — an
+// automation with no stages is simply inert.
+func LoadAutomations() []LoadedWorkflow {
+	entries, err := os.ReadDir(AutomationsDir())
+	if err != nil {
+		return nil
+	}
+	out := []LoadedWorkflow{}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(strings.ToLower(e.Name()), ".json") {
+			continue
+		}
+		p := filepath.Join(AutomationsDir(), e.Name())
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		var cfg WorkflowConfig
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			logx.Warn("automation.parse_error", "path", p, "error", err.Error())
+			continue
+		}
+		if strings.TrimSpace(cfg.Name) == "" {
+			cfg.Name = strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
+		}
+		out = append(out, LoadedWorkflow{Config: cfg, Path: p})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
+// AutomationSlug turns a workflow name into a safe filename stem.
+func AutomationSlug(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(strings.TrimSpace(name)) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case r == ' ' || r == '.':
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		out = "automation"
+	}
+	return out
+}
+
+// SaveAutomation writes (or overwrites) one automation JSON and returns its
+// path. It validates the config first so the scheduler never loads a config
+// the daemon would reject.
+func SaveAutomation(cfg WorkflowConfig) (string, error) {
+	if strings.TrimSpace(cfg.Name) == "" {
+		return "", errors.New("automation: name is required")
+	}
+	if err := cfg.Validate(); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(AutomationsDir(), 0o755); err != nil {
+		return "", err
+	}
+	p := filepath.Join(AutomationsDir(), AutomationSlug(cfg.Name)+".json")
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(p, append(data, '\n'), 0o644); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+// DeleteAutomation removes one automation JSON by name.
+func DeleteAutomation(name string) error {
+	return os.Remove(filepath.Join(AutomationsDir(), AutomationSlug(name)+".json"))
+}
+
 // DefaultConfigFilePath returns the canonical path `goon workflow init`
 // writes to. The new default is ./workflow.json — repo-local, easy to
 // commit alongside the project. $GOON_WORKFLOW_FILE overrides if set so
@@ -437,6 +735,12 @@ func SaveDefault(path string) error {
 func starterConfig() WorkflowConfig {
 	cfg := DefaultConfig()
 	cfg.VerifyRuns = 3
+	// `goon workflow init` writes the default role-graph so the file matches
+	// what goon actually runs (LoadConfig injects the same graph when stages
+	// are omitted). The reviewer is the single human gate; flip auto_approve to
+	// let it approve automatically.
+	cfg.Description = "goon's default role-graph: execute → reviewer (human approval) → on approve fan out to open_pr + notify; on reject loop back through rework. The reviewer node is the only human checkpoint — set auto_approve=true (or env GOON_AUTO_APPROVE=1) to let the reviewer approve automatically for unattended runs."
+	cfg.Stages = BuiltinRoleGraph()
 	cfg.Hooks = map[string][]string{
 		HookBeforeTriage: {
 			"echo \"→ goon picked up {{.Key}} — {{.Title}}\"",

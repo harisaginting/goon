@@ -1,36 +1,46 @@
 {
   "version": 2,
   "name": "default",
-  "description": "The built-in engineering pipeline expressed as editable stages: triage → execute → verify. PR-opening and notify still run automatically (driven by pr_title_template + a configured git host). NOTE: custom stages bypass the confirm_repo / approve_plan approval gates — set auto_approve or re-add gates via a future stage type. Edit the prompts/tasks below to tune behavior.",
+  "description": "goon's default role-graph as editable stages: execute → reviewer (human approval) → on approve fan out to open_pr + notify; on reject loop back through rework. The reviewer is the only human gate (set auto_approve to skip it). Edit the prompts/tasks/wiring below to tune behaviour.",
   "branch_prefix": "goon/",
-  "test_command": "make test",
-  "verify_runs": 3,
   "pr_title_template": "[{{.Key}}] {{.Title}}",
-  "pr_body_template": "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
-  "extra_labels": ["auto"],
+  "pr_body_template": "Resolves {{.Key}}.\n\n## Plan\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened autonomously by goon 🤖",
+  "extra_labels": ["goon", "auto"],
   "stages": [
     {
-      "name": "triage",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.1,
-      "max_tokens": 800,
-      "prompt": "You are GOON's planner. Break this ticket into 3-7 ordered atomic engineering steps that an autonomous agent can do one-by-one. Each step must finish in <= 5 tool calls.\n\nReply with EXACTLY ONE JSON object: {\"steps\":[{\"title\":\"...\"}, ...]}.\nNo prose, no fences, no comments.\n\nTICKET:\nkey: {{.Key}}\ntitle: {{.Title}}\nproject: {{.Project}}"
-    },
-    {
       "name": "execute",
-      "type": "agent",
-      "task": "Implement ticket {{.Key}} ({{.Title}}). Plan:\n{{range .Stages.triage.steps}}- {{.title}}\n{{end}}"
+      "type": "executor",
+      "on_next": "review"
     },
     {
-      "name": "verify",
-      "type": "agent",
-      "repeat": 3,
-      "task": "Verify the implementation for ticket {{.Key}} ({{.Title}}) is correct. List any defects via finish."
+      "name": "review",
+      "type": "reviewer",
+      "mode": "human",
+      "task": "Review the executor's changes for {{.Key}} ({{.Title}}): correctness, regressions, missing edge cases.",
+      "on_approve": ["open_pr", "notify"],
+      "on_reject": "rework",
+      "max_loops": 3
+    },
+    {
+      "name": "rework",
+      "type": "loop",
+      "max_loops": 3,
+      "on_next": "execute",
+      "on_done": "end"
+    },
+    {
+      "name": "open_pr",
+      "type": "executor",
+      "do": "open_pr",
+      "on_next": "end"
+    },
+    {
+      "name": "notify",
+      "type": "notify",
+      "message": "✅ {{.Key}} approved — {{.Title}}{{if .PRURL}}\nPR: {{.PRURL}}{{end}}"
     }
   ],
   "hooks": {
-    "before_pr": ["go fmt ./...", "go vet ./..."],
-    "on_failure": ["echo 'workflow failed for {{.Key}}: $(date)' >> ~/.goon/failures.log"]
+    "before_pr": ["go fmt ./...", "go vet ./..."]
   }
 }

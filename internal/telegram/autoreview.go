@@ -24,6 +24,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/logx"
 	"github.com/harisaginting/goon/internal/review"
 )
@@ -105,7 +106,7 @@ func (b *Bot) autoPass(ctx context.Context) {
 	}
 	runner := review.New(review.Options{
 		Host:   b.opts.Host,
-		LLM:    b.opts.LLM,
+		LLM:    llm.NewForRoleOr(llm.RoleReview, b.opts.LLM),
 		Memory: b.opts.Memory,
 	})
 	if autoReviewEnabled() {

@@ -156,7 +156,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ctx = usage.WithLabel(ctx, "chat")
 	result, err := agentctx.ChatTurn(ctx, agentctx.ChatTurnOptions{
-		LLM:          s.opts.LLM,
+		LLM:          llm.NewForRoleOr(llm.RoleChat, s.opts.LLM),
 		Memory:       s.opts.Memory,
 		Board:        s.opts.Board,
 		Host:         s.opts.Host,

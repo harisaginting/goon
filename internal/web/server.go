@@ -24,8 +24,10 @@ import (
 	"github.com/harisaginting/goon/internal/boards"
 	"github.com/harisaginting/goon/internal/checkup"
 	"github.com/harisaginting/goon/internal/githost"
+	"github.com/harisaginting/goon/internal/google"
 	"github.com/harisaginting/goon/internal/llm"
 	"github.com/harisaginting/goon/internal/memory"
+	"github.com/harisaginting/goon/internal/repository"
 	"github.com/harisaginting/goon/internal/usage"
 	"github.com/harisaginting/goon/internal/util"
 	"github.com/harisaginting/goon/internal/workflow"
@@ -46,6 +48,14 @@ type Reconfigurable interface {
 // 5 minutes — long enough for users to assume it's broken).
 type Waker interface {
 	Wake()
+}
+
+// AutomationRunner is implemented by the daemon — the web "run now" button on a
+// scheduled automation calls RunAutomationNow(name) to fire it immediately,
+// ignoring its schedule. Optional: when the daemon doesn't implement it (or
+// isn't wired), the run-now button reports that the daemon isn't running.
+type AutomationRunner interface {
+	RunAutomationNow(name string)
 }
 
 // Options bundles dependencies for the Server.
@@ -159,6 +169,7 @@ func (s *Server) mux() *http.ServeMux {
 	// workflow without changing its board status. The daemon's
 	// nextTicket() filter respects the ignore set on every poll.
 	mux.HandleFunc("/api/tickets/clear", s.handleTicketsClear)
+	mux.HandleFunc("/api/ticket/pick", s.handleTicketPick)
 	mux.HandleFunc("/api/ticket/ignore", s.handleTicketIgnore)
 	mux.HandleFunc("/api/ticket/unignore", s.handleTicketUnignore)
 	// Local (goon-native) tickets — no external board required.
@@ -177,6 +188,7 @@ func (s *Server) mux() *http.ServeMux {
 	// Repo picker: list all repos visible to the token, save the
 	// selected subset into GOON_REVIEW_REPOS without restart.
 	mux.HandleFunc("/fragments/repos-picker", s.handleReposPicker)
+	mux.HandleFunc("/fragments/repo-add-list", s.handleRepoAddList)
 	// Repositories tab — repo-centric reframing of the old flat-PR view.
 	// /fragments/repositories renders the per-repo card list with PR
 	// counts + local-mapping status; /fragments/repo?slug=… lazy-loads
@@ -198,6 +210,11 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/api/files/tree", s.handleFilesTree)
 	mux.HandleFunc("/api/files/read", s.handleFilesRead)
 	mux.HandleFunc("/api/files/write", s.handleFilesWrite)
+	// In-browser agentic coding ("Code" tab). Pick a workdir, run the
+	// agent loop against a task, stream the transcript live. Executes
+	// commands + edits files — see internal/web/code.go for the safety
+	// guards (workdir whitelist, safety validator, step cap, timeout).
+	mux.HandleFunc("/api/code/run", s.handleCodeRun)
 	mux.HandleFunc("/htmx.min.js", s.handleHTMX)
 	// Brand. Served from a stable URL so favicon, og:image, and external
 	// links don't need to be updated when the file moves.
@@ -222,8 +239,16 @@ func (s *Server) mux() *http.ServeMux {
 	// workflowConfigChanged so the header re-renders with the new name.
 	mux.HandleFunc("/fragments/workflow-config", s.fragWorkflowConfig)
 	mux.HandleFunc("/api/workflow/save", s.handleWorkflowSave)
+	mux.HandleFunc("/fragments/automations", s.fragAutomations)
+	mux.HandleFunc("/api/automation/create", s.handleAutomationCreate)
+	mux.HandleFunc("/api/automation/toggle", s.handleAutomationToggle)
+	mux.HandleFunc("/api/automation/run", s.handleAutomationRun)
+	mux.HandleFunc("/api/automation/delete", s.handleAutomationDelete)
 	mux.HandleFunc("/fragments/config", s.fragConfig)
 	mux.HandleFunc("/fragments/setup", s.fragSetup)
+	mux.HandleFunc("/oauth/google/start", s.handleGoogleOAuthStart)
+	mux.HandleFunc("/oauth/google/callback", s.handleGoogleOAuthCallback)
+	mux.HandleFunc("/api/google/disconnect", s.handleGoogleDisconnect)
 	// Alias so the sidebar "Setup" tab can follow the same
 	// /fragments/tab-<name> convention every other tab uses. Some
 	// dev-tools fetches and at least one user-extension was hitting
@@ -276,6 +301,8 @@ func (s *Server) mux() *http.ServeMux {
 	mux.HandleFunc("/fragments/tab-skills", s.fragTabMemory)    // legacy → memory
 	// File browser tab composer (sidebar entry "Files").
 	mux.HandleFunc("/fragments/tab-files", s.fragTabFiles)
+	// Code tab composer (sidebar entry "Code") — agentic coding session.
+	mux.HandleFunc("/fragments/tab-code", s.fragTabCode)
 	return mux
 }
 
@@ -695,6 +722,10 @@ type configKey struct {
 // web package so we don't reach across boundaries. Keep them in sync.
 var webConfigKeys = []configKey{
 	{Name: "GOON_LLM_PROVIDER", Default: "openai", Group: "agent", Hint: "openai | anthropic | gemini | ollama | mock"},
+	{Name: "GOON_LLM_CHAT", Group: "agent", Hint: `per-role model for chat — "provider:model" | "provider" | "model" (empty = use default provider)`},
+	{Name: "GOON_LLM_PLAN", Group: "agent", Hint: `per-role model for triage/planning — e.g. "gemini:gemini-2.5-flash"`},
+	{Name: "GOON_LLM_CODE", Group: "agent", Hint: `per-role model for the execute agent (writes code) — e.g. "anthropic:claude-sonnet-4-5"`},
+	{Name: "GOON_LLM_REVIEW", Group: "agent", Hint: `per-role model for verify + PR-review drafts`},
 	{Name: "GOON_BOARD", Group: "agent", Hint: "jira | github | mock"},
 	{Name: "GOON_GIT_HOST", Group: "agent", Hint: "github | gitlab | bitbucket | mock (optional)"},
 	{Name: "GOON_POLL_SECONDS", Default: "300", Group: "agent"},
@@ -706,23 +737,14 @@ var webConfigKeys = []configKey{
 	{Name: "GOON_AUTO_CONFIRM_REPO", Group: "agent", Hint: "auto-skip the confirm_repo gate when triage picks a single repo already in REPOSITORY.md. 1/true to enable"},
 	{Name: "GOON_AUTO_APPROVE_PLAN", Group: "agent", Hint: "auto-accept the plan (keeps the repo gate) so your only actions are set-repo + approve-PR. 1/true to enable"},
 	{Name: "GOON_LLM_HTTP_TIMEOUT_SEC", Default: "120", Group: "agent", Hint: "per-request LLM timeout (seconds). Raise if your provider/proxy is slow and you see 'context deadline exceeded'."},
-	{Name: "GOOGLE_OAUTH_CLIENT_ID", Group: "agent", Hint: "Google OAuth client id (Desktop app). Then run `goon google auth` to connect Calendar/Tasks/Gmail/Logs."},
-	{Name: "GOOGLE_OAUTH_CLIENT_SECRET", Sensitive: true, Group: "agent", Hint: "Google OAuth client secret."},
-	{Name: "GOOGLE_OAUTH_REFRESH_TOKEN", Sensitive: true, Group: "agent", Hint: "set automatically by `goon google auth` — read-only Google access."},
+	{Name: "GOOGLE_OAUTH_CLIENT_ID", Group: "agent", Hint: "Google OAuth client id (Web application type). Paste here then click Connect Google in Setup."},
+	{Name: "GOOGLE_OAUTH_CLIENT_SECRET", Sensitive: true, Group: "agent", Hint: "Google OAuth client secret (from Google Cloud Console)."},
+	{Name: "GOOGLE_OAUTH_REFRESH_TOKEN", Sensitive: true, Group: "agent", Hint: "set automatically by the Connect Google button in Setup — do not edit manually."},
 	{Name: "GOOGLE_CLOUD_PROJECT", Group: "agent", Hint: "GCP project id for Cloud Logging (log search) queries."},
 	{Name: "GOON_WORKSPACE_DIR", Group: "agent", Hint: `parent directory holding multiple git repos — confirm_repo gate offers them as a numbered menu`},
-
-	// Model routing — override which provider+model is used per feature.
-	// Leave empty to use GOON_LLM_PROVIDER + that provider's MODEL env var.
-	{Name: "GOON_DEFAULT_MODEL", Group: "model_routing", Hint: "default model string when multiple providers are configured (e.g. gpt-4o, claude-opus-4-5)"},
-	{Name: "GOON_TRIAGE_PROVIDER", Group: "model_routing", Hint: "provider for triage + planning stages (openai|anthropic|gemini|ollama)"},
-	{Name: "GOON_TRIAGE_MODEL", Group: "model_routing", Hint: "model override for triage + planning"},
-	{Name: "GOON_EXECUTE_PROVIDER", Group: "model_routing", Hint: "provider for the execute agent stage"},
-	{Name: "GOON_EXECUTE_MODEL", Group: "model_routing", Hint: "model override for the execute agent stage"},
-	{Name: "GOON_CHAT_PROVIDER", Group: "model_routing", Hint: "provider for web/Telegram chat turns"},
-	{Name: "GOON_CHAT_MODEL", Group: "model_routing", Hint: "model override for chat turns"},
-	{Name: "GOON_REVIEW_PROVIDER", Group: "model_routing", Hint: "provider for PR review drafts"},
-	{Name: "GOON_REVIEW_MODEL", Group: "model_routing", Hint: "model override for PR review drafts"},
+	{Name: "GOON_MAX_STEPS", Default: "5", Group: "agent", Hint: "max tool-call steps the one-shot agent takes per task"},
+	{Name: "GOON_AUTO_APPROVE", Group: "agent", Hint: "skip ALL gates (repo + plan) for fully unattended runs. 1/true to enable — use with care"},
+	{Name: "GOON_LOG_LEVEL", Default: "info", Group: "agent", Hint: "debug | info | warn | error"},
 
 	{Name: "OPENAI_API_KEY", Sensitive: true, Group: "openai"},
 	{Name: "OPENAI_MODEL", Default: "gpt-4o-mini", Group: "openai"},
@@ -769,8 +791,27 @@ var webConfigKeys = []configKey{
 	{Name: "BITBUCKET_API_URL", Default: "https://api.bitbucket.org/2.0", Group: "bitbucket"},
 
 	{Name: "TELEGRAM_BOT_TOKEN", Sensitive: true, Group: "telegram"},
+	{Name: "GOON_TELEGRAM_SECRET", Sensitive: true, Group: "telegram", Hint: "passphrase a chat sends via /auth to authorize itself"},
 	{Name: "TELEGRAM_CHAT_ID", Group: "telegram"},
 	{Name: "TELEGRAM_API_BASE_URL", Default: "https://api.telegram.org", Group: "telegram"},
+	{Name: "GOON_AUTO_REVIEW", Group: "telegram", Hint: "auto-draft PR reviews for PRs awaiting you (Telegram). 1/true"},
+	{Name: "GOON_AUTO_NOTIFY", Group: "telegram", Hint: "forward new review-request / mention notifications. 1/true"},
+	{Name: "GOON_AUTO_INTERVAL", Group: "telegram", Hint: "how often the auto review/notify loop runs (e.g. 10m)"},
+	{Name: "GOON_REVIEW_REPOS", Group: "telegram", Hint: "comma-separated repos to scope proactive PR review to"},
+
+	{Name: "JIRA_JQL", Group: "jira", Hint: `JQL filter, e.g. project="EB" AND assignee=currentUser() — empty uses a sensible default`},
+
+	{Name: "GOON_OBSIDIAN_VAULT", Group: "obsidian", Hint: "absolute path to your Obsidian vault (enables obsidian_* chat tools)"},
+	{Name: "GOON_OBSIDIAN_REPO", Group: "obsidian", Hint: "optional git repo to sync the vault"},
+
+	// System paths — most users never change these; goon defaults to ./storage.
+	{Name: "GOON_STORAGE_DIR", Default: "./storage", Group: "system", Hint: "root for all goon state (logs, memory, pid)"},
+	{Name: "GOON_MEMORY_PATH", Group: "system", Hint: "override path for memory.json"},
+	{Name: "GOON_MEMORY_DIR", Group: "system", Hint: "override path for the memory/ notes folder"},
+	{Name: "GOON_LOG_FILE", Group: "system", Hint: "override path for goon.log"},
+	{Name: "GOON_PID_FILE", Group: "system", Hint: "override path for goon.pid"},
+	{Name: "GOON_WORKFLOW_FILE", Group: "system", Hint: "override path for workflow.json"},
+	{Name: "GOON_UPSTREAM", Group: "system", Hint: "git remote used by `goon update`"},
 }
 
 // handleAPIConfig serves both reads (GET) and writes (POST).
@@ -779,6 +820,67 @@ var webConfigKeys = []configKey{
 // POST /api/config  KEY=VAL ...→ form-encoded; writes to ~/.config/goon/.env, sets os.Setenv,
 //
 //	triggers daemon Reconfigure, and returns a fragment.
+// ── Google OAuth handlers ──────────────────────────────────────────────────
+
+// handleGoogleOAuthStart redirects the browser to Google's OAuth consent
+// screen. CLIENT_ID + CLIENT_SECRET must already be set in config.
+func (s *Server) handleGoogleOAuthStart(w http.ResponseWriter, r *http.Request) {
+	cfg := google.ConfigFromEnv()
+	if !cfg.HasClient() {
+		http.Error(w, "Set GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET in Setup first", http.StatusBadRequest)
+		return
+	}
+	redirectURI := "http://" + r.Host + "/oauth/google/callback"
+	authURL := google.AuthCodeURL(cfg.ClientID, redirectURI, google.PersonalScopes)
+	http.Redirect(w, r, authURL, http.StatusFound)
+}
+
+// handleGoogleOAuthCallback receives the authorization code from Google,
+// exchanges it for a refresh token, and saves it to config.json.
+func (s *Server) handleGoogleOAuthCallback(w http.ResponseWriter, r *http.Request) {
+	if errParam := r.URL.Query().Get("error"); errParam != "" {
+		// User denied access or something went wrong on Google's side.
+		http.Error(w, "Google OAuth error: "+errParam+"\n\nGo back to Setup and try again.", http.StatusBadRequest)
+		return
+	}
+	code := r.URL.Query().Get("code")
+	if code == "" {
+		http.Error(w, "Missing authorization code — please try again from Setup.", http.StatusBadRequest)
+		return
+	}
+	cfg := google.ConfigFromEnv()
+	if !cfg.HasClient() {
+		http.Error(w, "OAuth credentials missing — save CLIENT_ID and CLIENT_SECRET in Setup first.", http.StatusBadRequest)
+		return
+	}
+	redirectURI := "http://" + r.Host + "/oauth/google/callback"
+	hc := &http.Client{Timeout: 15 * time.Second}
+	refresh, _, err := google.ExchangeCode(r.Context(), hc, cfg, code, redirectURI)
+	if err != nil {
+		http.Error(w, "Token exchange failed: "+err.Error()+"\n\nCheck that the redirect URI is registered in Google Cloud Console.", http.StatusBadGateway)
+		return
+	}
+	if err := setConfigKey("GOOGLE_OAUTH_REFRESH_TOKEN", refresh); err != nil {
+		http.Error(w, "Failed to save token: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	// Apply immediately so the running process sees it without restart.
+	_ = os.Setenv("GOOGLE_OAUTH_REFRESH_TOKEN", refresh)
+	// Redirect back to the main app — Setup will now show "● connected".
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// handleGoogleDisconnect clears the stored refresh token.
+func (s *Server) handleGoogleDisconnect(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	_ = unsetConfigKey("GOOGLE_OAUTH_REFRESH_TOKEN")
+	_ = os.Unsetenv("GOOGLE_OAUTH_REFRESH_TOKEN")
+	http.Redirect(w, r, "/", http.StatusFound)
+}
+
 func (s *Server) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -872,7 +974,13 @@ func (s *Server) handleConfigVerify(w http.ResponseWriter, r *http.Request) {
 	override := map[string]string{}
 	for _, k := range webConfigKeys {
 		if vals, ok := r.Form[k.Name]; ok {
-			override[k.Name] = strings.TrimSpace(vals[0])
+			v := strings.TrimSpace(vals[0])
+			// Sensitive fields render as password inputs with an empty value
+			// (the mask is in the placeholder). Skip empty submissions so the
+			// probe falls back to os.Getenv and reads the real stored secret.
+			if v != "" {
+				override[k.Name] = v
+			}
 		}
 	}
 	all := checkup.RunWithEnvOverride(r.Context(), override)
@@ -941,15 +1049,10 @@ func configHumanLabel(name string) string {
 		"GITHUB_REPOS":         "GitHub Repos",
 		"GITHUB_LABEL":         "GitHub Label Filter",
 		"GITHUB_ASSIGNEE":      "GitHub Assignee Filter",
-		"GOON_DEFAULT_MODEL":   "Default Model",
-		"GOON_TRIAGE_PROVIDER": "Triage Provider",
-		"GOON_TRIAGE_MODEL":    "Triage Model",
-		"GOON_EXECUTE_PROVIDER": "Execute Provider",
-		"GOON_EXECUTE_MODEL":   "Execute Model",
-		"GOON_CHAT_PROVIDER":   "Chat Provider",
-		"GOON_CHAT_MODEL":      "Chat Model",
-		"GOON_REVIEW_PROVIDER": "Review Provider",
-		"GOON_REVIEW_MODEL":    "Review Model",
+		"GOON_LLM_CHAT":        "Chat model",
+		"GOON_LLM_PLAN":        "Plan / triage model",
+		"GOON_LLM_CODE":        "Code (execute) model",
+		"GOON_LLM_REVIEW":      "Review model",
 		"ATLASSIAN_BASE_URL":   "Atlassian URL",
 		"ATLASSIAN_EMAIL":      "Atlassian Email",
 		"ATLASSIAN_API_TOKEN":  "Atlassian API Token",
@@ -964,7 +1067,7 @@ func configHumanLabel(name string) string {
 // masked value as the placeholder so the user can see "something is set"
 // without the secret being in HTML. All output is Tailwind-classed for
 // the redesigned dashboard.
-func (s *Server) fragConfig(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) fragConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
 	// Current values for pre-selecting pickers.
@@ -972,11 +1075,17 @@ func (s *Server) fragConfig(w http.ResponseWriter, _ *http.Request) {
 	if llmProvider == "" {
 		llmProvider = "openai"
 	}
-	board   := envEcho("GOON_BOARD")
+	board := envEcho("GOON_BOARD")
 	gitHost := envEcho("GOON_GIT_HOST")
+
+	// rendered records every key surfaced by a curated section so the
+	// "advanced" block can show ALL remaining keys — guaranteeing every
+	// config value is editable in the UI and new keys never go missing.
+	rendered := map[string]bool{}
 
 	// Helper: render a labelled input row.
 	field := func(k configKey, rowClass string) string {
+		rendered[k.Name] = true
 		val := envEcho(k.Name)
 		disp, placeholder := "", ""
 		if k.Sensitive && val != "" {
@@ -1077,9 +1186,9 @@ function cfgToggleAdv(){
   btn.textContent=open?'show advanced ▾':'hide advanced ▴';
 }
 document.addEventListener('DOMContentLoaded',function(){
-  cfgPickLLM('` + llmProvider + `');
-  cfgPickBoard('` + board + `');
-  cfgPickHost('` + gitHost + `');
+  cfgPickLLM('`+llmProvider+`');
+  cfgPickBoard('`+board+`');
+  cfgPickHost('`+gitHost+`');
 });
 </script>`)
 
@@ -1277,70 +1386,268 @@ document.addEventListener('DOMContentLoaded',function(){
 		`</p>`
 	fmt.Fprint(w, card(step4))
 
-	// ── Step 5: Google Workspace (optional) ───────────────────────────────────
+	// ── Step 5: Google (optional) ─────────────────────────────────────────────
 	gConnected := envEcho("GOOGLE_OAUTH_REFRESH_TOKEN") != ""
 	gHasClient := envEcho("GOOGLE_OAUTH_CLIENT_ID") != "" && envEcho("GOOGLE_OAUTH_CLIENT_SECRET") != ""
-	gProject := envEcho("GOOGLE_CLOUD_PROJECT") != ""
 	var gPill string
 	switch {
 	case gConnected:
 		gPill = `<span class="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 px-2.5 py-0.5 text-[11px] font-semibold">● connected</span>`
 	case gHasClient:
-		gPill = `<span class="inline-flex items-center gap-1 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 px-2.5 py-0.5 text-[11px] font-semibold">○ client set — run goon google auth</span>`
+		gPill = `<span class="inline-flex items-center gap-1 rounded-full bg-amber-500/15 text-amber-700 dark:text-amber-400 px-2.5 py-0.5 text-[11px] font-semibold">○ credentials saved — click Connect below</span>`
 	default:
 		gPill = `<span class="inline-flex items-center gap-1 rounded-full bg-surface-sunken text-muted px-2.5 py-0.5 text-[11px] font-semibold">○ not connected</span>`
 	}
-	logsPill := ""
-	if gConnected && !gProject {
-		logsPill = `<span class="inline-flex items-center gap-1 rounded-full bg-surface-sunken text-muted px-2.5 py-0.5 text-[11px]">log search needs a project id ↓</span>`
-	}
+	// Derive the OAuth redirect URI from the current request host so we can
+	// show it in the instructions — users must register this exact URI in Google Cloud.
+	gRedirectURI := "http://" + r.Host + "/oauth/google/callback"
 	step5 := `<div class="flex items-start gap-3 mb-3">
 		<span class="shrink-0 w-6 h-6 rounded-full bg-accent/15 text-accent text-[11px] font-bold flex items-center justify-center">5</span>
-		<div class="flex-1"><div class="flex items-center gap-2 flex-wrap"><p class="text-sm font-semibold text-ink">Google Workspace</p>` + gPill + logsPill + `</div>
-		<p class="text-xs text-muted">Ask goon about your Calendar, Tasks, Gmail &amp; Cloud Logging — read-only. Optional.</p></div></div>`
+		<div class="flex-1"><div class="flex items-center gap-2 flex-wrap"><p class="text-sm font-semibold text-ink">Google (Gmail + Calendar)</p>` + gPill + `</div>
+		<p class="text-xs text-muted">Read-only access to your personal Gmail and Google Calendar. Optional — connect once, use forever.</p></div></div>`
+	// Credential fields (CLIENT_ID + SECRET).
 	step5 += `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">` +
 		field(keyByName("GOOGLE_OAUTH_CLIENT_ID"), "") +
 		field(keyByName("GOOGLE_OAUTH_CLIENT_SECRET"), "") +
-		field(keyByName("GOOGLE_CLOUD_PROJECT"), "") +
 		`</div>`
-	step5 += `<div class="rounded-lg border border-surface-border bg-surface-sunken/50 p-3 text-[11px] text-muted space-y-1.5">
-		<p class="font-semibold text-ink">Connect (one-time)</p>
-		<p>1. Create an OAuth <strong>Desktop app</strong> client in Google Cloud, paste the ID + secret above, and <strong>save &amp; apply</strong>.</p>
-		<p>2. In your terminal, run <code class="font-mono text-ink bg-surface px-1 py-0.5 rounded">goon google auth</code> and approve access in the browser.</p>
-		<p>Optional: set <span class="font-mono text-ink">GOOGLE_CLOUD_PROJECT</span> to enable log search. Full click-by-click guide: <span class="font-mono text-ink">docs/google-workspace.md</span></p>
-	</div>`
+	// Connect / Disconnect button.
+	if gConnected {
+		step5 += `<div class="flex items-center gap-3 pt-1">` +
+			`<span class="text-[11px] text-emerald-700 dark:text-emerald-400 font-semibold">✓ Google account connected</span>` +
+			`<form method="post" action="/api/google/disconnect" class="inline">` +
+			`<button type="submit" class="text-[11px] text-rose-600 dark:text-rose-400 underline underline-offset-2 bg-transparent border-0 cursor-pointer p-0">disconnect</button>` +
+			`</form></div>`
+	} else if gHasClient {
+		step5 += `<div class="pt-1">` +
+			`<a href="/oauth/google/start" class="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-[13px] font-semibold text-white shadow hover:bg-accent-strong transition-colors">` +
+			`<svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>` +
+			`Connect Google Account</a></div>`
+	} else {
+		step5 += `<p class="text-[11px] text-muted pt-1">Save your Client ID + Secret above first, then the Connect button will appear.</p>`
+	}
+	// Setup instructions.
+	step5 += `<details class="mt-3"><summary class="text-[11px] text-muted cursor-pointer select-none hover:text-ink">How to get credentials (one-time, free)</summary>` +
+		`<div class="rounded-lg border border-surface-border bg-surface-sunken/50 p-3 text-[11px] text-muted space-y-1.5 mt-2">` +
+		`<p class="font-semibold text-ink">Google Cloud setup (5 min, free)</p>` +
+		`<p>1. Go to <strong>console.cloud.google.com</strong> → create a project.</p>` +
+		`<p>2. APIs &amp; Services → <strong>Enable</strong> Gmail API + Google Calendar API.</p>` +
+		`<p>3. OAuth consent screen → External → Testing → add your Gmail as test user.</p>` +
+		`<p>4. Credentials → <strong>Create OAuth 2.0 Client ID</strong> → type: <strong>Web application</strong>.</p>` +
+		`<p>5. Add this Authorized redirect URI: <code class="font-mono text-ink bg-surface px-1 py-0.5 rounded select-all">` + html.EscapeString(gRedirectURI) + `</code></p>` +
+		`<p>6. Copy Client ID + Secret here → Save &amp; Apply → click <strong>Connect Google Account</strong>.</p>` +
+		`<p class="text-[10px] opacity-70">Uses your personal @gmail.com account. Free forever in Testing mode. Read-only: Gmail + Calendar.</p>` +
+		`</div></details>`
 	gExamples := []string{
 		"what meetings do I have today?",
-		"what are my tasks?",
 		"check my email from finance last week",
-		"get the traceId for the login of username harisa",
+		"any unread emails from my boss?",
 	}
-	step5 += `<div class="flex flex-wrap gap-1.5 pt-1">`
+	step5 += `<div class="flex flex-wrap gap-1.5 pt-2">`
 	for _, ex := range gExamples {
 		step5 += `<span class="rounded-full border border-surface-border bg-surface px-2.5 py-1 text-[11px] text-muted">&ldquo;` + html.EscapeString(ex) + `&rdquo;</span>`
 	}
 	step5 += `</div>`
 	fmt.Fprint(w, card(step5))
 
-	// ── Advanced (collapsed) ──────────────────────────────────────────────────
-	advKeys := []string{
-		"GOON_POLL_SECONDS", "GOON_VERIFY_RUNS", "GOON_DAEMON_AUTO_START",
-		"GOON_TICKET_STATUSES", "GOON_WORKSPACE_DIR", "GOON_AUTO_APPROVE",
-		"GOON_AUTO_CONFIRM_REPO", "GOON_AUTO_APPROVE_PLAN", "GOON_LLM_HTTP_TIMEOUT_SEC",
-		"TELEGRAM_BOT_TOKEN", "GOON_TELEGRAM_SECRET", "TELEGRAM_CHAT_ID",
-		"CONFLUENCE_BASE_URL", "CONFLUENCE_EMAIL", "CONFLUENCE_API_TOKEN",
-		"GOON_OBSIDIAN_VAULT", "GOON_OBSIDIAN_REPO",
-		"GOON_MAX_STEPS", "GOON_LOG_LEVEL",
+	// ── Step 6: Models per role (optional) ────────────────────────────────────
+
+	// Compute the effective default model string from GOON_LLM_PROVIDER + its
+	// model key, so the UI can show "currently using: openai:gpt-4o-mini".
+	providerDefaultModel := func(p string) string {
+		switch p {
+		case "openai":
+			m := envEcho("OPENAI_MODEL")
+			if m == "" {
+				m = "gpt-4o-mini"
+			}
+			return "openai:" + m
+		case "anthropic":
+			m := envEcho("ANTHROPIC_MODEL")
+			if m == "" {
+				m = "claude-sonnet-4-5"
+			}
+			return "anthropic:" + m
+		case "gemini":
+			m := envEcho("GEMINI_MODEL")
+			if m == "" {
+				m = "gemini-2.5-flash"
+			}
+			return "gemini:" + m
+		case "ollama":
+			m := envEcho("OLLAMA_MODEL")
+			if m == "" {
+				m = "llama3"
+			}
+			return "ollama:" + m
+		}
+		if p != "" {
+			return p
+		}
+		return "openai:gpt-4o-mini"
 	}
-	advHTML := `<div id="cfg-advanced" style="display:none" class="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-3 border-t border-surface-border">`
-	for _, name := range advKeys {
-		advHTML += field(keyByName(name), "")
+	defaultModel := providerDefaultModel(llmProvider)
+
+	// Build datalist suggestions from whichever providers have keys configured.
+	type modelOpt struct{ val, label string }
+	var modelOpts []modelOpt
+	seen6 := map[string]bool{}
+	addOpt := func(val, label string) {
+		if !seen6[val] {
+			seen6[val] = true
+			modelOpts = append(modelOpts, modelOpt{val, label})
+		}
+	}
+	if envEcho("OPENAI_API_KEY") != "" || llmProvider == "openai" {
+		om := envEcho("OPENAI_MODEL")
+		if om == "" {
+			om = "gpt-4o-mini"
+		}
+		addOpt("openai:"+om, "OpenAI — "+om+" (your model)")
+		addOpt("openai:gpt-4o-mini", "OpenAI — gpt-4o-mini")
+		addOpt("openai:gpt-4o", "OpenAI — gpt-4o")
+		addOpt("openai:o3-mini", "OpenAI — o3-mini")
+	}
+	if envEcho("ANTHROPIC_API_KEY") != "" || llmProvider == "anthropic" {
+		am := envEcho("ANTHROPIC_MODEL")
+		if am == "" {
+			am = "claude-sonnet-4-5"
+		}
+		addOpt("anthropic:"+am, "Anthropic — "+am+" (your model)")
+		addOpt("anthropic:claude-sonnet-4-5", "Anthropic — claude-sonnet-4-5")
+		addOpt("anthropic:claude-haiku-4-5-20251001", "Anthropic — claude-haiku (fast/cheap)")
+	}
+	if envEcho("GEMINI_API_KEY") != "" || envEcho("GOOGLE_API_KEY") != "" || llmProvider == "gemini" {
+		gm := envEcho("GEMINI_MODEL")
+		if gm == "" {
+			gm = "gemini-2.5-flash"
+		}
+		addOpt("gemini:"+gm, "Gemini — "+gm+" (your model)")
+		addOpt("gemini:gemini-2.5-flash", "Gemini — gemini-2.5-flash")
+		addOpt("gemini:gemini-2.5-pro", "Gemini — gemini-2.5-pro")
+	}
+	if llmProvider == "ollama" || envEcho("OLLAMA_BASE_URL") != "" {
+		olm := envEcho("OLLAMA_MODEL")
+		if olm == "" {
+			olm = "llama3"
+		}
+		addOpt("ollama:"+olm, "Ollama — "+olm+" (your model)")
+	}
+	dlID6 := "cfg-model-datalist"
+	dlHTML6 := `<datalist id="` + dlID6 + `">`
+	for _, o := range modelOpts {
+		dlHTML6 += fmt.Sprintf(`<option value="%s">%s</option>`, html.EscapeString(o.val), html.EscapeString(o.label))
+	}
+	dlHTML6 += `</datalist>`
+
+	// roleField renders a role input with a live "currently using" badge and
+	// the datalist for dropdown suggestions.
+	roleField := func(roleKey, roleLabel, roleDesc string) string {
+		rendered[roleKey] = true
+		val := envEcho(roleKey)
+		eff := defaultModel
+		if val != "" {
+			eff = val
+		}
+		badgeText := "default: " + eff
+		badgeCls := "text-[10px] text-muted"
+		if val != "" {
+			badgeCls = "text-[10px] text-accent font-semibold"
+			badgeText = eff
+		}
+		badge := fmt.Sprintf(`<span class="%s font-mono">%s</span>`, badgeCls, html.EscapeString(badgeText))
+		inputCls := "w-full font-mono text-sm rounded-md border border-surface-border bg-surface px-3 py-1.5 focus:border-accent focus:ring-1 focus:ring-accent/30 focus:outline-none text-ink"
+		return fmt.Sprintf(
+			`<div class="space-y-1">`+
+				`<div class="flex items-baseline justify-between gap-2">`+
+				`<label for="cfg-%s" class="text-xs font-medium text-ink shrink-0">%s`+
+				`<span class="font-normal text-muted ml-1">%s</span></label>`+
+				badge+
+				`</div>`+
+				`<input id="cfg-%s" type="text" name="%s" value="%s"`+
+				` placeholder="empty = %s" autocomplete="off" list="%s" class="%s">`+
+				`</div>`,
+			html.EscapeString(roleKey),
+			html.EscapeString(roleLabel),
+			html.EscapeString(roleDesc),
+			html.EscapeString(roleKey),
+			html.EscapeString(roleKey),
+			html.EscapeString(val),
+			html.EscapeString(defaultModel),
+			dlID6,
+			inputCls)
+	}
+
+	step6 := sectionHead("6", "Models per role",
+		"Route each job to a different model. Leave empty to use the provider from Step 1.")
+	step6 += dlHTML6
+	step6 += `<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">` +
+		roleField("GOON_LLM_CODE", "Code", "execute agent — writes &amp; edits files") +
+		roleField("GOON_LLM_CHAT", "Chat", "web &amp; Telegram chat") +
+		roleField("GOON_LLM_PLAN", "Plan", "ticket triage &amp; planning") +
+		roleField("GOON_LLM_REVIEW", "Review", "verify + PR-review drafts") +
+		`</div>` +
+		`<p class="text-[11px] text-muted mt-1">Format: <span class="font-mono text-ink">provider:model</span> · <span class="font-mono text-ink">provider</span> · or bare <span class="font-mono text-ink">model</span>. Each provider uses its own API key from Step 1.</p>`
+	fmt.Fprint(w, card(step6))
+
+	// The three picker values are saved via hidden inputs, not field(), so
+	// mark them rendered too — otherwise the advanced block would duplicate
+	// them as raw text boxes.
+	rendered["GOON_LLM_PROVIDER"] = true
+	rendered["GOON_BOARD"] = true
+	rendered["GOON_GIT_HOST"] = true
+
+	// ── Advanced (collapsed) — EVERY config key not already shown above ───────
+	// Built from webConfigKeys minus what the curated sections rendered, so
+	// no config value is ever un-editable in the UI (and a newly-added key
+	// shows up here automatically). Grouped by area, with friendly headers.
+	groupTitles := map[string]string{
+		"agent": "Daemon & agent", "openai": "OpenAI", "anthropic": "Anthropic",
+		"gemini": "Gemini", "ollama": "Ollama", "atlassian": "Atlassian (shared)",
+		"jira": "Jira", "confluence": "Confluence", "github": "GitHub",
+		"gitlab": "GitLab", "bitbucket": "Bitbucket", "telegram": "Telegram",
+		"obsidian": "Obsidian", "system": "System paths",
+	}
+	groupOrder := []string{"agent", "openai", "anthropic", "gemini", "ollama",
+		"atlassian", "jira", "confluence", "github", "gitlab", "bitbucket",
+		"telegram", "obsidian", "system"}
+	byGroup := map[string][]configKey{}
+	for _, k := range webConfigKeys {
+		if rendered[k.Name] {
+			continue
+		}
+		byGroup[k.Group] = append(byGroup[k.Group], k)
+	}
+	advHTML := `<div id="cfg-advanced" style="display:none" class="space-y-4 pt-3 border-t border-surface-border">`
+	seen := map[string]bool{}
+	emit := func(g string) {
+		keys := byGroup[g]
+		if len(keys) == 0 || seen[g] {
+			return
+		}
+		seen[g] = true
+		title := groupTitles[g]
+		if title == "" {
+			title = g
+		}
+		advHTML += `<div><p class="text-[11px] font-semibold uppercase tracking-wider text-muted mb-2">` + html.EscapeString(title) + `</p>` +
+			`<div class="grid grid-cols-1 sm:grid-cols-2 gap-3">`
+		for _, k := range keys {
+			advHTML += field(k, "")
+		}
+		advHTML += `</div></div>`
+	}
+	for _, g := range groupOrder {
+		emit(g)
+	}
+	// Any group not in the known order (future-proofing) renders last.
+	for g := range byGroup {
+		emit(g)
 	}
 	advHTML += `</div>`
 
 	advSection := `<div class="rounded-xl border border-surface-border bg-surface-raised p-4">` +
 		`<button type="button" id="cfg-adv-btn" onclick="cfgToggleAdv()" ` +
-		`class="text-xs text-muted hover:text-ink transition font-medium">show advanced ▾</button>` +
+		`class="text-xs text-muted hover:text-ink transition font-medium">show all settings ▾</button>` +
 		advHTML + `</div>`
 	fmt.Fprint(w, advSection)
 
@@ -1370,10 +1677,30 @@ document.addEventListener('DOMContentLoaded',function(){
 // drag/select bugs. Branching/routing lives under an "Advanced" section per
 // step so beginners never see it. The backend save path, data model, starter
 // templates, and validation are unchanged.
-func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) fragWorkflowConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	cfg := s.opts.Workflow
 	path := s.opts.WorkflowPath
+
+	// ?file=<slug> opens a scheduled automation in the same island editor.
+	// The slug is sanitised + confined to the automations dir (no traversal),
+	// and the editor saves back to that file (not the active pipeline).
+	autoMode := false
+	if slug := strings.TrimSpace(r.URL.Query().Get("file")); slug != "" {
+		ap := filepath.Join(workflow.AutomationsDir(), workflow.AutomationSlug(slug)+".json")
+		if data, err := os.ReadFile(ap); err == nil {
+			var ac workflow.WorkflowConfig
+			if json.Unmarshal(data, &ac) == nil {
+				cfg = &ac
+				path = ap
+				autoMode = true
+			}
+		}
+		if !autoMode {
+			fmt.Fprint(w, `<div class="rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">Automation not found. <button type="button" class="underline" hx-get="/fragments/tab-workflows" hx-target="closest [data-page]" hx-swap="innerHTML">← back to Workflows</button></div>`)
+			return
+		}
+	}
 
 	name := "default"
 	desc := "Built-in pipeline (no workflow.json found)."
@@ -1400,6 +1727,16 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
 	branchLabel := ""
 	if branchPrefix != "" {
 		branchLabel = fmt.Sprintf(`<span class="text-[11px] font-mono text-muted/80">%s</span>`, html.EscapeString(branchPrefix))
+	}
+
+	// When editing an automation, a back bar returns to the Workflows tab and
+	// names what's being edited + its schedule.
+	if autoMode {
+		fmt.Fprintf(w, `<div class="mb-2 flex items-center gap-2 text-xs">
+			<button type="button" class="inline-flex items-center gap-1 rounded-md border border-surface-border text-muted px-2 py-1 hover:border-accent hover:text-accent transition" hx-get="/fragments/tab-workflows" hx-target="closest [data-page]" hx-swap="innerHTML">
+				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>back to Workflows</button>
+			<span class="text-muted">editing automation <b class="text-ink">%s</b> · <span class="font-mono">%s</span></span>
+		</div>`, html.EscapeString(cfg.Name), html.EscapeString(cfg.Trigger.ScheduleHint()))
 	}
 
 	// ── Header band ──────────────────────────────────────────────────────
@@ -1429,36 +1766,6 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
 		html.EscapeString(desc),
 	)
 
-	// ── Stage flowchart (compact, read-only) ─────────────────────────────
-	var stageNames []string
-	gateSet := map[string]bool{"confirm_repo": true, "approve_plan": true}
-	if cfg != nil && len(cfg.Stages) > 0 {
-		for _, st := range cfg.Stages {
-			stageNames = append(stageNames, st.Name)
-		}
-	} else {
-		stageNames = []string{"triage", "confirm_repo", "approve_plan", "execute", "test", "verify", "update_memory", "open_pr", "notify"}
-	}
-
-	fmt.Fprint(w, `<div class="px-5 pb-4 overflow-x-auto">
-	<div class="flex items-center gap-0 min-w-max">`)
-	for i, stage := range stageNames {
-		if i > 0 {
-			fmt.Fprint(w, `<div class="flex items-center shrink-0"><div class="w-5 h-px bg-surface-border"></div><svg class="h-2.5 w-2.5 text-surface-border" viewBox="0 0 10 10" fill="currentColor"><polygon points="0,2 8,5 0,8"/></svg></div>`)
-		}
-		isGate := gateSet[stage]
-		shape := "rounded-full"
-		icon := `<svg class="h-3 w-3" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="4"/></svg>`
-		tone := "bg-surface-sunken border-surface-border text-muted"
-		if isGate {
-			shape = "rounded-md"
-			icon = `<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>`
-			tone = "bg-amber-500/10 border-amber-500/40 text-amber-700 dark:text-amber-400"
-		}
-		fmt.Fprintf(w, `<div class="shrink-0 flex flex-col items-center gap-1.5"><div class="w-8 h-8 %s %s border flex items-center justify-center">%s</div><span class="text-[10px] text-muted text-center whitespace-nowrap max-w-[56px] leading-tight">%s</span></div>`,
-			shape, tone, icon, html.EscapeString(stage))
-	}
-	fmt.Fprint(w, `</div></div>`)
 	fmt.Fprint(w, `</div>`) // close outer card
 
 	// ── Prepare JS data ───────────────────────────────────────────────────
@@ -1493,6 +1800,48 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
 <!-- Workflow step-list editor overlay — fixed, full-screen, hidden until "edit pipeline" -->
 <div id="wf-graph-overlay" class="fixed inset-0 z-[100] flex flex-col hidden bg-surface text-ink">
 
+	<style>
+	/* Graph-canvas editor styles. Pure CSS so re-renders are free. */
+	#wg-canvas { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab;
+		background-color: #2E8FC9;
+		background-image: radial-gradient(rgb(255 255 255 / 0.16) 1.5px, transparent 1.7px);
+		background-size: 26px 26px; }
+	#wg-canvas.wg-panning { cursor: grabbing; }
+	#wg-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
+	#wg-world .wg-step, #wg-world .wg-life { transition: box-shadow 150ms, border-color 150ms;
+		box-shadow: 0 8px 16px -10px rgb(0 0 0 / 0.5); }
+	#wg-world .wg-step:hover { box-shadow: 0 14px 30px -8px rgb(0 0 0 / 0.45); }
+	#wg-world .wg-step.wg-sel { box-shadow: 0 0 0 3px #FFD66B, 0 16px 34px -8px rgb(0 0 0 / 0.55); }
+	#wg-world .wg-dragging { z-index: 30; cursor: grabbing;
+		box-shadow: 0 18px 40px -12px rgb(0 0 0 / 0.5); }
+	#wg-edges { position: absolute; left: 0; top: 0; width: 8px; height: 8px; overflow: visible; pointer-events: none; }
+	#wg-edges path { pointer-events: stroke; cursor: pointer; }
+	#wg-edges path#wg-ghost { pointer-events: none; }
+	.wg-edge { fill: none; stroke-linecap: round; stroke-dasharray: 9 6; animation: wgDash 1s linear infinite; }
+	.wg-edge-case { fill: none; stroke: rgb(13 27 42 / 0.55); pointer-events: none; }
+	.wg-edge-sel { filter: drop-shadow(0 0 4px rgb(var(--c-accent))); }
+	/* fat invisible hit area so thin wires are easy to click + select */
+	.wg-hit { fill: none; stroke: transparent; stroke-width: 18; cursor: pointer; }
+	/* delete badge shown on the selected wire */
+	#wg-edges .wg-del { pointer-events: auto; cursor: pointer; }
+	#wg-edges .wg-del circle:hover { fill: rgb(244 63 94 / 0.18); }
+	@keyframes wgDash { to { stroke-dashoffset: -15; } }
+	.wg-port { position: absolute; width: 11px; height: 11px; border-radius: 9999px; z-index: 12;
+		border: 2px solid rgb(var(--c-muted)); background: rgb(var(--c-surface));
+		cursor: crosshair; transition: transform 120ms; }
+	.wg-port:hover { transform: scale(1.4); }
+	.wg-pal-item { cursor: grab; transition: transform 120ms, border-color 120ms; }
+	.wg-pal-item:hover { transform: translateY(-1px); }
+	#wg-pal-ghost { position: fixed; z-index: 200; pointer-events: none; opacity: 0.9; }
+	.wg-fade { animation: wgFade 180ms ease-out both; }
+	@keyframes wgFade { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+	@media (prefers-reduced-motion: reduce) {
+		.wg-edge { animation: none; }
+		.wg-port, .wg-pal-item, .wg-pal-item:hover { transition: none; transform: none; }
+		.wg-fade { animation: none; }
+	}
+	</style>
+
 	<!-- Top bar -->
 	<div class="flex items-center gap-3 px-4 py-2.5 border-b border-surface-border bg-surface-raised shrink-0">
 		<div class="flex items-center gap-2 min-w-0">
@@ -1509,9 +1858,10 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
 				undo
 			</button>
 			<button onclick="wgClose()" class="text-xs text-muted hover:text-ink px-3 py-1.5 rounded-md hover:bg-surface-sunken transition">cancel</button>
-			<button onclick="wgSave()" class="inline-flex items-center gap-1.5 rounded-md bg-accent text-black px-4 py-1.5 text-xs font-bold hover:brightness-110 transition">
+			<button onclick="wgSave()" id="wg-save-btn" title="Save (Ctrl+S)" class="relative inline-flex items-center gap-1.5 rounded-md bg-accent text-black px-4 py-1.5 text-xs font-bold hover:brightness-110 transition">
 				<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-				Save pipeline
+				Save Workflow
+				<span id="wg-dirty-dot" class="hidden absolute -top-1 -right-1 h-2.5 w-2.5 rounded-full bg-amber-400 ring-2 ring-surface" title="Unsaved changes"></span>
 			</button>
 		</div>
 	</div>
@@ -1533,9 +1883,19 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, _ *http.Request) {
 		You're editing the <strong>built-in pipeline</strong>. Saving turns it into a custom step pipeline — the two approval gates become automatic (toggle <em>auto-approve</em> in Settings); PR-opening and notify still run for you. Hit <strong>revert to built-in</strong> any time to restore the original.
 	</div>
 
-	<!-- Scrollable body -->
-	<div class="flex-1 overflow-y-auto">
-		<div id="wg-body" class="max-w-3xl mx-auto px-4 py-6"></div>
+	<!-- Body: node palette (left) + graph canvas (center) + step editor panel
+	     (right; stacks below on small screens). The panel edits whichever node
+	     is selected on the canvas — selection never rebuilds canvas DOM. -->
+	<div class="flex-1 min-h-0 flex flex-col lg:flex-row">
+		<div id="wg-palette" class="shrink-0 flex flex-row lg:flex-col gap-2 lg:gap-0 items-center lg:items-stretch overflow-x-auto lg:overflow-x-visible lg:w-56 border-b lg:border-b-0 lg:border-r border-surface-border bg-surface-raised/40 px-3 py-2 lg:py-3">
+			<input id="wg-pal-search" type="search" placeholder="Search nodes…" oninput="wgPalFilter(this.value)"
+				class="hidden lg:block w-full mb-3 text-xs rounded-md border border-surface-border bg-surface-sunken px-2 py-1.5 text-ink focus:border-accent focus:outline-none">
+			<div class="hidden lg:block text-[9px] uppercase tracking-widest text-muted font-semibold mb-2">Steps</div>
+			<div id="wg-pal-items" class="flex flex-row lg:flex-col gap-2 min-w-max lg:min-w-0"></div>
+			<div class="hidden lg:block mt-3 text-[10px] text-muted leading-relaxed">Drag onto the canvas to add a node, or click to append.<br><br>Drag from a port to wire a branch · click a wire and press Delete to remove it.</div>
+		</div>
+		<div class="flex-1 min-h-0 relative" id="wg-body"></div>
+		<div id="wg-panel" class="hidden shrink-0 lg:w-[400px] max-h-[45vh] lg:max-h-none min-h-0 overflow-y-auto border-t lg:border-t-0 lg:border-l border-surface-border bg-surface-raised/40"></div>
 	</div>
 </div>`)
 
@@ -1562,24 +1922,45 @@ var HOOK_PHASES = ['before_triage','before_execute','after_execute','before_test
 
 // ── Stage type metadata (single source of truth) ─────────────────────
 var TYPES = {
-	llm: { label:'LLM', letter:'L', color:'#f59e0b', short:'One model call',
-		blurb:'Runs your prompt through the model ONCE and returns the reply (optionally parsed as JSON). No file access, no tools — fast and cheap.',
-		when:'Use for: planning, classifying, drafting, or turning a ticket into structured JSON the next step reads.',
-		example:'Break this ticket into 3-7 steps. Reply JSON {"steps":[...]}.' },
-	agent: { label:'Agent', letter:'A', color:'#38bdf8', short:'Autonomous, uses tools',
-		blurb:'Runs goon\'s full agent loop: reads/edits files, runs commands, searches code, and keeps going until it finishes.',
-		when:'Use for: the actual work — implement a feature, refactor, fix a bug, verify a change.',
-		example:'Implement the plan for {{.Key}} and run the tests.' },
-	notify: { label:'Notify', letter:'N', color:'#22c55e', short:'Send a message',
+	analyst: { label:'Analyst', letter:'A', color:'#f59e0b', short:'Answers questions (ask target)',
+		blurb:'A knowledge node other nodes ASK. It answers using the repo context and any URLs you give it; the asking node then re-runs with the answer. It never routes forward on its own.',
+		when:'Use for: a Product Owner / domain consultant the implementers and reviewers can consult.',
+		example:'Answer the team question about scope and acceptance criteria.',
+		ports:[] },
+	executor: { label:'Executor', letter:'E', color:'#6366F1', short:'Does the work (implementer)',
+		blurb:'Runs goon\'s agent loop inside the repo: reads/edits files, runs commands, opens the PR. Emits NEXT when done, or ASK to consult the analyst.',
+		when:'Use for: the implementers — architect, backend engineer — and the open-PR step (set do = open_pr).',
+		example:'Implement the change for {{.Key}} and run the tests.',
+		ports:[{port:'ask',label:'ASK',color:'#F59E0B'},{port:'next',label:'NEXT',color:'#6366F1'}] },
+	reviewer: { label:'Reviewer', letter:'R', color:'#8B5CF6', short:'Reviews + gates (approve/reject)',
+		blurb:'Judges the executor\'s work. mode=human shows a person a change summary to APPROVE or REJECT; mode=llm decides automatically. APPROVE advances (fan-out); REJECT routes back, usually to a loop.',
+		when:'Use for: code review, security review, QA sign-off.',
+		example:'Review {{.Key}} for correctness and regressions.',
+		ports:[{port:'ask',label:'ASK',color:'#F59E0B'},{port:'approve',label:'APPROVE',color:'#10B981'},{port:'reject',label:'REJECT',color:'#F43F5E'}] },
+	loop: { label:'Loop', letter:'↻', color:'#F43F5E', short:'Bounded rework loop',
+		blurb:'Routing node, no model call. Each arrival jumps back to its LOOP target until max loops is reached, then it exits via DONE.',
+		when:'Use for: rework cycles — wire a reviewer REJECT here and the LOOP port back to the implementer, capped at N rounds.',
+		example:'max loops: 3 → body runs at most 3 times',
+		ports:[{port:'next',label:'LOOP',color:'#F43F5E'},{port:'done',label:'DONE',color:'#10B981'}] },
+	notify: { label:'Notify', letter:'N', color:'#10B981', short:'Send a message',
 		blurb:'Sends a message to your configured Telegram channel. Stored output = the message text.',
-		when:'Use for: pinging yourself mid-pipeline — e.g. after a risky step.',
-		example:'Heads up: {{.Key}} passed review and is ready to ship.' },
-	http: { label:'HTTP', letter:'H', color:'#a855f7', short:'Fetch a URL',
-		blurb:'Fetches an https URL (GET) and captures the response text, so a later step can use it via {{.Stages.NAME}}. (POST/webhooks: use an agent step.)',
-		when:'Use for: pulling in a status page, a spec, or a JSON API before reasoning about it.',
-		example:'https://api.example.com/status' }
+		when:'Use for: announcing a shipped PR or pinging mid-pipeline.',
+		example:'{{.Key}} shipped — {{.Title}}',
+		ports:[{port:'next',label:'NEXT',color:'#6366F1'}] }
 };
-function typeMeta(t){ return TYPES[t] || {label:(t||'?').toUpperCase(), letter:'?', color:'#8b5cf6', blurb:'', when:'', example:''}; }
+function typeMeta(t){ return TYPES[t] || {label:(t||'?').toUpperCase(), letter:'?', color:'#6366F1', blurb:'', when:'', example:'', ports:[{port:'ask',label:'ASK',color:'#F59E0B'},{port:'next',label:'NEXT',color:'#6366F1'}]}; }
+// on_approve may be a string or an array (fan-out) — normalize, like on_next.
+function approveList(p){
+	if(!p||p.on_approve==null||p.on_approve==='') return [];
+	if(Object.prototype.toString.call(p.on_approve)==='[object Array]') return p.on_approve.slice();
+	return [String(p.on_approve)];
+}
+function setApproveList(st,arr){
+	st.props=st.props||{};
+	if(!arr.length){ delete st.props.on_approve; }
+	else if(arr.length===1){ st.props.on_approve=arr[0]; }
+	else { st.props.on_approve=arr; }
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 function clone(o){ return o==null?o:JSON.parse(JSON.stringify(o)); }
@@ -1603,20 +1984,56 @@ function typeHelpBlock(t){
 }
 function stepPreview(st){
 	var p=st.props||{};
-	var v = st.type==='agent'?p.task : st.type==='notify'?p.message : st.type==='http'?p.url : p.prompt;
+	if(st.type==='loop'){ return 'max '+(p.max_loops||3)+' loops'+(p.on_done?(' · done → '+p.on_done):''); }
+	if(st.type==='executor'&&p.do){ return 'built-in: '+p.do; }
+	var v = (st.type==='executor'||st.type==='reviewer')?p.task : st.type==='notify'?p.message : p.prompt;
 	v=(v||'').replace(/\s+/g,' ').trim();
 	if(v.length>72) v=v.slice(0,71)+'…';
 	return v;
 }
+// on_next may be a string (legacy) or an array (fan-out) — normalize.
+function nextList(p){
+	if(!p||p.on_next==null||p.on_next==='') return [];
+	if(Object.prototype.toString.call(p.on_next)==='[object Array]') return p.on_next.slice();
+	return [String(p.on_next)];
+}
+function setNextList(st,arr){
+	st.props=st.props||{};
+	if(!arr.length){ delete st.props.on_next; }
+	else if(arr.length===1){ st.props.on_next=arr[0]; }
+	else { st.props.on_next=arr; }
+}
+
+// ── Inline SVG icons (consistent outline family — no emoji) ──────────
+var ICONS={
+	grip:'<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="6" r="1.6"/><circle cx="15" cy="6" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="18" r="1.6"/><circle cx="15" cy="18" r="1.6"/></svg>',
+	up:'<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg>',
+	down:'<svg class="h-3 w-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>',
+	copy:'<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+	trash:'<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>',
+	chevR:'<svg class="h-3.5 w-3.5 transition-transform duration-150" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>',
+	chevD:'<svg class="h-3.5 w-3.5 transition-transform duration-150" style="transform:rotate(90deg)" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 18l6-6-6-6"/></svg>',
+	ship:'<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>'
+};
+
+// ── Dirty state — amber dot on Save, guard on close ──────────────────
+var _dirty=false;
+function setDirty(v){
+	_dirty=v;
+	var d=document.getElementById('wg-dirty-dot');
+	if(d) d.classList.toggle('hidden', !v);
+}
 
 // ── Undo ─────────────────────────────────────────────────────────────
 var _history=[], _MAX_HISTORY=60;
-function pushHistory(){ _history.push({STEPS:clone(STEPS), selId:selId, CFG:clone(CFG)}); if(_history.length>_MAX_HISTORY) _history.shift(); updUndoBtn(); }
+function pushHistory(){ setDirty(true); _history.push({STEPS:clone(STEPS), selId:selId, CFG:clone(CFG)}); if(_history.length>_MAX_HISTORY) _history.shift(); updUndoBtn(); }
 function updUndoBtn(){ var b=document.getElementById('wg-undo-btn'); if(b) b.disabled=(_history.length===0); }
 window.wgUndo=function(){ if(!_history.length) return; var s=_history.pop(); STEPS=s.STEPS; selId=s.selId; CFG=s.CFG; renderAll(); updUndoBtn(); };
 
 // ── Tabs + top-level render ──────────────────────────────────────────
 window.wgTab=function(which){ tab=which; renderAll(); };
+window.wgTogglePalette=function(){ window._palHidden=!window._palHidden; var p=document.getElementById('wg-palette'); if(p) p.style.display=(tab==='steps'&&!window._palHidden)?'':'none'; };
+window.wgTogglePanel=function(){ window._panelHidden=!window._panelHidden; renderPanel(); };
 function setTabUI(){
 	var on='text-ink border-accent bg-surface-sunken/40';
 	var off='text-muted border-transparent hover:text-ink';
@@ -1624,101 +2041,762 @@ function setTabUI(){
 	if(ts) ts.className='px-4 py-2 text-[12px] font-semibold rounded-t-md border-b-2 transition '+(tab==='steps'?on:off);
 	if(tw) tw.className='px-4 py-2 text-[12px] font-semibold rounded-t-md border-b-2 transition '+(tab==='settings'?on:off);
 }
-function renderAll(){ setTabUI(); if(tab==='settings'){ renderSettings(document.getElementById('wg-body')); } else { renderSteps(); } }
+function renderAll(){
+	setTabUI();
+	var pal=document.getElementById('wg-palette');
+	if(pal) pal.style.display=(tab==='steps'&&!window._palHidden)?'':'none';
+	if(tab==='settings'){
+		var body=document.getElementById('wg-body');
+		if(body){
+			body.innerHTML='<div class="absolute inset-0 overflow-y-auto"><div id="wg-settings" class="px-6 py-6"></div></div>';
+			renderSettings(document.getElementById('wg-settings'));
+		}
+		renderPanel();
+	} else {
+		renderSteps();
+	}
+}
 
-// ── Steps list ───────────────────────────────────────────────────────
+// ── Graph canvas — free 2D node editor ───────────────────────────────
+// Nexus-style canvas: pan/zoom world, nodes at arbitrary positions with
+// typed ports (ask / next / reject), bezier wires you create by dragging
+// from a port onto another node, Start/Finish lifecycle nodes, a minimap,
+// and a palette you drag node types from. STEPS array order stays the
+// engine's spine (implicit "next" wires); explicit wires write the
+// on_next / on_reject / ask_stage props. Layout persists per-pipeline in
+// localStorage. CRITICAL (history): selection must NEVER rebuild node
+// DOM mid-pointer interaction — wgSelectStep only toggles classes.
+var NODE_W=232, NODE_H=86, LIFE_W=132, LIFE_H=48;
+var WORLD={x:60,y:40,k:1};
+var NODEPOS={};   // node id (or '__start'/'__finish') -> {x,y} world coords
+var selEdge=null; // selected explicit wire key, deletable via Delete key
+var MODE=null;    // active pointer interaction: pan | node | port | pal
+
+function posStoreKey(){ return 'goon-wg-pos:'+_savePath; }
+function loadSavedPos(){ try{ return JSON.parse(localStorage.getItem(posStoreKey())||'{}'); }catch(err){ return {}; } }
+function persistPos(){
+	try{
+		var o={};
+		STEPS.forEach(function(s){ var p=NODEPOS[s.id]; if(p&&s.name) o[s.name]={x:Math.round(p.x),y:Math.round(p.y)}; });
+		['__start','__finish'].forEach(function(k){ if(NODEPOS[k]) o[k]={x:Math.round(NODEPOS[k].x),y:Math.round(NODEPOS[k].y)}; });
+		localStorage.setItem(posStoreKey(), JSON.stringify(o));
+	}catch(err){}
+}
+function spinePos(i){ return {x:40+LIFE_W+60+i*(NODE_W+52), y:250}; }
+// autoLayout: forward spine in a row, analysts floated ABOVE it, loops BELOW
+// it, Start at the left and Finish at the right — readable, room for wires.
+function autoLayout(){
+	var COLW=NODE_W+120, ROWY=320, baseX=210;
+	var byName={}; STEPS.forEach(function(s,j){ byName[s.name]=j; });
+	var order=[], seen={}, cur=STEPS[0], guard=0;
+	while(cur && guard<STEPS.length+2){ guard++; if(seen[cur.id]) break; seen[cur.id]=true; order.push(cur); var pr=cur.props||{}; var nx=nextList(pr)[0]; if(!nx) nx=approveList(pr)[0]; if(!nx||nx==='end'||byName[nx]==null) break; cur=STEPS[byName[nx]]; }
+	var spine=[];
+	order.forEach(function(s){ if(s.type!=='analyst'&&s.type!=='loop') spine.push(s); });
+	STEPS.forEach(function(s){ if(s.type!=='analyst'&&s.type!=='loop'&&spine.indexOf(s)<0) spine.push(s); });
+	var pos={};
+	spine.forEach(function(s,i){ pos[s.id]={x:baseX+i*COLW, y:ROWY}; });
+	var midX=baseX+(Math.max(0,spine.length-1)/2)*COLW;
+	var an=STEPS.filter(function(s){return s.type==='analyst';});
+	var lp=STEPS.filter(function(s){return s.type==='loop';});
+	an.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(an.length-1)/2)*COLW), y:ROWY-215}; });
+	lp.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(lp.length-1)/2)*COLW), y:ROWY+225}; });
+	pos.__start={x:baseX-LIFE_W-60, y:ROWY+(NODE_H-LIFE_H)/2};
+	pos.__finish={x:baseX+spine.length*COLW, y:ROWY+(NODE_H-LIFE_H)/2};
+	return pos;
+}
+function ensureLayout(){
+	var saved=loadSavedPos(), auto=autoLayout();
+	var shared=(CFG&&CFG.layout)||{}; // positions shared inside workflow.json win
+	if(!NODEPOS.__start) NODEPOS.__start=shared.__start||saved.__start||auto.__start||{x:30,y:289};
+	STEPS.forEach(function(s){ if(!NODEPOS[s.id]) NODEPOS[s.id]=(s.name&&shared[s.name])||(s.name&&saved[s.name])||auto[s.id]||{x:210,y:320}; });
+	if(!NODEPOS.__finish) NODEPOS.__finish=shared.__finish||saved.__finish||auto.__finish||{x:700,y:289};
+}
+
 function renderSteps(){
 	var body=document.getElementById('wg-body');
 	if(!body) return;
-	var h='';
-
+	renderPalette();
+	ensureLayout();
+	var h='<div id="wg-canvas" class="select-none">';
+	h+='<div id="wg-world">';
+	h+='<svg id="wg-edges" aria-hidden="true"></svg>';
+	h+=lifeNode('__start');
+	STEPS.forEach(function(st,i){ h+=graphNode(st,i); });
+	h+=lifeNode('__finish');
+	h+='</div>';
+	// floating toolbar
+	var tb='inline-flex items-center justify-center h-7 min-w-7 px-1.5 rounded text-xs text-muted hover:text-ink hover:bg-surface-sunken transition';
+	h+='<div class="absolute left-3 top-3 z-20 flex items-center gap-0.5 rounded-lg border border-surface-border bg-surface-raised/95 px-1 py-0.5 shadow-card">';
+	h+='<button type="button" onclick="wgZoomBtn(1)" title="Zoom in" aria-label="Zoom in" class="'+tb+'">+</button>';
+	h+='<button type="button" onclick="wgZoomBtn(-1)" title="Zoom out" aria-label="Zoom out" class="'+tb+'">&minus;</button>';
+	h+='<button type="button" onclick="wgFit()" title="Fit view" class="'+tb+'">fit</button>';
+	h+='<button type="button" onclick="wgTidy()" title="Auto-arrange nodes" class="'+tb+'">tidy</button>';
+	h+='<span class="w-px h-4 mx-0.5" style="background:rgb(var(--c-border))"></span>';
+	h+='<button type="button" onclick="wgTogglePalette()" title="Hide / show steps panel (left)" aria-label="Toggle left panel" class="'+tb+'">◧</button>';
+	h+='<button type="button" onclick="wgTogglePanel()" title="Hide / show editor panel (right)" aria-label="Toggle right panel" class="'+tb+'">◨</button>';
+	h+='</div>';
 	if(STEPS.length===0){
-		h+='<div class="rounded-xl border border-dashed border-surface-border bg-surface-raised/40 p-8 text-center">'
-		  +'<div class="text-2xl mb-2">🧩</div>'
-		  +'<div class="text-sm font-medium text-ink">No steps yet</div>'
-		  +'<div class="text-xs text-muted mt-1 mb-4">A pipeline is a list of steps that run top to bottom. Add your first one.</div>'
-		  +'</div>';
-	} else {
-		h+='<ol id="wg-step-list" class="space-y-2">';
-		STEPS.forEach(function(st,i){ h+=stepCard(st,i); });
-		h+='</ol>';
+		h+='<div class="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 z-10 rounded-xl border border-dashed border-surface-border bg-surface-raised/80 px-5 py-4 text-center pointer-events-none">'
+		  +'<svg class="h-7 w-7 text-muted mx-auto mb-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>'
+		  +'<div class="text-xs text-muted">Drag a step from the palette onto the canvas.</div></div>';
 	}
-
-	// Add-step zone (always visible — the obvious way to add multiple steps).
-	h+='<div class="mt-4 rounded-xl border border-surface-border bg-surface-raised/60 p-3">'
-	  +'<div class="text-[10px] uppercase tracking-widest text-muted font-semibold mb-2 px-1">Add a step</div>'
-	  +'<div class="grid grid-cols-2 sm:grid-cols-4 gap-2">';
-	Object.keys(TYPES).forEach(function(k){
-		var m=TYPES[k];
-		h+='<button type="button" onclick="wgAddStep(\''+k+'\')" title="'+escX(m.blurb)+'"'
-		  +' class="text-left rounded-lg border border-surface-border bg-surface-raised px-3 py-2.5 hover:bg-surface-sunken transition" style="border-left:3px solid '+m.color+'">'
-		  +'<div class="flex items-center gap-2 mb-0.5"><span class="w-5 h-5 rounded flex items-center justify-center text-[10px] font-black" style="background:'+m.color+'22;color:'+m.color+'">'+escX(m.letter)+'</span>'
-		  +'<span class="text-[12px] font-semibold" style="color:'+m.color+'">'+escX(m.label)+'</span></div>'
-		  +'<div class="text-[10px] text-muted leading-snug">'+escX(m.short)+'</div></button>';
-	});
-	h+='</div></div>';
-
+	h+='<div id="wg-mini" class="absolute bottom-3 right-3 z-20 w-44 h-28 rounded-lg border border-surface-border bg-surface-raised/95 shadow-card overflow-hidden"></div>';
+	h+='</div>';
 	body.innerHTML=h;
-	bindStepDrag();
-	// Fill the expanded step's editor (single source of truth — callers just
-	// set selId + renderSteps()). Only runs on structural re-renders, never on
-	// text-input keystrokes, so it can't steal focus mid-typing.
-	if(selId){ var be=document.getElementById('wg-body-'+selId); if(be) renderStageProps(stepById(selId), be); }
+	bindCanvas();
+	applyWorld();
+	wgDrawEdges();
+	renderMini();
+	renderPanel();
 }
 
-function stepCard(st,i){
-	var m=typeMeta(st.type);
-	var expanded=(st.id===selId);
+// roleGlyph returns the island's icon SVG for a node role (the open_pr
+// executor becomes a treasure chest — the shipped PR). currentColor is the
+// glyph colour; the caller sets it via the badge's style.
+var GLYPH_MAG='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6"/><line x1="15" y1="15" x2="20" y2="20"/></svg>';
+var GLYPH_LOOP='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 6"/><path d="M20 4v6h-6"/></svg>';
+var GLYPH_SHIP='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/><circle cx="12" cy="16" r="1.5" fill="currentColor"/></svg>';
+var GLYPH_USER='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 3.6-7 8-7s8 3 8 7"/></svg>';
+var GLYPH_GEAR='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M1 12h4M19 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>';
+var GLYPH_BELL='<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>';
+function roleGlyph(t,ship){
+	if(ship) return GLYPH_SHIP;
+	if(t==='analyst') return GLYPH_USER;
+	if(t==='executor') return GLYPH_GEAR;
+	if(t==='notify') return GLYPH_BELL;
+	if(t==='reviewer') return GLYPH_MAG;
+	if(t==='loop') return GLYPH_LOOP;
+	return '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>';
+}
+// SHIP_SVG is goon's voyage ship (from the landing page), scaled + centred on
+// its origin so animateMotion can sail it along the spine path.
+var SHIP_SVG='<g transform="translate(-15.6,-13) scale(0.13)">'
+	+'<line x1="120" y1="22" x2="120" y2="128" stroke="#6B4426" stroke-width="9" stroke-linecap="round"/>'
+	+'<path d="M120 30 L120 96 L66 90 Q88 62 66 36 Z" fill="#FBF2DF" stroke="#1E2433" stroke-width="7" stroke-linejoin="round"/>'
+	+'<path d="M120 22 L162 32 L120 44 Z" fill="#E24B4A" stroke="#1E2433" stroke-width="6" stroke-linejoin="round"/>'
+	+'<path d="M34 128 L206 128 L182 168 Q120 180 58 168 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="7" stroke-linejoin="round"/>'
+	+'</g>';
+function graphNode(st,i){
+	var m=typeMeta(st.type), on=(st.id===selId);
+	var p=NODEPOS[st.id]||spinePos(i);
 	var preview=stepPreview(st);
-	var h='<li class="wg-step rounded-xl border bg-surface-raised overflow-hidden transition '+(expanded?'border-accent/60 shadow-lg':'border-surface-border')+'" data-id="'+st.id+'">';
-	// Header (click to expand)
-	h+='<div class="flex items-center gap-2.5 px-2 py-2.5 cursor-pointer select-none hover:bg-surface-sunken/40" onclick="wgToggleStep(\''+st.id+'\')">';
-	h+='<span class="wg-drag cursor-grab text-muted hover:text-ink px-1 select-none" data-drag="'+st.id+'" title="Drag to reorder" onclick="event.stopPropagation()">⠿</span>';
-	h+='<span class="w-5 text-center text-[11px] font-mono text-muted">'+(i+1)+'</span>';
-	h+='<span class="w-6 h-6 rounded-md flex items-center justify-center text-[11px] font-black shrink-0" style="background:'+m.color+'22;color:'+m.color+'">'+escX(m.letter)+'</span>';
-	h+='<div class="flex-1 min-w-0">';
-	h+='<div class="text-[13px] font-semibold text-ink truncate"><span data-stepname="'+st.id+'">'+escX(st.name||'(unnamed)')+'</span> <span class="text-[10px] font-normal text-muted">· '+escX(m.label.toLowerCase())+'</span></div>';
-	if(preview) h+='<div class="text-[11px] text-muted truncate font-mono">'+escX(preview)+'</div>';
+	// Each node is a sandy ISLAND (tan body, dark outline) with a role glyph
+	// and a sea-blue shoreline along the bottom — matching goon's voyage-map
+	// art. Decorative layer is clipped to the rounded shape; ports sit OUTSIDE
+	// it (direct children) so they are never clipped.
+	var isShip=!!(st.type==='executor' && st.props && st.props.do==='open_pr');
+	var glyphCol=isShip?'#8A5A33':m.color;
+	var h='<div class="wg-step absolute cursor-grab '+(on?'wg-sel':'')+'"'
+	  +' data-id="'+st.id+'" tabindex="0" role="button"'
+	  +' aria-label="Step '+(i+1)+': '+escX(st.name||'unnamed')+' ('+escX(m.label)+')"'
+	  +' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();wgSelectStep(\''+st.id+'\');}"'
+	  +' style="left:'+p.x+'px;top:'+p.y+'px;width:'+NODE_W+'px;height:'+NODE_H+'px;background:#EFD9A0;border:3px solid #1E2433;border-radius:20px">';
+	h+='<div class="absolute inset-0 pointer-events-none" style="border-radius:17px;overflow:hidden">';
+	h+='<svg class="absolute inset-x-0 bottom-0 w-full" height="13" viewBox="0 0 '+NODE_W+' 13" preserveAspectRatio="none" aria-hidden="true"><path d="M0 8 Q '+(NODE_W/8)+' 2 '+(NODE_W/4)+' 8 T '+(NODE_W/2)+' 8 T '+(NODE_W*3/4)+' 8 T '+NODE_W+' 8 V13 H0 Z" fill="#2E8FC9"></path></svg>';
 	h+='</div>';
-	// Reorder + actions (stopPropagation so they don't toggle expand)
-	h+='<div class="flex items-center gap-0.5 shrink-0" onclick="event.stopPropagation()">';
-	h+='<button onclick="wgMoveStep(\''+st.id+'\',-1)" '+(i===0?'disabled':'')+' class="p-1.5 rounded text-muted hover:text-ink hover:bg-surface-border disabled:opacity-25 disabled:hover:bg-transparent" title="Move up">▲</button>';
-	h+='<button onclick="wgMoveStep(\''+st.id+'\',1)" '+(i===STEPS.length-1?'disabled':'')+' class="p-1.5 rounded text-muted hover:text-ink hover:bg-surface-border disabled:opacity-25 disabled:hover:bg-transparent" title="Move down">▼</button>';
-	h+='<button onclick="wgDuplicateStep(\''+st.id+'\')" class="p-1.5 rounded text-muted hover:text-accent-strong hover:bg-surface-border" title="Duplicate">⧉</button>';
-	h+='<button onclick="wgDeleteStep(\''+st.id+'\')" class="p-1.5 rounded text-muted hover:text-rose-400 hover:bg-surface-border" title="Delete">🗑</button>';
-	h+='<span class="px-1 text-muted text-xs">'+(expanded?'▾':'▸')+'</span>';
+	h+='<div class="relative flex items-start gap-2 px-2.5 pt-2 pointer-events-none">';
+	h+='<span class="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style="background:#FBF2DF;color:'+glyphCol+';border:2.5px solid #1E2433">'+roleGlyph(st.type,isShip)+'</span>';
+	h+='<div class="flex-1 min-w-0 pr-11">';
+	h+='<div class="text-[14px] font-bold truncate" style="color:#1E2433" data-stepname="'+st.id+'">'+escX(st.name||'(unnamed)')+'</div>';
+	h+='<div class="text-[9.5px] uppercase tracking-wider font-bold" style="color:'+glyphCol+'">'+escX(isShip?'ship · open PR':m.label)+'</div>';
+	if(preview) h+='<div class="text-[10px] truncate font-mono mt-0.5" style="color:#1E2433;opacity:.7">'+escX(preview)+'</div>';
 	h+='</div></div>';
-	// Body (only built when expanded)
-	if(expanded){
-		h+='<div class="border-t border-surface-border px-4 py-3" id="wg-body-'+st.id+'"></div>';
-	}
-	h+='</li>';
+	h+='<div class="absolute left-2.5 bottom-1 text-[9px] font-mono pointer-events-none" style="color:#1E2433;opacity:.5;z-index:1">'+(i+1)+'</div>';
+	// ports: input (left) + typed outputs (right). Normal steps get
+	// ask/next/reject; loop nodes get LOOP (the body, repeats) + DONE
+	// (the exit once max loops is spent). NEXT supports several wires —
+	// drop on more nodes to fan out.
+	var inLoop=(st.type==='loop');
+	h+='<span class="wg-port" data-node="'+st.id+'" data-port="in" style="'+(inLoop?'right:-7px;top:18px':'left:-7px;top:'+(NODE_H/2-6)+'px')+'" title="arrival"></span>';
+	// ports are data-driven per role (TYPES[type].ports): executor ask+next,
+	// reviewer ask+approve+reject, loop loop+done, notify next, analyst none.
+	var PORTY={ask:14, next:NODE_H/2-6, approve:NODE_H/2-6, reject:NODE_H-26, done:NODE_H-26};
+	(m.ports||[]).forEach(function(pc){
+		var active=false;
+		if(pc.port==='next') active=nextList(st.props).length>0;
+		else if(pc.port==='approve') active=approveList(st.props).length>0;
+		else if(pc.port==='ask') active=!!(st.props&&st.props.ask);
+		else if(pc.port==='reject') active=!!(st.props&&st.props.on_reject);
+		else if(pc.port==='done') active=!!(st.props&&st.props.on_done);
+		var pTop=PORTY[pc.port], pSide='r';
+		if(st.type==='loop'){ if(pc.port==='next'){ pSide='l'; pTop=NODE_H/2-6; } else if(pc.port==='done'){ pTop=NODE_H-26; } }
+		h+=outPort(st.id, pc.port, pTop, pc.label, pc.color, active, pSide);
+	});
+	h+='</div>';
+	return h;
+}
+function outPort(id,port,top,label,col,active,side){
+	var L=(side==='l'), dotPos=L?'left:-7px':'right:-7px', lblPos=L?'left:9px':'right:9px';
+	return '<span class="wg-port" data-node="'+id+'" data-port="'+port+'" title="Drag to wire: '+label.toLowerCase()
+	  +'" style="'+dotPos+';top:'+top+'px;border-color:'+col+(active?';background:'+col:'')+'"></span>'
+	  +'<span class="absolute pointer-events-none font-bold" style="'+lblPos+';top:'+(top-1)+'px;font-size:7px;color:'+col+'">'+label+'</span>';
+}
+function lifeNode(id){
+	var start=(id==='__start');
+	var p=NODEPOS[id]||{x:0,y:0};
+	var col=start?'#6366F1':'#10B981';
+	var icon=start
+		?'<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>'
+		:'<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>';
+	var h='<div class="wg-life absolute rounded-lg border-2 border-surface-border bg-surface-raised cursor-grab" data-life="'+id+'"'
+	  +' style="left:'+p.x+'px;top:'+p.y+'px;width:'+LIFE_W+'px;height:'+LIFE_H+'px">';
+	h+='<div class="flex items-center gap-2 px-2.5 h-full pointer-events-none">';
+	h+='<span class="w-6 h-6 rounded-md flex items-center justify-center shrink-0" style="background:'+col+'22;color:'+col+'">'+icon+'</span>';
+	h+='<div class="min-w-0"><div class="text-[11px] font-semibold text-ink">'+(start?'Start':'Finish')+'</div><div class="text-[8px] uppercase tracking-wider text-muted">lifecycle</div></div>';
+	h+='</div>';
+	if(start){ h+='<span class="wg-port" data-node="__start" data-port="start" title="Drag to choose the first step" style="right:-7px;top:'+(LIFE_H/2-6)+'px;border-color:#6366F1"></span>'; }
+	else { h+='<span class="wg-port" data-node="__finish" data-port="in" style="left:-7px;top:'+(LIFE_H/2-6)+'px;border-color:#10B981" title="end of pipeline"></span>'; }
+	h+='</div>';
 	return h;
 }
 
-window.wgToggleStep=function(id){
-	selId=(selId===id)?null:id;
+// Selection — class toggles only, never a DOM rebuild (see note above).
+window.wgSelectStep=function(id){
+	if(selEdge){ selEdge=null; wgDrawEdges(); }
+	if(selId!==id){
+		var prev=document.querySelector('.wg-step[data-id="'+selId+'"]');
+		if(prev){ prev.classList.remove('wg-sel'); }
+		selId=id;
+		var cur=document.querySelector('.wg-step[data-id="'+id+'"]');
+		if(cur){ cur.classList.add('wg-sel'); }
+	}
+	renderPanel();
+};
+window.wgDeselect=function(){ selId=null; renderSteps(); };
+
+// ── World transform helpers ──────────────────────────────────────────
+function applyWorld(){
+	var w=document.getElementById('wg-world');
+	var cv=document.getElementById('wg-canvas');
+	if(w) w.style.transform='translate('+WORLD.x+'px,'+WORLD.y+'px) scale('+WORLD.k+')';
+	if(cv){
+		var g=22*WORLD.k;
+		cv.style.backgroundSize=g+'px '+g+'px';
+		cv.style.backgroundPosition=WORLD.x+'px '+WORLD.y+'px';
+	}
+}
+function worldFromClient(cx,cy){
+	var cv=document.getElementById('wg-canvas');
+	var r=cv.getBoundingClientRect();
+	return { x:(cx-r.left-WORLD.x)/WORLD.k, y:(cy-r.top-WORLD.y)/WORLD.k };
+}
+window.wgZoomBtn=function(dir){
+	var cv=document.getElementById('wg-canvas'); if(!cv) return;
+	zoomAt(cv.clientWidth/2, cv.clientHeight/2, dir>0?1.2:1/1.2);
+};
+function zoomAt(px,py,factor){
+	var k2=Math.min(2.5, Math.max(0.3, WORLD.k*factor));
+	WORLD.x=px-(px-WORLD.x)*(k2/WORLD.k);
+	WORLD.y=py-(py-WORLD.y)*(k2/WORLD.k);
+	WORLD.k=k2;
+	applyWorld(); renderMini();
+}
+function graphBBox(){
+	var xs=[],ys=[],xe=[],ye=[];
+	Object.keys(NODEPOS).forEach(function(id){
+		var p=NODEPOS[id]; if(!p) return;
+		var w=(id==='__start'||id==='__finish')?LIFE_W:NODE_W;
+		var hh=(id==='__start'||id==='__finish')?LIFE_H:NODE_H;
+		xs.push(p.x); ys.push(p.y); xe.push(p.x+w); ye.push(p.y+hh);
+	});
+	if(!xs.length) return {x:0,y:0,w:600,h:400};
+	var x0=Math.min.apply(null,xs), y0=Math.min.apply(null,ys);
+	return {x:x0, y:y0, w:Math.max.apply(null,xe)-x0, h:Math.max.apply(null,ye)-y0};
+}
+window.wgHome=function(){
+	var cv=document.getElementById('wg-canvas'); if(!cv) return;
+	var b=graphBBox();
+	// Open at a READABLE zoom: fit to width but never below 0.72, anchored near
+	// the start so the first islands are legible (pan / minimap for the rest).
+	var k=Math.min((cv.clientWidth-90)/Math.max(b.w,1), 1.0);
+	WORLD.k=Math.max(0.72, k);
+	WORLD.x=90 - b.x*WORLD.k;
+	WORLD.y=(cv.clientHeight-b.h*WORLD.k)/2 - b.y*WORLD.k;
+	applyWorld(); renderMini();
+};
+window.wgFit=function(){
+	var cv=document.getElementById('wg-canvas'); if(!cv) return;
+	var b=graphBBox();
+	var k=Math.min((cv.clientWidth-100)/Math.max(b.w,1), (cv.clientHeight-100)/Math.max(b.h,1), 1.15);
+	WORLD.k=Math.max(0.5, k);
+	WORLD.x=(cv.clientWidth-b.w*WORLD.k)/2 - b.x*WORLD.k;
+	WORLD.y=(cv.clientHeight-b.h*WORLD.k)/2 - b.y*WORLD.k;
+	applyWorld(); renderMini();
+};
+window.wgTidy=function(){
+	try{ localStorage.removeItem(posStoreKey()); }catch(err){}
+	NODEPOS={};
 	renderSteps();
-	if(selId){
-		var bodyEl=document.getElementById('wg-body-'+selId);
-		if(bodyEl) renderStageProps(stepById(selId), bodyEl);
-		// Scroll the expanded card into view.
-		var card=document.querySelector('.wg-step[data-id="'+selId+'"]');
-		if(card) card.scrollIntoView({block:'nearest', behavior:'smooth'});
+	wgFit();
+};
+function wgCenterOn(id){
+	var cv=document.getElementById('wg-canvas'); var p=NODEPOS[id];
+	if(!cv||!p) return;
+	WORLD.x=cv.clientWidth/2-(p.x+NODE_W/2)*WORLD.k;
+	WORLD.y=cv.clientHeight/2-(p.y+NODE_H/2)*WORLD.k;
+	applyWorld(); renderMini();
+}
+
+// ── Wires ────────────────────────────────────────────────────────────
+function edgeDefs(){
+	function mk(id,col){ return '<marker id="wg-arr-'+id+'" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M 0 1 L 8 5 L 0 9 z" style="fill:'+col+'"></path></marker>'; }
+	return '<defs>'+mk('seq','rgb(var(--c-muted) / 0.8)')+mk('next','rgb(var(--c-accent))')+mk('reject','rgb(244 63 94 / 0.9)')+mk('ask','rgb(245 158 11 / 0.9)')+mk('approve','rgb(34 197 94 / 0.9)')+mk('loop','rgb(244 63 94 / 0.9)')+mk('done','rgb(34 197 94 / 0.9)')+'</defs>';
+}
+function edgeColor(kind,sel){
+	if(kind==='reject'||kind==='loop') return sel?'rgb(244 63 94)':'rgb(244 63 94 / 0.7)';
+	if(kind==='ask')    return sel?'rgb(245 158 11)':'rgb(245 158 11 / 0.3)';
+	if(kind==='approve'||kind==='done') return sel?'rgb(34 197 94)':'rgb(34 197 94 / 0.75)';
+	if(kind==='next')   return sel?'rgb(var(--c-accent))':'rgb(var(--c-accent) / 0.8)';
+	return 'rgb(var(--c-muted) / 0.5)';
+}
+function edgeKey(e){ return e.src+'|'+(e.prop||'seq')+'|'+e.dst; }
+function edgeList(){
+	var L=[]; var byName={}; STEPS.forEach(function(s,j){ byName[s.name]=j; });
+	if(STEPS.length){ L.push({src:'__start',port:'start',dst:STEPS[0].id,kind:'seq'}); }
+	else { L.push({src:'__start',port:'start',dst:'__finish',kind:'seq'}); }
+	STEPS.forEach(function(st,i){
+		var p=st.props||{};
+		var mp=typeMeta(st.type);
+		function hasPort(pn){ return (mp.ports||[]).some(function(x){ return x.port===pn; }); }
+		var isLoop=(st.type==='loop');
+		// next / loop-body — only nodes with a NEXT/LOOP port (executor, notify, loop)
+		if(hasPort('next')){
+			var nxts=nextList(p);
+			if(nxts.length){
+				nxts.forEach(function(nm){
+					var kind=isLoop?'loop':'next';
+					if(nm==='end'){ L.push({src:st.id,port:'next',dst:'__finish',kind:kind,prop:'on_next'}); }
+					else if(byName[nm]!=null){ L.push({src:st.id,port:'next',dst:STEPS[byName[nm]].id,kind:kind,prop:'on_next'}); }
+				});
+			}
+			else if(!isLoop){
+				// Implicit fall-through skips analyst sidecars (ask-only nodes),
+				// mirroring the engine's nextTargets — so a trailing Product Owner
+				// never gets a phantom wire from a notify/executor with no on_next.
+				var fx=null;
+				for(var k=i+1;k<STEPS.length;k++){ if(STEPS[k].type==='analyst') continue; fx=STEPS[k]; break; }
+				if(fx){ L.push({src:st.id,port:'next',dst:fx.id,kind:'seq'}); }
+				else { L.push({src:st.id,port:'next',dst:'__finish',kind:'seq'}); }
+			}
+		}
+		// approve — reviewer fan-out (green)
+		if(hasPort('approve')){
+			approveList(p).forEach(function(nm){
+				if(nm==='end'){ L.push({src:st.id,port:'approve',dst:'__finish',kind:'approve',prop:'on_approve'}); }
+				else if(byName[nm]!=null){ L.push({src:st.id,port:'approve',dst:STEPS[byName[nm]].id,kind:'approve',prop:'on_approve'}); }
+			});
+		}
+		// reject — reviewer
+		if(hasPort('reject')){
+			if(p.on_reject==='end'){ L.push({src:st.id,port:'reject',dst:'__finish',kind:'reject',prop:'on_reject'}); }
+			else if(p.on_reject&&byName[p.on_reject]!=null){ L.push({src:st.id,port:'reject',dst:STEPS[byName[p.on_reject]].id,kind:'reject',prop:'on_reject'}); }
+		}
+		// done — loop exit
+		if(hasPort('done')){
+			if(p.on_done==='end'){ L.push({src:st.id,port:'done',dst:'__finish',kind:'done',prop:'on_done'}); }
+			else if(p.on_done&&byName[p.on_done]!=null){ L.push({src:st.id,port:'done',dst:STEPS[byName[p.on_done]].id,kind:'done',prop:'on_done'}); }
+		}
+		// ask → analyst (any node may wire one)
+		if(p.ask&&byName[p.ask]!=null){ L.push({src:st.id,port:'ask',dst:STEPS[byName[p.ask]].id,kind:'ask',prop:'ask'}); }
+	});
+	return L;
+}
+function isLoopNode(id){ for(var i=0;i<STEPS.length;i++){ if(STEPS[i].id===id) return STEPS[i].type==='loop'; } return false; }
+function outAnchor(id,port){
+	var p=NODEPOS[id]; if(!p) return {x:0,y:0};
+	if(id==='__start') return {x:p.x+LIFE_W, y:p.y+LIFE_H/2};
+	if(isLoopNode(id)){
+		if(port==='next') return {x:p.x, y:p.y+NODE_H/2};        // LOOP exits LEFT
+		return {x:p.x+NODE_W, y:p.y+NODE_H-20};                  // DONE exits RIGHT
+	}
+	var t = port==='ask'?20 : (port==='reject'||port==='done')?(NODE_H-20) : NODE_H/2;
+	return {x:p.x+NODE_W, y:p.y+t};
+}
+function inAnchor(id){
+	var p=NODEPOS[id]; if(!p) return {x:0,y:0};
+	if(id==='__finish') return {x:p.x, y:p.y+LIFE_H/2};
+	if(isLoopNode(id)) return {x:p.x+NODE_W, y:p.y+22};          // loop ARRIVAL on the RIGHT
+	return {x:p.x, y:p.y+NODE_H/2};
+}
+// ── Wave wires ───────────────────────────────────────────────────────
+// Each connection is drawn as a gentle sine ripple riding the routing
+// bezier — water flowing between islands. The ripple tapers to 0 at both
+// ports so it meets the island cleanly; the flowing dash animation makes
+// the wave travel.
+function cubicAt(p0,p1,p2,p3,t){
+	var m=1-t;
+	return { x:m*m*m*p0.x+3*m*m*t*p1.x+3*m*t*t*p2.x+t*t*t*p3.x,
+		y:m*m*m*p0.y+3*m*m*t*p1.y+3*m*t*t*p2.y+t*t*t*p3.y };
+}
+function cubicTan(p0,p1,p2,p3,t){
+	var m=1-t;
+	return { x:3*m*m*(p1.x-p0.x)+6*m*t*(p2.x-p1.x)+3*t*t*(p3.x-p2.x),
+		y:3*m*m*(p1.y-p0.y)+6*m*t*(p2.y-p1.y)+3*t*t*(p3.y-p2.y) };
+}
+function wavePath(a,b,dx){
+	var p0=a, p1={x:a.x+dx,y:a.y}, p2={x:b.x-dx,y:b.y}, p3=b;
+	var len=Math.hypot(b.x-a.x,b.y-a.y);
+	var amp=Math.max(3,Math.min(6.5,len/26));
+	var n=30, pts=[];
+	for(var i=0;i<=n;i++){
+		var t=i/n;
+		var pt=cubicAt(p0,p1,p2,p3,t), tn=cubicTan(p0,p1,p2,p3,t);
+		var tl=Math.hypot(tn.x,tn.y)||1;
+		var w=Math.sin(t*Math.PI*3.2)*amp*Math.sin(t*Math.PI);
+		pts.push((pt.x+(-tn.y/tl)*w).toFixed(1)+' '+(pt.y+(tn.x/tl)*w).toFixed(1));
+	}
+	return 'M '+pts.join(' L ');
+}
+// Focus mode: hovering an island highlights only its wires and dims the rest,
+// so a complex route map stays readable.
+function wgFocus(id){
+	var eds=document.querySelectorAll('#wg-edges .wg-wire');
+	for(var i=0;i<eds.length;i++){ var p=eds[i]; var sc=p.getAttribute('data-esrc'), dc=p.getAttribute('data-edst'); p.style.opacity=(sc===id||dc===id)?'1':'0.08'; }
+}
+function wgClearFocus(){ var eds=document.querySelectorAll('#wg-edges .wg-wire'); for(var i=0;i<eds.length;i++){ eds[i].style.opacity=''; } }
+function wgDrawEdges(){
+	var svg=document.getElementById('wg-edges');
+	if(!svg) return;
+	var h=edgeDefs();
+	var ships=[];   // flow lanes that each get a sailing ship (one per branch)
+	edgeList().forEach(function(e){
+		var a=outAnchor(e.src,e.port), b=inAnchor(e.dst);
+		var dx=Math.max(46, Math.abs(b.x-a.x)/2);
+		var d='M '+a.x+' '+a.y+' C '+(a.x+dx)+' '+a.y+', '+(b.x-dx)+' '+b.y+', '+b.x+' '+b.y;
+		var sel=(selEdge===edgeKey(e));
+		var ek=edgeKey(e);
+		// Each work-flow edge (entry/next/approve/done/loop) is a sea lane with
+		// its own ship — a node that fans out launches a ship per branch. The
+		// ask (consult) and reject (bounce) wires stay ship-free.
+		if(e.kind==='seq'||e.kind==='next'||e.kind==='approve'||e.kind==='done'||e.kind==='loop'){
+			ships.push({d:d, len:Math.hypot(b.x-a.x,b.y-a.y)});
+		}
+		// Fat transparent hit-path under the visible wire so it's easy to click
+		// (only explicit, deletable wires get one — implicit "seq" links don't).
+		if(e.prop){
+			h+='<path class="wg-hit" d="'+d+'" data-ek="'+ek+'" data-eprop="'+e.prop+'" data-esrc="'+e.src+'"></path>';
+		}
+		h+='<g class="wg-wire" data-esrc="'+e.src+'" data-edst="'+e.dst+'">';
+		h+='<path class="wg-edge-case" d="'+d+'" style="pointer-events:none" stroke-width="'+(sel?8:6)+'"></path>';
+		h+='<path class="wg-edge'+(sel?' wg-edge-sel':'')+'" d="'+d+'"'
+		  +' style="stroke:'+edgeColor(e.kind,sel)+';pointer-events:none" stroke-width="'+(sel?4:3)+'" marker-end="url(#wg-arr-'+e.kind+')"></path>';
+		var mid=cubicAt({x:a.x,y:a.y},{x:a.x+dx,y:a.y},{x:b.x-dx,y:b.y},{x:b.x,y:b.y},0.5);
+		if(e.kind==='reject'||e.kind==='ask'||e.kind==='loop'||e.kind==='done'||e.kind==='approve'){
+			var mx=mid.x, my=mid.y, lw=e.kind.length*6+16;
+			// The label rides the curve and is itself a click target — clicking it
+			// selects the wire (people aim for the label, not the thin line).
+			h+='<rect class="wg-lbl" data-ek="'+ek+'" data-eprop="'+e.prop+'" data-esrc="'+e.src+'" x="'+(mx-lw/2)+'" y="'+(my-18)+'" width="'+lw+'" height="17" rx="8.5" fill="#FBF2DF" stroke="'+edgeColor(e.kind,sel)+'" stroke-width="'+(sel?2.5:1.5)+'" style="cursor:pointer"></rect>';
+			h+='<text x="'+mx+'" y="'+(my-6)+'" text-anchor="middle" style="fill:#1E2433;font-size:9.5px;font-weight:700;pointer-events:none">'+e.kind+'</text>';
+		}
+		// Visible delete badge on the selected wire (click the × to remove it).
+		if(sel&&e.prop){
+			var cx=mid.x, cy=mid.y+18;
+			h+='<g class="wg-del" data-del="'+ek+'"><circle cx="'+cx+'" cy="'+cy+'" r="9" fill="#FBF2DF" stroke="rgb(244 63 94)" stroke-width="1.5"></circle>'
+			  +'<text x="'+cx+'" y="'+(cy+3.6)+'" text-anchor="middle" style="fill:rgb(244 63 94);font-size:12px;font-weight:800;pointer-events:none">×</text></g>';
+		}
+		h+='</g>';
+	});
+	// One ship per flow lane — goon's fleet "working around the sea". A node
+	// with several outgoing branches launches several ships. Length-based
+	// duration keeps speed roughly constant; a staggered negative begin desyncs
+	// them (SMIL wraps the phase, so the offset needn't be < dur). Ships ride in
+	// the edges layer, so they duck behind the islands as they pass. Skipped
+	// under reduced-motion.
+	var rm=window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+	if(!rm){
+		ships.forEach(function(s,si){
+			var dur=Math.max(6,Math.min(15, s.len/46)).toFixed(1);
+			var beg=(-(si*1.7)).toFixed(1);
+			h+='<path id="wg-lane-'+si+'" d="'+s.d+'" fill="none" stroke="none"></path>';
+			h+='<g style="pointer-events:none" opacity="0.96"><animateMotion dur="'+dur+'s" begin="'+beg+'s" repeatCount="indefinite" calcMode="linear"><mpath href="#wg-lane-'+si+'"></mpath></animateMotion>'+SHIP_SVG+'</g>';
+		});
+	}
+	h+='<path id="wg-ghost" class="wg-edge" style="stroke:rgb(var(--c-accent) / 0.9);display:none" stroke-width="2"></path>';
+	svg.innerHTML=h;
+}
+
+// ── Minimap ──────────────────────────────────────────────────────────
+function renderMini(){
+	var mini=document.getElementById('wg-mini');
+	var cv=document.getElementById('wg-canvas');
+	if(!mini||!cv) return;
+	var b=graphBBox();
+	var pad=60;
+	b={x:b.x-pad, y:b.y-pad, w:b.w+pad*2, h:b.h+pad*2};
+	var s=Math.min(mini.clientWidth/b.w, mini.clientHeight/b.h);
+	var h='';
+	Object.keys(NODEPOS).forEach(function(id){
+		var p=NODEPOS[id]; if(!p) return;
+		var life=(id==='__start'||id==='__finish');
+		var w=(life?LIFE_W:NODE_W)*s, hh=(life?LIFE_H:NODE_H)*s;
+		var col = life ? 'rgb(var(--c-muted) / 0.6)' : (id===selId ? 'rgb(var(--c-accent))' : 'rgb(var(--c-muted) / 0.9)');
+		h+='<div style="position:absolute;left:'+((p.x-b.x)*s)+'px;top:'+((p.y-b.y)*s)+'px;width:'+Math.max(3,w)+'px;height:'+Math.max(2,hh)+'px;border-radius:2px;background:'+col+'"></div>';
+	});
+	var vx=(-WORLD.x/WORLD.k-b.x)*s, vy=(-WORLD.y/WORLD.k-b.y)*s;
+	var vw=cv.clientWidth/WORLD.k*s, vh=cv.clientHeight/WORLD.k*s;
+	h+='<div style="position:absolute;left:'+vx+'px;top:'+vy+'px;width:'+vw+'px;height:'+vh+'px;border:1.5px solid rgb(var(--c-accent) / 0.8);border-radius:3px;background:rgb(var(--c-accent) / 0.07)"></div>';
+	mini.innerHTML=h;
+	mini.setAttribute('data-bx',String(b.x)); mini.setAttribute('data-by',String(b.y)); mini.setAttribute('data-s',String(s));
+}
+
+// ── Palette ──────────────────────────────────────────────────────────
+function renderPalette(){
+	var box=document.getElementById('wg-pal-items');
+	if(!box||box.childNodes.length) return;
+	var h='';
+	Object.keys(TYPES).forEach(function(k){
+		var m=TYPES[k];
+		h+='<div class="wg-pal-item rounded-lg border border-surface-border bg-surface-raised px-2.5 py-2 select-none" data-pal="'+k+'" data-pallabel="'+escX(m.label.toLowerCase())+'" title="'+escX(m.blurb)+'" style="border-left:3px solid '+m.color+'">'
+		  +'<div class="flex items-center gap-2"><span class="w-5 h-5 rounded flex items-center justify-center text-[10px] font-black shrink-0" style="background:'+m.color+'22;color:'+m.color+'">'+escX(m.letter)+'</span>'
+		  +'<div class="min-w-0"><div class="text-[11px] font-semibold leading-tight" style="color:'+m.color+'">'+escX(m.label)+'</div>'
+		  +'<div class="text-[9px] text-muted leading-tight whitespace-nowrap lg:whitespace-normal">'+escX(m.short)+'</div></div></div></div>';
+	});
+	box.innerHTML=h;
+	box.querySelectorAll('.wg-pal-item').forEach(function(it){
+		it.addEventListener('pointerdown', function(e){
+			MODE={t:'pal', type:it.getAttribute('data-pal'), startX:e.clientX, startY:e.clientY, moved:false};
+			e.preventDefault();
+		});
+	});
+}
+window.wgPalFilter=function(q){
+	q=(q||'').toLowerCase();
+	document.querySelectorAll('#wg-pal-items .wg-pal-item').forEach(function(it){
+		it.style.display=(!q||it.getAttribute('data-pallabel').indexOf(q)>=0)?'':'none';
+	});
+};
+function palGhost(e,type){
+	var g=document.getElementById('wg-pal-ghost');
+	if(!g){
+		g=document.createElement('div'); g.id='wg-pal-ghost';
+		var m=typeMeta(type);
+		g.className='rounded-lg border-2 bg-surface-raised px-3 py-2 text-[11px] font-semibold shadow-lg';
+		g.style.borderColor=m.color; g.style.color=m.color;
+		g.textContent=m.label;
+		document.body.appendChild(g);
+	}
+	g.style.left=(e.clientX+10)+'px'; g.style.top=(e.clientY+8)+'px';
+}
+
+// ── Canvas interactions (single MODE state machine) ──────────────────
+function bindCanvas(){
+	var cv=document.getElementById('wg-canvas');
+	if(!cv) return;
+	cv.addEventListener('pointerdown', onCanvasDown);
+	cv.addEventListener('pointerover', function(e){ if(MODE) return; var nn=e.target&&e.target.closest?e.target.closest('.wg-step'):null; if(nn) wgFocus(nn.getAttribute('data-id')); });
+	cv.addEventListener('pointerout', function(e){ if(MODE) return; var nn=e.target&&e.target.closest?e.target.closest('.wg-step'):null; var to=e.relatedTarget&&e.relatedTarget.closest?e.relatedTarget.closest('.wg-step'):null; if(nn&&!to) wgClearFocus(); });
+	cv.addEventListener('wheel', function(e){
+		e.preventDefault();
+		var r=cv.getBoundingClientRect();
+		zoomAt(e.clientX-r.left, e.clientY-r.top, Math.exp(-e.deltaY*0.0016));
+	}, {passive:false});
+	var svg=document.getElementById('wg-edges');
+	if(svg) svg.addEventListener('click', function(e){
+		var del=e.target&&e.target.closest?e.target.closest('[data-del]'):null;
+		if(del){ wgDeleteEdge(del.getAttribute('data-del')); return; }
+		var t=e.target&&e.target.closest?e.target.closest('[data-eprop]'):null;
+		if(t){ selEdge=t.getAttribute('data-ek'); selId=null; wgDrawEdges(); }
+	});
+	var mini=document.getElementById('wg-mini');
+	if(mini) mini.addEventListener('pointerdown', function(e){
+		e.stopPropagation(); e.preventDefault();
+		var r=mini.getBoundingClientRect();
+		var bx=parseFloat(mini.getAttribute('data-bx')), by=parseFloat(mini.getAttribute('data-by')), s=parseFloat(mini.getAttribute('data-s'));
+		if(isNaN(s)||s<=0) return;
+		var wx=(e.clientX-r.left)/s+bx, wy=(e.clientY-r.top)/s+by;
+		WORLD.x=cv.clientWidth/2-wx*WORLD.k;
+		WORLD.y=cv.clientHeight/2-wy*WORLD.k;
+		applyWorld(); renderMini();
+	});
+}
+function onCanvasDown(e){
+	if(e.button!==undefined && e.button!==0) return;
+	if(e.target.closest('#wg-mini')||e.target.closest('button')) return;
+	var port=e.target.closest('.wg-port');
+	if(port && port.getAttribute('data-port')!=='in'){
+		MODE={t:'port', src:port.getAttribute('data-node'), port:port.getAttribute('data-port')};
+		e.preventDefault(); return;
+	}
+	var node=e.target.closest('.wg-step');
+	var life=e.target.closest('.wg-life');
+	var el=node||life;
+	if(el){
+		var id=node?node.getAttribute('data-id'):life.getAttribute('data-life');
+		var p=NODEPOS[id]||{x:0,y:0};
+		MODE={t:'node', id:id, el:el, isStep:!!node, startX:e.clientX, startY:e.clientY, ox:p.x, oy:p.y, moved:false};
+		e.preventDefault(); return;
+	}
+	var delB=e.target.closest&&e.target.closest('[data-del]');
+	if(delB){ wgDeleteEdge(delB.getAttribute('data-del')); e.preventDefault(); return; }
+	var wireHit=e.target.closest&&e.target.closest('.wg-hit, .wg-lbl');
+	if(wireHit){ var nk=wireHit.getAttribute('data-ek'); if(selEdge!==nk){ selEdge=nk; selId=null; wgDrawEdges(); } e.preventDefault(); return; }
+	MODE={t:'pan', startX:e.clientX, startY:e.clientY, ox:WORLD.x, oy:WORLD.y};
+	var cv=document.getElementById('wg-canvas'); if(cv) cv.classList.add('wg-panning');
+	e.preventDefault();
+}
+var _gRaf=false;
+function gRedraw(){
+	if(_gRaf) return;
+	_gRaf=true;
+	window.requestAnimationFrame(function(){ _gRaf=false; wgDrawEdges(); renderMini(); });
+}
+// htmx re-renders this fragment (and re-runs this script) after each save —
+// swap document-level listeners instead of stacking duplicates that would
+// double-fire against the new closure's window-bound functions.
+if(window.__wgPM) document.removeEventListener('pointermove', window.__wgPM);
+window.__wgPM=function(e){
+	if(!MODE) return;
+	if(MODE.t==='pan'){
+		WORLD.x=MODE.ox+(e.clientX-MODE.startX);
+		WORLD.y=MODE.oy+(e.clientY-MODE.startY);
+		applyWorld(); renderMini();
+	} else if(MODE.t==='node'){
+		var dx=(e.clientX-MODE.startX)/WORLD.k, dy=(e.clientY-MODE.startY)/WORLD.k;
+		if(!MODE.moved && Math.abs(dx)*WORLD.k<5 && Math.abs(dy)*WORLD.k<5) return;
+		if(!MODE.moved){ MODE.moved=true; MODE.el.classList.add('wg-dragging'); }
+		NODEPOS[MODE.id]={x:MODE.ox+dx, y:MODE.oy+dy};
+		MODE.el.style.left=NODEPOS[MODE.id].x+'px';
+		MODE.el.style.top=NODEPOS[MODE.id].y+'px';
+		gRedraw();
+	} else if(MODE.t==='port'){
+		var g=document.getElementById('wg-ghost');
+		if(g){
+			var a=outAnchor(MODE.src,MODE.port);
+			var w=worldFromClient(e.clientX,e.clientY);
+			var dx2=Math.max(46,Math.abs(w.x-a.x)/2);
+			g.setAttribute('d','M '+a.x+' '+a.y+' C '+(a.x+dx2)+' '+a.y+', '+(w.x-dx2)+' '+w.y+', '+w.x+' '+w.y);
+			g.style.display='';
+		}
+	} else if(MODE.t==='pal'){
+		MODE.moved=true;
+		palGhost(e,MODE.type);
 	}
 };
+document.addEventListener('pointermove', window.__wgPM);
+if(window.__wgPU) document.removeEventListener('pointerup', window.__wgPU);
+window.__wgPU=function(e){
+	if(!MODE) return;
+	var mode=MODE; MODE=null;
+	var cv=document.getElementById('wg-canvas');
+	if(cv) cv.classList.remove('wg-panning');
+	if(mode.t==='node'){
+		mode.el.classList.remove('wg-dragging');
+		if(mode.moved){ persistPos(); gRedraw(); }
+		else if(mode.isStep){ wgSelectStep(mode.id); }
+		return;
+	}
+	if(mode.t==='port'){
+		var g=document.getElementById('wg-ghost'); if(g) g.style.display='none';
+		var hit=document.elementFromPoint(e.clientX,e.clientY);
+		var tn=hit&&hit.closest?hit.closest('.wg-step'):null;
+		var tf=hit&&hit.closest?hit.closest('.wg-life[data-life="__finish"]'):null;
+		if(mode.src==='__start'){
+			if(tn){
+				var sid=tn.getAttribute('data-id'), si=stepIndex(sid);
+				if(si>0){ pushHistory(); var it=STEPS.splice(si,1)[0]; STEPS.unshift(it); renderSteps(); }
+			}
+			return;
+		}
+		var srcStep=stepById(mode.src);
+		if(!srcStep) return;
+		var prop = mode.port==='reject'?'on_reject' : mode.port==='ask'?'ask' : mode.port==='approve'?'on_approve' : mode.port==='done'?'on_done' : 'on_next';
+		var val=null;
+		var allowSelf=(prop==='on_reject'); // reject→itself = bounded retry
+		if(tn && (allowSelf || tn.getAttribute('data-id')!==mode.src)){ var ts=stepById(tn.getAttribute('data-id')); if(ts) val=ts.name; }
+		else if(tf && prop!=='ask'){ val='end'; }
+		if(val){
+			pushHistory();
+			srcStep.props=srcStep.props||{};
+			if(prop==='on_next'||prop==='on_approve'){
+				// Dragging a NEXT / APPROVE wire RE-POINTS it (replaces the
+				// target) so you can rewire without deleting first. Build a
+				// fan-out (several targets) from the step's side panel.
+				var listSet=(prop==='on_next')?setNextList:setApproveList; listSet(srcStep,[val]);
+			} else {
+				srcStep.props[prop]=val;
+			}
+			selEdge=mode.src+'|'+prop+'|'+(val==='end'?'__finish':(tn?tn.getAttribute('data-id'):''));
+			renderSteps();
+		}
+		return;
+	}
+	if(mode.t==='pal'){
+		var pg=document.getElementById('wg-pal-ghost'); if(pg) pg.remove();
+		if(!mode.moved){ wgAddStep(mode.type); return; }
+		var hitCv=document.elementFromPoint(e.clientX,e.clientY);
+		if(hitCv&&hitCv.closest&&hitCv.closest('#wg-canvas')){
+			var wpt=worldFromClient(e.clientX,e.clientY);
+			wgAddStepAt(mode.type, wpt.x-NODE_W/2, wpt.y-NODE_H/2);
+		}
+		return;
+	}
+};
+document.addEventListener('pointerup', window.__wgPU);
+if(window.__wgPC) document.removeEventListener('pointercancel', window.__wgPC);
+window.__wgPC=function(){
+	if(MODE&&MODE.t==='node'&&MODE.el) MODE.el.classList.remove('wg-dragging');
+	var g=document.getElementById('wg-ghost'); if(g) g.style.display='none';
+	var pg=document.getElementById('wg-pal-ghost'); if(pg) pg.remove();
+	var cv=document.getElementById('wg-canvas'); if(cv) cv.classList.remove('wg-panning');
+	MODE=null;
+};
+document.addEventListener('pointercancel', window.__wgPC);
 
-// ── Add / move / duplicate / delete ──────────────────────────────────
-window.wgAddStep=function(type){
+window.wgAddStepAt=function(type,x,y){
 	pushHistory();
 	var id=newId();
 	STEPS.push({id:id, type:type, name:uniqueName(type), props:{}});
+	NODEPOS[id]={x:x, y:y};
 	selId=id;
 	renderSteps();
-	var bodyEl=document.getElementById('wg-body-'+id);
-	if(bodyEl){ renderStageProps(stepById(id), bodyEl); }
-	var card=document.querySelector('.wg-step[data-id="'+id+'"]');
-	if(card) card.scrollIntoView({block:'center', behavior:'smooth'});
+	persistPos();
+};
+
+// ── Right-hand editor panel ──────────────────────────────────────────
+function renderPanel(){
+	var p=document.getElementById('wg-panel');
+	if(!p) return;
+	if(window._panelHidden){ p.classList.add('hidden'); return; }
+	if(tab!=='steps'){ p.classList.add('hidden'); return; }
+	p.classList.remove('hidden');
+	var n=stepById(selId);
+	if(!n){
+		p.innerHTML='<div class="p-6 text-center text-xs text-muted leading-relaxed">'
+			+'<svg class="h-6 w-6 mx-auto mb-2 opacity-60 text-muted" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M9 21V9"/></svg>'
+			+'Select a step on the canvas to edit it here.<br>Drag any card to reorder the pipeline.</div>';
+		return;
+	}
+	var m=typeMeta(n.type), i=stepIndex(n.id);
+	var btn='p-1.5 rounded text-muted hover:text-ink hover:bg-surface-border disabled:opacity-25 disabled:hover:bg-transparent transition';
+	var h='<div class="wg-fade p-4 space-y-3">';
+	h+='<div class="flex items-center gap-2 pb-2 border-b border-surface-border">';
+	h+='<span class="w-6 h-6 rounded-md flex items-center justify-center text-[11px] font-black shrink-0" style="background:'+m.color+'22;color:'+m.color+'">'+escX(m.letter)+'</span>';
+	h+='<span class="flex-1 min-w-0 text-[12px] font-semibold text-ink truncate">Step '+(i+1)+' of '+STEPS.length+'</span>';
+	h+='<button onclick="wgMoveStep(\''+n.id+'\',-1)" '+(i===0?'disabled':'')+' aria-label="Move up" title="Move up" class="'+btn+'">'+ICONS.up+'</button>';
+	h+='<button onclick="wgMoveStep(\''+n.id+'\',1)" '+(i===STEPS.length-1?'disabled':'')+' aria-label="Move down" title="Move down" class="'+btn+'">'+ICONS.down+'</button>';
+	h+='<button onclick="wgDuplicateStep(\''+n.id+'\')" aria-label="Duplicate step" title="Duplicate" class="'+btn+'">'+ICONS.copy+'</button>';
+	h+='<button onclick="wgDeleteStep(\''+n.id+'\')" aria-label="Delete step" title="Delete" class="p-1.5 rounded text-muted hover:text-rose-400 hover:bg-surface-border transition">'+ICONS.trash+'</button>';
+	h+='<button onclick="wgDeselect()" aria-label="Close panel" title="Close" class="'+btn+' ml-1">'
+	  +'<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button>';
+	h+='</div>';
+	h+='<div id="wg-panel-body"></div>';
+	h+='</div>';
+	p.innerHTML=h;
+	renderStageProps(n, document.getElementById('wg-panel-body'));
+}
+
+// ── Add / move / duplicate / delete ──────────────────────────────────
+window.wgAddStep=function(type){
+	// Click-to-append: place right of the last step (or at the spine start).
+	var pos;
+	if(STEPS.length){
+		var lp=NODEPOS[STEPS[STEPS.length-1].id]||spinePos(STEPS.length-1);
+		pos={x:lp.x+NODE_W+90, y:lp.y};
+	} else {
+		pos=spinePos(0);
+	}
+	wgAddStepAt(type,pos.x,pos.y);
+	wgCenterOn(STEPS[STEPS.length-1].id);
 };
 function uniqueName(base){
 	var n=base, i=2, taken={};
@@ -1741,9 +2819,11 @@ window.wgDuplicateStep=function(id){
 	var idx=stepIndex(id);
 	var copy={id:newId(), type:src.type, name:uniqueName(src.name), props:clone(src.props||{})};
 	STEPS.splice(idx+1,0,copy);
+	var sp=NODEPOS[id];
+	if(sp) NODEPOS[copy.id]={x:sp.x+36, y:sp.y+36};
 	selId=copy.id;
 	renderSteps();
-	var b=document.getElementById('wg-body-'+copy.id); if(b) renderStageProps(stepById(copy.id), b);
+	persistPos();
 };
 window.wgDeleteStep=function(id){
 	pushHistory();
@@ -1751,76 +2831,36 @@ window.wgDeleteStep=function(id){
 	if(selId===id) selId=null;
 	renderSteps();
 };
-
-// ── Drag-to-reorder (pointer-based, no DOM rebuild mid-drag) ──────────
-var DRAG=null;
-function bindStepDrag(){
-	var handles=document.querySelectorAll('#wg-step-list .wg-drag');
-	handles.forEach(function(hd){ hd.addEventListener('pointerdown', onDragStart); });
-}
-function clearDrag(){
-	if(DRAG){
-		var card=document.querySelector('.wg-step[data-id="'+DRAG.id+'"]');
-		if(card) card.style.opacity='';
-	}
-	var ind=document.getElementById('wg-drop-ind'); if(ind) ind.remove();
-	DRAG=null;
-}
-function onDragStart(e){
-	e.preventDefault(); e.stopPropagation();
-	var id=e.currentTarget.getAttribute('data-drag');
-	DRAG={id:id, startY:e.clientY, moved:false, target:stepIndex(id)};
-}
-document.addEventListener('pointermove', function(e){
-	if(!DRAG) return;
-	if(!DRAG.moved && Math.abs(e.clientY-DRAG.startY)<5) return; // threshold
-	DRAG.moved=true;
-	var card=document.querySelector('.wg-step[data-id="'+DRAG.id+'"]');
-	if(card) card.style.opacity='0.4';
-	// Find which gap the pointer is over.
-	var cards=Array.prototype.slice.call(document.querySelectorAll('#wg-step-list .wg-step'));
-	var target=cards.length;
-	for(var i=0;i<cards.length;i++){
-		var r=cards[i].getBoundingClientRect();
-		if(e.clientY < r.top + r.height/2){ target=i; break; }
-	}
-	DRAG.target=target;
-	// Draw a drop indicator line.
-	var ind=document.getElementById('wg-drop-ind');
-	if(!ind){ ind=document.createElement('div'); ind.id='wg-drop-ind'; ind.style.height='2px'; ind.style.background='#8b5cf6'; ind.style.borderRadius='2px'; ind.style.margin='-1px 0'; }
-	var list=document.getElementById('wg-step-list');
-	if(list){
-		if(target>=cards.length){ list.appendChild(ind); }
-		else { list.insertBefore(ind, cards[target]); }
-	}
-});
-document.addEventListener('pointerup', function(){
-	if(DRAG && DRAG.moved){
-		var from=stepIndex(DRAG.id);
-		var to=DRAG.target;
-		if(from>=0 && to>=0){
-			if(to>from) to--; // account for removal shift
-			if(to!==from){
-				pushHistory();
-				var item=STEPS.splice(from,1)[0];
-				STEPS.splice(to,0,item);
-			}
+// Delete one wire by its edge key. on_next / on_approve are fan-out lists —
+// remove only this wire's target; every other routing prop clears outright.
+window.wgDeleteEdge=function(ek){
+	if(!ek) return;
+	var parts=ek.split('|');
+	var st=stepById(parts[0]);
+	if(st&&st.props&&parts[1]&&parts[1]!=='seq'){
+		pushHistory();
+		if(parts[1]==='on_next'||parts[1]==='on_approve'){
+			var dstName=(parts[2]==='__finish')?'end':(stepById(parts[2])?stepById(parts[2]).name:'');
+			var lg=(parts[1]==='on_next')?nextList:approveList;
+			var ls=(parts[1]==='on_next')?setNextList:setApproveList;
+			ls(st, lg(st.props).filter(function(x){ return x!==dstName; }));
+		} else {
+			delete st.props[parts[1]];
 		}
-		clearDrag();
-		renderSteps();
-		if(selId){ var b=document.getElementById('wg-body-'+selId); if(b) renderStageProps(stepById(selId), b); }
-		return;
 	}
-	clearDrag();
-});
-document.addEventListener('pointercancel', clearDrag);
-window.addEventListener('blur', clearDrag);
+	selEdge=null;
+	renderSteps();
+};
 
-// ── Per-step field editor (renders into the expanded card body) ───────
+// ── Per-step field editor (renders into the panel body) ───────────────
 function renderStageProps(n, el){
 	if(!el || !n) return;
 	var p=n.props||{};
 	var ob=' onblur="wgPropBlur()"';
+	// Routing target lists, computed up front so any branch can use them
+	// (function declarations hoist; this assignment must come first).
+	var others=STEPS.filter(function(x){ return x.id!==n.id; }).map(function(x){ return x.name; });
+	var allNames=STEPS.map(function(x){ return x.name; }); // incl. self — reject→self = retry
 	var h='<div class="space-y-3">';
 
 	h+='<div class="grid grid-cols-2 gap-2">';
@@ -1835,19 +2875,37 @@ function renderStageProps(n, el){
 
 	h+=typeHelpBlock(n.type);
 
-	if(n.type==='agent'){
-		h+='<div>'+fieldLabel('Task')
-		  +'<textarea rows="5" oninput="wgProp(\'task\',this.value)"'+ob+' class="'+inputCls()+' font-mono text-[11px] resize-y leading-relaxed">'+escH(p.task||'')+'</textarea>'+varHint()+'</div>';
+	if(n.type==='executor'){
+		h+='<div>'+fieldLabel('Built-in capability')
+		  +'<select onchange="pushHistory();wgProp(\'do\',this.value)" class="'+inputCls()+'">'
+		  +'<option value=""'+((!p.do)?' selected':'')+'>— none (run the task below) —</option>'
+		  +'<option value="open_pr"'+(p.do==='open_pr'?' selected':'')+'>open_pr — open / update the PR</option>'
+		  +'</select>'+fieldHint('open_pr ships the change with goon\'s git host + PR template instead of a freeform task.')+'</div>';
+		h+='<div>'+fieldLabel('Task (when no built-in)')
+		  +'<textarea rows="5" oninput="wgProp(\'task\',this.value)"'+ob+' class="'+inputCls()+' font-mono text-[11px] resize-y leading-relaxed">'+escH(p.task||'')+'</textarea>'+varHint()
+		  +fieldHint('Empty task + no built-in = the default executor: it triages the ticket into a plan and implements it. Add a line \'ASK: your question\' to let it consult an analyst.')+'</div>';
 		h+='<div>'+fieldLabel('Max steps (0 = default)')
 		  +'<input type="number" min="0" value="'+escX(p.max_steps||'')+'" oninput="wgProp(\'max_steps\',this.value)"'+ob+' class="'+inputCls()+'"></div>';
+	} else if(n.type==='reviewer'){
+		h+='<div>'+fieldLabel('Mode')
+		  +'<select onchange="pushHistory();wgProp(\'mode\',this.value)" class="'+inputCls()+'">'
+		  +'<option value="human"'+((!p.mode||p.mode==='human')?' selected':'')+'>human — pause, show a person the change, approve / reject</option>'
+		  +'<option value="llm"'+(p.mode==='llm'?' selected':'')+'>llm — an automated model decides</option>'
+		  +'</select></div>';
+		h+='<div>'+fieldLabel('Review task — what to check')
+		  +'<textarea rows="4" oninput="wgProp(\'task\',this.value)"'+ob+' class="'+inputCls()+' font-mono text-[11px] resize-y leading-relaxed">'+escH(p.task||'')+'</textarea>'+varHint()
+		  +fieldHint('Approve advances (wire the APPROVE port); reject loops back (wire REJECT to a loop).')+'</div>';
 	} else if(n.type==='notify'){
 		h+='<div>'+fieldLabel('Message')
 		  +'<textarea rows="3" oninput="wgProp(\'message\',this.value)"'+ob+' class="'+inputCls()+' font-mono text-[11px] resize-y leading-relaxed">'+escH(p.message||'')+'</textarea>'+varHint()
 		  +fieldHint('Sent to your Telegram channel. Set On error → continue to make it optional.')+'</div>';
-	} else if(n.type==='http'){
-		h+='<div>'+fieldLabel('URL (https, GET)')
-		  +'<input type="text" value="'+escX(p.url||'')+'" oninput="wgProp(\'url\',this.value)"'+ob+' placeholder="https://api.example.com/status" class="'+inputCls()+' font-mono text-[11px]">'+varHint()
-		  +fieldHint('Response body is stored under this step — reference it later with {{.Stages.'+escH(n.name||'NAME')+'}}.')+'</div>';
+	} else if(n.type==='loop'){
+		h+='<div class="grid grid-cols-2 gap-2">';
+		h+='<div>'+fieldLabel('Max loops')
+		  +'<input type="number" min="1" value="'+escX(p.max_loops||'')+'" placeholder="3" oninput="wgProp(\'max_loops\',this.value)"'+ob+' class="'+inputCls()+'"></div>';
+		h+=routingSelect('on_done', p.on_done||'', 'when done → go to', others);
+		h+='</div>';
+		h+=fieldHint('Wire the LOOP port back to the step that starts the loop body. Each arrival here counts one iteration; after max loops the flow exits via "when done" (or the next step in list order).');
 	} else {
 		h+='<div>'+fieldLabel('Prompt')
 		  +'<textarea rows="5" oninput="wgProp(\'prompt\',this.value)"'+ob+' class="'+inputCls()+' font-mono text-[11px] resize-y leading-relaxed">'+escH(p.prompt||'')+'</textarea>'+varHint()+'</div>';
@@ -1868,29 +2926,62 @@ function renderStageProps(n, el){
 	h+='<summary class="cursor-pointer text-[11px] font-semibold text-muted hover:text-ink select-none">Advanced — branching, model, conditions</summary>';
 	h+='<div class="space-y-3 pt-3">';
 
-	var others=STEPS.filter(function(x){ return x.id!==n.id; }).map(function(x){ return x.name; });
-	function routingSelect(key,val,label){
+	function routingSelect(key,val,label,list){
 		var s='<div><label class="block text-[10px] text-muted mb-0.5">'+label+'</label>'
 		  +'<select onchange="pushHistory();wgProp(\''+key+'\',this.value)" class="'+inputCls()+'">'
 		  +'<option value=""'+(val===''?' selected':'')+'>— default (next in list) —</option>';
-		others.forEach(function(sn){ s+='<option value="'+escX(sn)+'"'+(val===sn?' selected':'')+'>'+escX(sn)+'</option>'; });
+		(list||others).forEach(function(sn){ s+='<option value="'+escX(sn)+'"'+(val===sn?' selected':'')+'>'+escX(sn)+'</option>'; });
 		s+='<option value="end"'+(val==='end'?' selected':'')+'>end pipeline</option>';
 		return s+'</select></div>';
 	}
+	function nextMulti(label){
+		var cur=nextList(p);
+		var s='<div><label class="block text-[10px] text-muted mb-0.5">'+label+'</label>'
+		  +'<div class="rounded-md border border-surface-border bg-surface-sunken px-2 py-1.5 space-y-1 max-h-28 overflow-y-auto">';
+		others.concat(['end']).forEach(function(sn){
+			var on=cur.indexOf(sn)>=0;
+			s+='<label class="flex items-center gap-2 cursor-pointer text-[11px] text-ink">'
+			  +'<input type="checkbox" '+(on?'checked':'')+' onchange="wgNextToggle(\''+escX(sn)+'\',this.checked)" class="rounded border-surface-border bg-surface text-accent focus:ring-accent/40">'
+			  +'<span class="font-mono truncate">'+escX(sn)+'</span></label>';
+		});
+		s+='</div>'+fieldHint('None checked = next step in list order. Check several to fan out (branches run one after another). Or just drag wires from the port.');
+		return s+'</div>';
+	}
+	function approveMulti(label){
+		var cur=approveList(p);
+		var s='<div><label class="block text-[10px] text-muted mb-0.5">'+label+'</label>'
+		  +'<div class="rounded-md border border-surface-border bg-surface-sunken px-2 py-1.5 space-y-1 max-h-28 overflow-y-auto">';
+		others.concat(['end']).forEach(function(sn){
+			var on=cur.indexOf(sn)>=0;
+			s+='<label class="flex items-center gap-2 cursor-pointer text-[11px] text-ink">'
+			  +'<input type="checkbox" '+(on?'checked':'')+' onchange="wgApproveToggle(\''+escX(sn)+'\',this.checked)" class="rounded border-surface-border bg-surface text-accent focus:ring-accent/40">'
+			  +'<span class="font-mono truncate">'+escX(sn)+'</span></label>';
+		});
+		s+='</div>'+fieldHint('Where to go when approved. Check several to fan out — e.g. open_pr + notify.');
+		return s+'</div>';
+	}
+	var analystNames=STEPS.filter(function(x){ return x.type==='analyst'&&x.id!==n.id; }).map(function(x){ return x.name; });
 	h+='<div class="text-[10px] uppercase tracking-widest text-muted font-semibold">Branching</div>';
-	h+='<div class="grid grid-cols-2 gap-2">';
-	h+=routingSelect('on_next', p.on_next||'', 'on success → go to');
-	h+=routingSelect('on_reject', p.on_reject||'', 'on reject → go to');
-	h+='</div>';
-	h+='<div>'+fieldLabel('Reject if (template)')
-	  +'<input type="text" value="'+escX(p.reject_if||'')+'" oninput="wgProp(\'reject_if\',this.value)"'+ob+' placeholder="{{eq (index .Stages.NAME &quot;ok&quot;) false}}" class="'+inputCls()+' font-mono text-[11px]">'
-	  +fieldHint('When truthy, this step is rejected and routing follows "on reject". Leave empty to never reject.')+'</div>';
-	h+='<div class="grid grid-cols-2 gap-2">';
-	h+=routingSelect('ask_stage', p.ask_stage||'', 'ask step (sub-call)');
-	h+='<div>'+fieldLabel('Max loops (default 3)')+'<input type="number" min="0" value="'+escX(p.max_loops||'')+'" oninput="wgProp(\'max_loops\',this.value)"'+ob+' class="'+inputCls()+'"></div>';
-	h+='</div>';
+	if(n.type==='loop'){
+		h+=nextMulti('loop target(s) — the loop body');
+	} else if(n.type==='reviewer'){
+		h+=approveMulti('on approve → go to (fan-out)');
+		h+='<div class="grid grid-cols-2 gap-2">';
+		h+=routingSelect('on_reject', p.on_reject||'', 'on reject → go to', allNames);
+		h+=routingSelect('ask', p.ask||'', 'ask analyst (optional)', analystNames);
+		h+='</div>';
+		h+='<div>'+fieldLabel('Max loops (default 3)')+'<input type="number" min="0" value="'+escX(p.max_loops||'')+'" oninput="wgProp(\'max_loops\',this.value)"'+ob+' class="'+inputCls()+'"></div>';
+	} else if(n.type==='analyst'){
+		h+=fieldHint('An analyst is ask-only — it has no outgoing routes. Other nodes point their ASK port at it; it answers and they re-run with the reply.');
+	} else {
+		h+=nextMulti('on success → go to');
+		h+='<div class="grid grid-cols-2 gap-2">';
+		h+=routingSelect('ask', p.ask||'', 'ask analyst (optional)', analystNames);
+		h+='<div>'+fieldLabel('Max loops (default 3)')+'<input type="number" min="0" value="'+escX(p.max_loops||'')+'" oninput="wgProp(\'max_loops\',this.value)"'+ob+' class="'+inputCls()+'"></div>';
+		h+='</div>';
+	}
 
-	if(n.type==='llm'||n.type==='agent'){
+	if(n.type==='analyst'||n.type==='executor'||n.type==='reviewer'){
 		h+='<div class="text-[10px] uppercase tracking-widest text-muted font-semibold pt-1">Model override</div>';
 		h+='<div class="grid grid-cols-2 gap-2">';
 		h+='<div><label class="block text-[10px] text-muted mb-0.5">Provider</label>'
@@ -1927,9 +3018,10 @@ function renderStageProps(n, el){
 
 window.wgProp=function(key,val){
 	var n=stepById(selId); if(!n) return;
+	setDirty(true);
 	if(key==='name'){
 		n.name=val;
-		// Live-update the card header without rebuilding the open editor
+		// Live-update the canvas node label without rebuilding the editor
 		// (rebuilding would steal focus from the name field).
 		var t=document.querySelector('[data-stepname="'+n.id+'"]');
 		if(t) t.textContent=val||'(unnamed)';
@@ -1944,8 +3036,35 @@ window.wgProp=function(key,val){
 	}
 	n.props=n.props||{};
 	n.props[key]=val;
+	// Routing changed → branch curves on the canvas must follow.
+	if(key==='on_next'||key==='on_approve'||key==='on_reject'||key==='ask'||key==='on_done') wgDrawEdges();
 };
 window.wgPropBlur=function(){ pushHistory(); };
+// Toggle one on_next fan-out target from the panel's checkbox list.
+// "end" is exclusive — checking it clears the rest and vice versa.
+window.wgNextToggle=function(nm,on){
+	var n=stepById(selId); if(!n) return;
+	pushHistory();
+	var arr=nextList(n.props).filter(function(x){ return x!==nm; });
+	if(on){
+		if(nm==='end'){ arr=['end']; }
+		else { arr=arr.filter(function(x){ return x!=='end'; }); arr.push(nm); }
+	}
+	setNextList(n,arr);
+	renderSteps();
+};
+// Toggle one on_approve fan-out target (reviewer) from the panel checkbox.
+window.wgApproveToggle=function(nm,on){
+	var n=stepById(selId); if(!n) return;
+	pushHistory();
+	var arr=approveList(n.props).filter(function(x){ return x!==nm; });
+	if(on){
+		if(nm==='end'){ arr=['end']; }
+		else { arr=arr.filter(function(x){ return x!=='end'; }); arr.push(nm); }
+	}
+	setApproveList(n,arr);
+	renderSteps();
+};
 
 // ── Settings tab ─────────────────────────────────────────────────────
 function renderSettings(el){
@@ -1978,12 +3097,13 @@ function renderSettings(el){
 	el.innerHTML=h;
 }
 window.wgSet=function(key,val){
+	setDirty(true);
 	if(key==='verify_runs'){ var n=parseInt(val,10); if(isNaN(n)){ delete CFG.verify_runs; } else { CFG.verify_runs=n; } return; }
 	if(key==='auto_approve'){ CFG.auto_approve=!!val; return; }
 	if(val===''||val==null){ delete CFG[key]; } else { CFG[key]=val; }
 };
-window.wgSetLabels=function(val){ var a=val.split(',').map(function(s){return s.trim();}).filter(Boolean); if(a.length){ CFG.extra_labels=a; } else { delete CFG.extra_labels; } };
-window.wgSetHook=function(ph,val){ CFG.hooks=CFG.hooks||{}; var a=val.split('\n').map(function(s){return s.trim();}).filter(Boolean); if(a.length){ CFG.hooks[ph]=a; } else { delete CFG.hooks[ph]; } if(Object.keys(CFG.hooks).length===0) delete CFG.hooks; };
+window.wgSetLabels=function(val){ setDirty(true); var a=val.split(',').map(function(s){return s.trim();}).filter(Boolean); if(a.length){ CFG.extra_labels=a; } else { delete CFG.extra_labels; } };
+window.wgSetHook=function(ph,val){ setDirty(true); CFG.hooks=CFG.hooks||{}; var a=val.split('\n').map(function(s){return s.trim();}).filter(Boolean); if(a.length){ CFG.hooks[ph]=a; } else { delete CFG.hooks[ph]; } if(Object.keys(CFG.hooks).length===0) delete CFG.hooks; };
 
 // ── Templates ────────────────────────────────────────────────────────
 function populateTemplateSelect(){
@@ -2008,42 +3128,63 @@ function stepToStage(n){
 	if(p.if) s.if=p.if;
 	var rep=parseInt(p.repeat,10); if(!isNaN(rep)&&rep>0) s.repeat=rep;
 	if(p.on_error&&p.on_error!=='fail') s.on_error=p.on_error;
-	if(p.on_next)   s.on_next=p.on_next;
+	// on_next: single target serializes as a string (back-compat), a
+	// fan-out list as an array (backend StringList accepts both).
+	var nx=nextList(p);
+	if(nx.length===1){ s.on_next=nx[0]; } else if(nx.length>1){ s.on_next=nx; }
 	if(p.reject_if) s.reject_if=p.reject_if;
 	if(p.on_reject) s.on_reject=p.on_reject;
-	if(p.ask_stage) s.ask_stage=p.ask_stage;
+	// on_approve: single target serializes as a string, fan-out as an array.
+	var ap=approveList(p);
+	if(ap.length===1){ s.on_approve=ap[0]; } else if(ap.length>1){ s.on_approve=ap; }
+	if(p.ask) s.ask=p.ask;
+	if(p.on_done)   s.on_done=p.on_done;
 	var ml=parseInt(p.max_loops,10); if(!isNaN(ml)&&ml>0) s.max_loops=ml;
 	if(p.provider) s.provider=p.provider;
 	if(p.model)    s.model=p.model;
-	if(n.type==='agent'){
-		if(p.task) s.task=p.task;
+	if(n.type==='executor'){
+		if(p.do){ s.do=p.do; } else if(p.task){ s.task=p.task; }
 		var ms=parseInt(p.max_steps,10); if(!isNaN(ms)&&ms>0) s.max_steps=ms;
+	} else if(n.type==='reviewer'){
+		if(p.task) s.task=p.task;
+		if(p.mode) s.mode=p.mode;
 	} else if(n.type==='notify'){
 		if(p.message) s.message=p.message;
-	} else if(n.type==='http'){
-		if(p.url) s.url=p.url;
+	} else if(n.type==='loop'){
+		// routing-only node: everything it needs is already serialized above
 	} else {
+		// analyst (and any prompt-style role)
 		if(p.prompt) s.prompt=p.prompt;
 		if(p.system) s.system=p.system;
 		if(p.json_mode) s.json_mode=true;
 		var tmp=parseFloat(p.temperature); if(!isNaN(tmp)&&tmp!==0) s.temperature=tmp;
 		var mt=parseInt(p.max_tokens,10); if(!isNaN(mt)&&mt>0) s.max_tokens=mt;
 		if(p.output) s.output=p.output;
+		if(p.urls&&p.urls.length) s.urls=p.urls;
 	}
 	return s;
 }
 function buildConfig(includeStages){
 	var c=clone(CFG)||{};
-	if(includeStages){ c.stages=STEPS.map(stepToStage); } else { delete c.stages; }
+	if(includeStages){
+		c.stages=STEPS.map(stepToStage);
+		// Bake current node positions into the config so a shared workflow.json
+		// opens with the same view for everyone.
+		var lay={};
+		STEPS.forEach(function(s){ var p=NODEPOS[s.id]; if(p&&s.name) lay[s.name]={x:Math.round(p.x),y:Math.round(p.y)}; });
+		['__start','__finish'].forEach(function(k){ if(NODEPOS[k]) lay[k]={x:Math.round(NODEPOS[k].x),y:Math.round(NODEPOS[k].y)}; });
+		c.layout=lay;
+	} else { delete c.stages; delete c.layout; }
 	return c;
 }
 function loadConfig(cfg){
 	CFG=cfg||{};
 	var stages=(CFG.stages&&CFG.stages.length)?CFG.stages:_seed;
 	seededFromBuiltin=!(CFG.stages&&CFG.stages.length);
-	STEPS=(stages||[]).map(function(s){ return {id:newId(), type:s.type||'llm', name:s.name||('step-'+_seq), props:clone(s)}; });
-	selId=null; tab='steps';
+	STEPS=(stages||[]).map(function(s){ return {id:newId(), type:s.type||'executor', name:s.name||('step-'+_seq), props:clone(s)}; });
+	selId=null; selEdge=null; NODEPOS={}; tab='steps';
 	renderAll();
+	wgHome();
 	var banner=document.getElementById('wg-builtin-banner');
 	var revert=document.getElementById('wg-revert-btn');
 	if(banner) banner.classList.toggle('hidden', !seededFromBuiltin);
@@ -2067,6 +3208,7 @@ function postConfig(c){
 		}
 		document.body.dispatchEvent(new CustomEvent('workflowConfigChanged'));
 		document.body.dispatchEvent(new CustomEvent('workflowsChanged'));
+		setDirty(false);
 		if(msg){ msg.textContent='✓ saved'; msg.className='text-xs text-emerald-700 dark:text-emerald-400'; }
 		setTimeout(wgClose, 600);
 		return true;
@@ -2085,21 +3227,26 @@ window.wgSave=function(){
 		if(seen[nm]){ flashErr('duplicate step name "'+nm+'"'); openStep(n.id); return; }
 		seen[nm]=true;
 		var pp=n.props||{};
-		if(n.type==='agent'&&!(pp.task||'').trim()){ flashErr('step "'+nm+'": task is required'); openStep(n.id); return; }
-		if(n.type==='llm'&&!(pp.prompt||'').trim()){ flashErr('step "'+nm+'": prompt is required'); openStep(n.id); return; }
 		if(n.type==='notify'&&!(pp.message||'').trim()){ flashErr('step "'+nm+'": message is required'); openStep(n.id); return; }
-		if(n.type==='http'&&!(pp.url||'').trim()){ flashErr('step "'+nm+'": url is required'); openStep(n.id); return; }
+		if(n.type==='reviewer'&&approveList(pp).filter(function(x){return x!=='end';}).length===0&&!(pp.on_reject||'').trim()){ flashErr('step "'+nm+'": a reviewer needs APPROVE and/or REJECT wired'); openStep(n.id); return; }
+		if(n.type==='loop'&&nextList(pp).filter(function(x){return x!=='end';}).length===0&&!(pp.on_done||'').trim()){ flashErr('step "'+nm+'": wire the LOOP port to the loop body (or set "when done")'); openStep(n.id); return; }
 	}
+	try{ persistPos(); window._posSnap=localStorage.getItem(posStoreKey()); }catch(err){}
 	postConfig(buildConfig(true));
 };
-function openStep(id){ if(tab!=='steps'){ tab='steps'; } selId=id; renderSteps(); var b=document.getElementById('wg-body-'+id); if(b) renderStageProps(stepById(id), b); }
+function openStep(id){ if(tab!=='steps'){ tab='steps'; } selId=id; renderAll(); wgCenterOn(id); }
 window.wgRevertBuiltin=function(){
-	if(!confirm('Revert to the built-in pipeline? Saves your settings + hooks but DROPS the custom steps, restoring the gated triage → confirm_repo → approve_plan → … flow.')) return;
+	if(!confirm('Revert to goon\'s default role-graph? Saves your settings + hooks but DROPS the custom steps, restoring execute → reviewer (human) → open_pr + notify.')) return;
 	postConfig(buildConfig(false));
 };
 
 // ── Open / close ─────────────────────────────────────────────────────
 window.wgClose=function(){
+	// Guard against losing work: anything edited since open/save asks first.
+	if(_dirty && !confirm('Discard unsaved changes? Your edits are lost unless you Save first.')) return;
+	setDirty(false);
+	// Cancel reverts layout changes (tidy/drag) made this session.
+	try{ if(window._posSnap!=null){ localStorage.setItem(posStoreKey(), window._posSnap); } else { localStorage.removeItem(posStoreKey()); } }catch(err){}
 	var ov=document.getElementById('wf-graph-overlay');
 	if(ov) ov.classList.add('hidden');
 	var lbl=document.getElementById('wf-editor-toggle-label');
@@ -2112,22 +3259,38 @@ window.goonWfEditorToggle=function(){
 	var lbl=document.getElementById('wf-editor-toggle-label');
 	if(lbl) lbl.textContent='close editor';
 	_history=[]; updUndoBtn();
+	setDirty(false);
 	populateTemplateSelect();
+	try{ window._posSnap=localStorage.getItem(posStoreKey()); }catch(err){ window._posSnap=null; }
 	loadConfig(hasKeys(_cfg)?clone(_cfg):clone(_defaults));
 };
 window.goonWorkflowEditorToggle=window.goonWfEditorToggle;
 
-document.addEventListener('keydown',function(e){
+if(window.__wgKeys) document.removeEventListener('keydown', window.__wgKeys);
+window.__wgKeys=function(e){
 	var ov=document.getElementById('wf-graph-overlay');
 	if(!ov||ov.classList.contains('hidden')) return;
-	if(e.key==='Escape'){ wgClose(); }
+	var tag=e.target&&e.target.tagName?e.target.tagName:'';
+	var typing=(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT');
+	if(e.key==='Escape'){
+		if(selEdge){ selEdge=null; wgDrawEdges(); return; }
+		wgClose();
+	}
+	else if((e.key==='Delete'||e.key==='Backspace') && !typing && (selEdge||selId)){
+		// Delete the selected wire; if no wire is selected, delete the
+		// selected node. Both work from the keyboard.
+		e.preventDefault();
+		if(selEdge){ wgDeleteEdge(selEdge); }
+		else if(selId){ wgDeleteStep(selId); }
+	}
 	else if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')){ e.preventDefault(); wgUndo(); }
-});
+	else if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){ e.preventDefault(); wgSave(); }
+};
+document.addEventListener('keydown', window.__wgKeys);
 
 })();
 </script>`, cfgJSON, defaultsJSON, seedJSON, startersJSON, saveTarget)
 }
-
 
 // handleWorkflowSave writes the posted body to workflow.json after
 // validating that it parses as a workflow.WorkflowConfig. Returns a small
@@ -2156,8 +3319,10 @@ func (s *Server) handleWorkflowSave(w http.ResponseWriter, r *http.Request) {
 	if target == "" {
 		target = workflow.DefaultConfigFilePath()
 	}
-	// Allowlist the destination — only the loaded path or the default.
-	allowed := target == s.opts.WorkflowPath || target == workflow.DefaultConfigFilePath()
+	// Allowlist the destination — the active pipeline, the default, or any
+	// automation file directly under the automations dir (slug-named JSON).
+	isAuto := filepath.Dir(target) == workflow.AutomationsDir()
+	allowed := target == s.opts.WorkflowPath || target == workflow.DefaultConfigFilePath() || isAuto
 	if !allowed {
 		fragErr(w, "refusing to write to unexpected path: "+target)
 		return
@@ -2212,6 +3377,14 @@ func (s *Server) handleWorkflowSave(w http.ResponseWriter, r *http.Request) {
 		fragErr(w, "rename: "+err.Error())
 		return
 	}
+	// An automation save must NOT switch the active pipeline — just refresh the
+	// automations fleet and leave s.opts.Workflow pointing at the board pipeline.
+	if isAuto {
+		w.Header().Set("HX-Trigger", "automationsChanged")
+		s.events.Publish("automationsChanged")
+		fragOK(w, fmt.Sprintf("saved automation — runs on its schedule (%s)", filepath.Base(target)))
+		return
+	}
 	// Patch the in-memory copy so the header reflects the new state
 	// immediately (without waiting for a daemon restart).
 	s.opts.Workflow = &probe
@@ -2221,6 +3394,267 @@ func (s *Server) handleWorkflowSave(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("HX-Trigger", "workflowConfigChanged, workflowsChanged")
 	s.events.Publish("workflowConfigChanged")
 	fragOK(w, fmt.Sprintf("saved to %s — daemon picks it up on next poll", target))
+}
+
+// ── Scheduled automations (fleet + create + run / toggle / delete) ──────────
+//
+// Automations are extra workflows that run on a timer instead of off the
+// board — digests, health checks, anything. They live one-JSON-per-file under
+// the automations dir; the daemon's minute scheduler fires the due ones. This
+// fleet UI lets the user create, run-now, enable/pause, edit (in the same
+// island editor), and delete them without hand-writing JSON.
+
+// fragAutomations lazy-loads the automations fleet + create panel into the
+// Workflows tab.
+func (s *Server) fragAutomations(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	s.renderAutomations(w)
+}
+
+// renderAutomations writes the fleet + create panel HTML. Shared by
+// fragAutomations and the mutating handlers (which re-render in place), so the
+// list always reflects the latest on-disk state.
+func (s *Server) renderAutomations(w http.ResponseWriter) {
+	autos := workflow.LoadAutomations()
+	var b strings.Builder
+	b.WriteString(`<div id="automations" class="rounded-xl border border-surface-border bg-surface-raised shadow-card">`)
+	b.WriteString(`<div class="px-5 py-3.5 flex items-center gap-3 border-b border-surface-border">
+		<svg class="h-4 w-4 text-accent shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+		<div class="flex-1 min-w-0">
+			<div class="text-sm font-semibold text-ink">Automations</div>
+			<div class="text-xs text-muted">Scheduled workflows that run on their own — digests, health checks, anything. Separate from the board pipeline above.</div>
+		</div>
+		<button type="button" onclick="var n=document.getElementById('auto-new'); if(n) n.classList.toggle('hidden')" class="inline-flex items-center gap-1.5 rounded-md bg-accent text-white px-3 py-1.5 text-xs font-medium hover:bg-accent-strong transition">
+			<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>new automation</button>
+	</div>`)
+	b.WriteString(`<div class="divide-y divide-surface-border">`)
+	if len(autos) == 0 {
+		b.WriteString(`<div class="px-5 py-6 text-sm text-muted text-center">No automations yet. Click <b class="text-ink">new automation</b> — start from a template or build your own.</div>`)
+	}
+	for _, a := range autos {
+		cfg := a.Config
+		slug := workflow.AutomationSlug(cfg.Name)
+		enabled := cfg.IsEnabled()
+		pill := `<span class="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 text-emerald-700 dark:text-emerald-400 border border-emerald-500/40 px-2 py-0.5 text-[11px] font-medium">● enabled</span>`
+		toggleLabel := "pause"
+		if !enabled {
+			pill = `<span class="inline-flex items-center gap-1 rounded-full bg-gray-400/15 text-muted border border-surface-border px-2 py-0.5 text-[11px] font-medium">○ paused</span>`
+			toggleLabel = "enable"
+		}
+		last := "—"
+		if s.opts.Memory != nil {
+			last = humanizeSince(s.opts.Memory.LastScheduledRun(cfg.Name))
+		}
+		b.WriteString(`<div class="px-5 py-3.5 flex items-center gap-3 flex-wrap">`)
+		b.WriteString(`<div class="flex-1 min-w-0">`)
+		b.WriteString(fmt.Sprintf(`<div class="flex items-center gap-2 flex-wrap"><span class="text-sm font-semibold text-ink truncate">%s</span> %s <span class="text-[11px] font-mono rounded bg-surface-sunken border border-surface-border px-1.5 py-0.5 text-muted">%s</span></div>`,
+			html.EscapeString(cfg.Name), pill, html.EscapeString(cfg.Trigger.ScheduleHint())))
+		b.WriteString(fmt.Sprintf(`<div class="text-xs text-muted mt-0.5 truncate">%s · %d step(s) · last run %s</div>`,
+			html.EscapeString(autoFirstLine(cfg.Description)), len(cfg.Stages), html.EscapeString(last)))
+		b.WriteString(`</div>`)
+		b.WriteString(`<div class="flex items-center gap-1.5 shrink-0">`)
+		b.WriteString(fmt.Sprintf(`<button type="button" title="Run now" class="inline-flex items-center gap-1 rounded-md border border-surface-border text-muted px-2.5 py-1.5 text-xs hover:border-emerald-500 hover:text-emerald-600 transition" hx-post="/api/automation/run" hx-vals='{"slug":"%s"}' hx-target="#auto-msg" hx-swap="innerHTML"><svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>run</button>`, slug))
+		b.WriteString(fmt.Sprintf(`<button type="button" title="Edit in the visual editor" class="inline-flex items-center gap-1 rounded-md border border-surface-border text-muted px-2.5 py-1.5 text-xs hover:border-accent hover:text-accent transition" hx-get="/fragments/workflow-config?file=%s" hx-target="closest [data-page]" hx-swap="innerHTML"><svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>edit</button>`, slug))
+		b.WriteString(fmt.Sprintf(`<button type="button" class="inline-flex items-center rounded-md border border-surface-border text-muted px-2.5 py-1.5 text-xs hover:border-accent hover:text-accent transition" hx-post="/api/automation/toggle" hx-vals='{"slug":"%s"}' hx-target="#automations" hx-swap="outerHTML">%s</button>`, slug, toggleLabel))
+		b.WriteString(fmt.Sprintf(`<button type="button" class="inline-flex items-center rounded-md border border-surface-border text-muted px-2.5 py-1.5 text-xs hover:border-rose-500 hover:text-rose-600 transition" hx-post="/api/automation/delete" hx-vals='{"slug":"%s"}' hx-confirm="Delete this automation?" hx-target="#automations" hx-swap="outerHTML">delete</button>`, slug))
+		b.WriteString(`</div></div>`)
+	}
+	b.WriteString(`</div>`)
+	b.WriteString(`<div id="auto-msg" class="px-5 empty:hidden"></div>`)
+	b.WriteString(s.automationCreatePanel())
+	b.WriteString(`</div>`)
+	_, _ = io.WriteString(w, b.String())
+}
+
+// automationCreatePanel renders the (hidden until toggled) "new automation"
+// panel: one-click starter templates plus a build-your-own form.
+func (s *Server) automationCreatePanel() string {
+	var b strings.Builder
+	b.WriteString(`<div id="auto-new" class="hidden border-t border-surface-border px-5 py-4 space-y-4">`)
+	b.WriteString(`<div><div class="text-xs font-semibold text-ink mb-2">Start from a template</div><div class="flex flex-wrap gap-2">`)
+	for _, st := range workflow.AutomationStarters() {
+		b.WriteString(fmt.Sprintf(`<button type="button" class="text-left rounded-lg border border-surface-border bg-surface px-3 py-2 hover:border-accent hover:shadow-card transition max-w-[260px]" hx-post="/api/automation/create" hx-vals='{"starter":"%s"}' hx-target="#automations" hx-swap="outerHTML"><div class="text-xs font-semibold text-ink">%s</div><div class="text-[11px] text-muted mt-0.5">%s</div><div class="text-[10px] font-mono text-accent mt-1">%s</div></button>`,
+			html.EscapeString(st.Key), html.EscapeString(st.Label), html.EscapeString(st.Desc), html.EscapeString(st.Config.Trigger.ScheduleHint())))
+	}
+	b.WriteString(`</div></div>`)
+	b.WriteString(`<form class="border-t border-surface-border pt-4 space-y-2.5" hx-post="/api/automation/create" hx-target="#automations" hx-swap="outerHTML">`)
+	b.WriteString(`<div class="text-xs font-semibold text-ink">…or build your own</div>`)
+	b.WriteString(`<input name="name" required placeholder="Automation name (e.g. Morning email digest)" class="w-full px-3 py-2 text-sm rounded-md border border-surface-border bg-surface text-ink focus:border-accent focus:outline-none">`)
+	b.WriteString(`<div class="flex gap-2">`)
+	b.WriteString(`<select name="sched_type" class="px-3 py-2 text-sm rounded-md border border-surface-border bg-surface text-ink focus:border-accent focus:outline-none"><option value="every">every</option><option value="cron">cron</option></select>`)
+	b.WriteString(`<input name="sched_value" required placeholder="15m   ·   1h   ·   daily   ·   0 9 * * 1-5" class="flex-1 px-3 py-2 text-sm rounded-md border border-surface-border bg-surface text-ink font-mono focus:border-accent focus:outline-none">`)
+	b.WriteString(`</div>`)
+	b.WriteString(`<div class="text-[11px] text-muted">every: a duration like <span class="font-mono">15m</span> / <span class="font-mono">1h</span>, or <span class="font-mono">hourly</span> / <span class="font-mono">daily</span>. cron: 5 fields <span class="font-mono">min hour dom mon dow</span> — e.g. <span class="font-mono">0 9 * * 1-5</span> = weekdays 9am.</div>`)
+	b.WriteString(`<textarea name="task" required rows="3" placeholder="What should goon do? e.g. Read my unread email and summarise senders, subjects, and anything needing a reply." class="w-full px-3 py-2 text-sm rounded-md border border-surface-border bg-surface text-ink focus:border-accent focus:outline-none"></textarea>`)
+	b.WriteString(`<input name="notify" placeholder="Notify message (optional). Use {{.Stages.run}} for the result." class="w-full px-3 py-2 text-sm rounded-md border border-surface-border bg-surface text-ink focus:border-accent focus:outline-none">`)
+	b.WriteString(`<div class="flex items-center gap-2"><button type="submit" class="rounded-md bg-accent text-white px-3 py-2 text-xs font-medium hover:bg-accent-strong transition">Create automation</button><span class="text-[11px] text-muted">Builds an executor → notify graph. Edit it visually afterward for anything fancier.</span></div>`)
+	b.WriteString(`</form>`)
+	b.WriteString(`</div>`)
+	return b.String()
+}
+
+// autoFirstLine trims a description to a single, length-capped line for the
+// fleet row subtitle.
+func autoFirstLine(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	if len([]rune(s)) > 90 {
+		s = string([]rune(s)[:90]) + "…"
+	}
+	if s == "" {
+		s = "Scheduled automation"
+	}
+	return s
+}
+
+// findAutomationBySlug resolves a slug to its on-disk automation config.
+func findAutomationBySlug(slug string) (workflow.WorkflowConfig, bool) {
+	slug = workflow.AutomationSlug(slug)
+	for _, a := range workflow.LoadAutomations() {
+		if workflow.AutomationSlug(a.Config.Name) == slug {
+			return a.Config, true
+		}
+	}
+	return workflow.WorkflowConfig{}, false
+}
+
+// handleAutomationCreate saves a new automation — either from a named starter
+// template or from the build-your-own form (executor → notify on a schedule).
+func (s *Server) handleAutomationCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		fragErr(w, "invalid form: "+err.Error())
+		return
+	}
+	var cfg workflow.WorkflowConfig
+	if key := strings.TrimSpace(r.FormValue("starter")); key != "" {
+		found := false
+		for _, st := range workflow.AutomationStarters() {
+			if st.Key == key {
+				cfg = st.Config
+				found = true
+				break
+			}
+		}
+		if !found {
+			fragErr(w, "unknown template: "+key)
+			return
+		}
+	} else {
+		name := strings.TrimSpace(r.FormValue("name"))
+		task := strings.TrimSpace(r.FormValue("task"))
+		if name == "" || task == "" {
+			fragErr(w, "name and task are required")
+			return
+		}
+		trig := workflow.Trigger{Type: "schedule"}
+		val := strings.TrimSpace(r.FormValue("sched_value"))
+		if strings.TrimSpace(r.FormValue("sched_type")) == "cron" {
+			if len(strings.Fields(val)) != 5 {
+				fragErr(w, "cron needs 5 fields: min hour dom mon dow (e.g. 0 9 * * 1-5)")
+				return
+			}
+			trig.Cron = val
+		} else {
+			if val == "" {
+				fragErr(w, "enter an interval like 15m, 1h, hourly, or daily")
+				return
+			}
+			trig.Every = val
+		}
+		msg := strings.TrimSpace(r.FormValue("notify"))
+		if msg == "" {
+			msg = "🔔 " + name + "\n{{.Stages.run}}"
+		}
+		enabled := true
+		cfg = workflow.WorkflowConfig{
+			Version:     2,
+			Name:        name,
+			Description: "Scheduled automation.",
+			Trigger:     trig,
+			Enabled:     &enabled,
+			Stages: []workflow.StageConfig{
+				{Name: "run", Type: workflow.RoleExecutor, OnNext: workflow.StringList{"notify"}, Task: task},
+				{Name: "notify", Type: workflow.RoleNotify, Message: msg},
+			},
+		}
+	}
+	if _, err := workflow.SaveAutomation(cfg); err != nil {
+		fragErr(w, "save failed: "+err.Error())
+		return
+	}
+	s.events.Publish("automationsChanged")
+	s.renderAutomations(w)
+}
+
+// handleAutomationToggle flips an automation's enabled flag.
+func (s *Server) handleAutomationToggle(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	_ = r.ParseForm()
+	cfg, ok := findAutomationBySlug(r.FormValue("slug"))
+	if !ok {
+		fragErr(w, "automation not found")
+		return
+	}
+	nv := !cfg.IsEnabled()
+	cfg.Enabled = &nv
+	if _, err := workflow.SaveAutomation(cfg); err != nil {
+		fragErr(w, "save failed: "+err.Error())
+		return
+	}
+	s.events.Publish("automationsChanged")
+	s.renderAutomations(w)
+}
+
+// handleAutomationDelete removes an automation file.
+func (s *Server) handleAutomationDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	_ = r.ParseForm()
+	slug := workflow.AutomationSlug(r.FormValue("slug"))
+	if slug == "" {
+		fragErr(w, "missing automation")
+		return
+	}
+	if err := workflow.DeleteAutomation(slug); err != nil {
+		fragErr(w, "delete failed: "+err.Error())
+		return
+	}
+	s.events.Publish("automationsChanged")
+	s.renderAutomations(w)
+}
+
+// handleAutomationRun fires one automation immediately via the daemon (which
+// owns the engine + lock). Requires a running daemon that implements
+// AutomationRunner.
+func (s *Server) handleAutomationRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	_ = r.ParseForm()
+	cfg, ok := findAutomationBySlug(r.FormValue("slug"))
+	if !ok {
+		fragErr(w, "automation not found")
+		return
+	}
+	runner, canRun := s.opts.Daemon.(AutomationRunner)
+	if !canRun {
+		fragErr(w, "start the daemon to run automations on demand (run: goon start)")
+		return
+	}
+	runner.RunAutomationNow(cfg.Name)
+	fragOK(w, fmt.Sprintf("running “%s” now — watch your notify channel / logs", cfg.Name))
 }
 
 // fragSetup renders a banner if the daemon isn't fully configured yet.
@@ -2353,9 +3787,9 @@ func statusKV(w http.ResponseWriter, k, v string) {
 // colours match the new palette's semantic roles:
 //   - stopped → cool grey (muted), no pulse
 //   - paused  → vibrant amber (highlight), no pulse — paused is a
-//               deliberate state, not an error, but should stand out
+//     deliberate state, not an error, but should stand out
 //   - running → neon purple (accent) with the pulse-dot animation, so
-//               the brand-purple matches the header logo glow when live
+//     the brand-purple matches the header logo glow when live
 func statusBadge(st memory.DaemonStatus) (string, string) {
 	switch {
 	case !st.Running:
@@ -2403,13 +3837,14 @@ func (s *Server) fragStatusPill(w http.ResponseWriter, _ *http.Request) {
 	if st.Running && !st.Paused {
 		dotAnim = " pulse-dot"
 	}
+	glyph := ""
 	fmt.Fprintf(w, `<div class="flex items-center gap-2.5" data-paused="%s" data-running="%s" title="Last poll: %s">
 		<span class="h-2 w-2 rounded-full shrink-0 %s%s"></span>
 		<div class="min-w-0 flex-1">
-			<div class="text-[11px] font-medium %s">%s</div>
+			<div class="flex items-center gap-1.5 text-[11px] font-medium %s">%s%s</div>
 			<div class="text-[10px] text-muted font-mono">polled %s</div>
 		</div>
-	</div>`, pausedFlag, runningFlag, html.EscapeString(last), dotClass, dotAnim, labelColor, state, html.EscapeString(last))
+	</div>`, pausedFlag, runningFlag, html.EscapeString(last), dotClass, dotAnim, labelColor, glyph, state, html.EscapeString(last))
 }
 
 // fragQuestionsBanner renders a yellow strip above the tabs when there
@@ -2477,9 +3912,9 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 			Clear cached tickets
 		</button>
 	</div>`, len(tks), pluralS(len(tks)))
-	fmt.Fprint(w, `<div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised shadow-card">
+	fmt.Fprint(w, `<div class="overflow-x-auto rounded-xl border-2 border-amber-700/25 dark:border-amber-300/20 ring-1 ring-inset ring-amber-700/10 dark:ring-amber-300/10 bg-amber-50/40 dark:bg-surface-raised shadow-card">
 	<table class="min-w-full text-sm">
-		<thead class="sticky top-0 z-10 border-b border-gray-200 dark:border-surface-border text-[11px] uppercase tracking-wider text-gray-500 bg-gray-50/50 dark:bg-surface">
+		<thead class="sticky top-0 z-10 border-b border-amber-700/20 dark:border-amber-300/15 text-[11px] uppercase tracking-wider text-gray-500 bg-amber-50/80 dark:bg-surface">
 			<tr>
 				<th class="px-4 py-2.5 text-left font-semibold">Key</th>
 				<th class="px-4 py-2.5 text-left font-semibold">Title</th>
@@ -2492,6 +3927,10 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 		</thead>
 		<tbody class="divide-y divide-gray-100 dark:divide-surface-border/60">`)
 	ignored := s.opts.Memory.IgnoredTickets()
+	// Repo options for the per-ticket "Pick" control. Only repos with a
+	// local checkout can be assigned — the execute phase needs a working
+	// tree. The checkbox list is identical per row, so build it once.
+	repoCheckboxes, repoOptCount := pickRepoCheckboxes()
 	for _, t := range tks {
 		isIgnored := false
 		if ignored != nil {
@@ -2531,31 +3970,59 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 		var inlineIgnoreBtn string
 		if isIgnored {
 			inlineIgnoreBtn = fmt.Sprintf(
-				`<form hx-post="/api/ticket/unignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline">` +
-				`<input type="hidden" name="key" value="%s">` +
-				`<button type="submit" title="Restore into workflow" class="p-1.5 rounded text-emerald-500 hover:bg-emerald-500/10 transition">` +
-				`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.5"/></svg>` +
-				`</button></form>`,
+				`<form hx-post="/api/ticket/unignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline">`+
+					`<input type="hidden" name="key" value="%s">`+
+					`<button type="submit" title="Restore into workflow" class="p-1.5 rounded text-emerald-500 hover:bg-emerald-500/10 transition">`+
+					`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 .49-4.5"/></svg>`+
+					`</button></form>`,
 				actionsRowID, escapedKey)
 		} else {
 			inlineIgnoreBtn = fmt.Sprintf(
-				`<form hx-post="/api/ticket/ignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline">` +
-				`<input type="hidden" name="key" value="%s">` +
-				`<button type="submit" title="Skip in daemon workflow" class="p-1.5 rounded text-muted hover:text-amber-500 hover:bg-amber-500/10 transition">` +
-				`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>` +
-				`</button></form>`,
+				`<form hx-post="/api/ticket/ignore" hx-target="#%s-r" hx-swap="innerHTML" class="inline">`+
+					`<input type="hidden" name="key" value="%s">`+
+					`<button type="submit" title="Skip in daemon workflow" class="p-1.5 rounded text-muted hover:text-amber-500 hover:bg-amber-500/10 transition">`+
+					`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>`+
+					`</button></form>`,
 				actionsRowID, escapedKey)
 		}
 
 		// Drawer toggle — three-dot icon opens comment/status/edit panel.
 		drawerBtn := fmt.Sprintf(
 			`<button type="button" onclick="document.getElementById('%s').classList.toggle('hidden')" `+
-			`title="Comment / status / edit" class="p-1.5 rounded text-muted hover:text-accent hover:bg-accent/10 transition">`+
-			`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>`+
-			`</button>`,
+				`title="Comment / status / edit" class="p-1.5 rounded text-muted hover:text-accent hover:bg-accent/10 transition">`+
+				`<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="19" cy="12" r="1.5"/></svg>`+
+				`</button>`,
 			actionsRowID)
 
 		actionCell := `<div class="inline-flex items-center gap-0.5">` + inlineIgnoreBtn + drawerBtn + `</div>`
+
+		// Pick control — only for tickets goon hasn't taken yet (no open or
+		// completed workflow) and that aren't ignored. The user assigns
+		// repo(s) and clicks Pick to push the ticket into the workflow.
+		pickBlock := ""
+		if !isIgnored {
+			hasWF := s.opts.Memory.HasOpenWorkflowFor(t.ID) || s.opts.Memory.HasCompletedWorkflowFor(t.ID)
+			switch {
+			case hasWF:
+				pickBlock = ""
+			case s.opts.Memory.IsPickQueued(t.ID):
+				pickBlock = `<div class="flex-1 min-w-[160px] space-y-1.5"><p class="text-[10px] font-semibold uppercase tracking-wider text-muted">Pick</p>` +
+					`<span class="inline-flex items-center gap-1 rounded-full bg-accent/15 text-accent px-2 py-0.5 text-[11px] font-medium">⏳ queued for goon</span></div>`
+			case repoOptCount == 0:
+				pickBlock = `<div class="flex-1 min-w-[160px] space-y-1.5"><p class="text-[10px] font-semibold uppercase tracking-wider text-muted">Pick</p>` +
+					`<p class="text-[11px] text-muted">Map a repo to a local checkout on the <strong>Repositories</strong> tab to enable Pick.</p></div>`
+			default:
+				pickBlock = `<div class="flex-1 min-w-[160px] space-y-1.5">` +
+					`<p class="text-[10px] font-semibold uppercase tracking-wider text-muted">Pick → run in goon</p>` +
+					`<form hx-post="/api/ticket/pick" hx-target="#` + actionsRowID + `-r" hx-swap="innerHTML" class="space-y-1.5">` +
+					`<input type="hidden" name="id" value="` + html.EscapeString(t.ID) + `">` +
+					`<div class="space-y-1 max-h-28 overflow-y-auto pr-1">` + repoCheckboxes + `</div>` +
+					`<button type="submit" class="rounded bg-accent text-surface px-3 py-1 text-xs font-semibold hover:brightness-110 transition">pick →</button>` +
+					`</form>` +
+					`<p class="text-[10px] text-muted">assigns the repo(s), then goon plans &amp; asks you to approve.</p>` +
+					`</div>`
+			}
+		}
 
 		fmt.Fprintf(w, `<tr data-ticket-row data-status="%s" class="hover:bg-gray-50 dark:hover:bg-surface-raised/60 transition%s">
 			<td class="px-4 py-2.5 font-mono whitespace-nowrap align-middle">%s</td>
@@ -2602,6 +4069,7 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 							<button type="submit" class="rounded border border-accent/40 text-accent px-3 py-1 text-xs font-medium hover:bg-accent/10 transition">apply →</button>
 						</form>
 					</div>
+					%s
 				</div>
 				<div id="%s-r" class="mt-2 text-xs"></div>
 			</td>
@@ -2614,6 +4082,7 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 			actionsRowID, escapedKey,
 			actionsRowID, escapedKey, escapedKey,
 			actionsRowID, escapedKey,
+			pickBlock,
 			actionsRowID,
 		)
 	}
@@ -2631,6 +4100,7 @@ func (s *Server) fragTickets(w http.ResponseWriter, _ *http.Request) {
 //   - in-review         → neon purple accent (waiting on a human)
 //   - done/merged       → emerald (universally "shipped")
 //   - blocked           → rose (universally "stop")
+//
 // Keeping emerald + rose for the universal traffic-light semantics; the
 // rest tie back to the brand.
 func ticketStatusPill(status string) string {
@@ -2656,79 +4126,160 @@ func ticketStatusPill(status string) string {
 		cls, html.EscapeString(label))
 }
 
+// pickRepoCheckboxes builds the repo checkbox list for the Tickets-tab
+// "Pick" control and returns how many options exist. Only repos that have a
+// local checkout in REPOSITORY.md are offered — the execute phase needs a
+// working tree, so remote-only entries are skipped.
+func pickRepoCheckboxes() (out string, count int) {
+	ents, err := repository.Read()
+	if err != nil {
+		return "", 0
+	}
+	var b strings.Builder
+	for _, e := range ents {
+		if strings.TrimSpace(e.Local) == "" {
+			continue
+		}
+		slug := html.EscapeString(e.Remote)
+		b.WriteString(`<label class="flex items-center gap-1.5"><input type="checkbox" name="repos" value="` +
+			slug + `" class="accent-accent"> <span class="font-mono text-[11px] text-ink">` + slug + `</span></label>`)
+		count++
+	}
+	return b.String(), count
+}
+
+// goonGlyph renders one decorative nautical glyph from the inline
+// <symbol> sprite in index.html (ship, anchor, storm, chest, flag…).
+// Stroke is currentColor, so the tailwind text-* class in cls themes it
+// for light AND dark automatically. Purely decorative (aria-hidden) —
+// the plain text label next to it always carries the meaning.
+func goonGlyph(id, cls string) string {
+	return `<svg class="goon-glyph ` + cls + `" aria-hidden="true" focusable="false"><use href="#goon-i-` + id + `"></use></svg>`
+}
+
+// wfPipeline is the display order + short labels for the built-in
+// engine pipeline, shared by the mini flow (workflow cards) and the
+// full stage route (workflow detail).
+var wfPipeline = []struct{ name, short string }{
+	{"triage", "plan"},
+	{"confirm_repo", "repo"},
+	{"approve_plan", "plan"},
+	{"execute", "exec"},
+	{"test", "test"},
+	{"verify", "verify"},
+	{"update_memory", "memory"},
+	{"open_pr", "pr"},
+	{"notify", "notify"},
+}
+
 // renderMiniStageFlow renders a compact horizontal pipeline flowchart for
 // a workflow card. Each stage is a small colored dot; the current stage
-// gets a slightly larger accent dot. Stages that come after the current
-// one are muted gray; completed stages are emerald.
-func renderMiniStageFlow(currentStage string, state memory.WorkflowState) string {
-	pipeline := []struct{ name, short string }{
-		{"triage", "triage"},
-		{"confirm_repo", "repo"},
-		{"approve_plan", "plan"},
-		{"execute", "exec"},
-		{"test", "test"},
-		{"verify", "verify"},
-		{"update_memory", "memory"},
-		{"open_pr", "pr"},
-		{"notify", "notify"},
-	}
-
+// is marked by a tiny ship (voyage theme) — or a flag while a gate waits
+// on the user, or a storm cloud when the workflow failed. Stages after
+// the current one are muted gray; completed stages are emerald.
+func renderMiniStageFlow(wf memory.Workflow) string {
+	state := wf.State
 	// Find index of current stage.
 	cur := -1
-	for i, p := range pipeline {
-		if p.name == currentStage {
+	for i, p := range wfPipeline {
+		if p.name == wf.Stage {
 			cur = i
 			break
 		}
 	}
+	isGate := wf.Stage == "confirm_repo" || wf.Stage == "approve_plan"
 
 	var b strings.Builder
 	b.WriteString(`<div class="mt-2 flex items-center gap-0 overflow-x-auto pb-0.5">`)
-	for i, p := range pipeline {
+	for i, p := range wfPipeline {
 		if i > 0 {
 			// Connector line — green if both sides are done.
 			lineCls := "bg-surface-border/60"
-			if cur >= 0 && i <= cur && state != memory.WFFailed {
+			if (cur >= 0 && i <= cur && state != memory.WFFailed) || state == memory.WFDone {
 				lineCls = "bg-emerald-500/50"
 			}
 			b.WriteString(`<div class="h-px w-3 shrink-0 ` + lineCls + `"></div>`)
 		}
-		// Dot style by position relative to current.
-		var dotCls, titleAttr string
-		titleAttr = `title="` + p.name + `"`
-		switch {
-		case state == memory.WFDone:
-			dotCls = "bg-emerald-500"
-		case state == memory.WFFailed && i == cur:
-			dotCls = "bg-rose-500 ring-1 ring-rose-400/60"
-		case cur < 0 || i < cur:
-			// Done stages (before current).
-			if state != memory.WFFailed {
-				dotCls = "bg-emerald-500/80"
-			} else {
-				dotCls = "bg-surface-border"
-			}
-		case i == cur:
-			// Active stage.
-			dotCls = "bg-accent ring-2 ring-accent/30 w-3 h-3"
-		default:
-			// Pending.
-			dotCls = "bg-surface-border"
-		}
-		// Active stage gets a label below it.
-		label := ""
-		if i == cur {
-			label = `<span class="text-[9px] text-accent whitespace-nowrap leading-none mt-0.5">` + html.EscapeString(p.short) + `</span>`
-		}
+		titleAttr := `title="` + p.name + `"`
 		b.WriteString(`<div class="shrink-0 flex flex-col items-center">`)
-		if label != "" {
-			b.WriteString(`<div class="w-3 h-3 rounded-full ` + dotCls + `" ` + titleAttr + `></div>` + label)
-		} else {
-			b.WriteString(`<div class="w-2 h-2 rounded-full ` + dotCls + `" ` + titleAttr + `></div>`)
+		switch {
+		case i == cur && state == memory.WFFailed:
+			b.WriteString(`<span ` + titleAttr + ` class="grid place-items-center h-4 w-4 rounded-full bg-danger/15 border border-danger/50"><svg class="h-2.5 w-2.5 text-danger" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 10L10 2M2 2l8 8"/></svg></span>` +
+				`<span class="text-[9px] text-danger/80 whitespace-nowrap leading-none mt-0.5">` + html.EscapeString(p.short) + `</span>`)
+		case i == cur && state == memory.WFAwaitingApproval && isGate:
+			b.WriteString(`<span ` + titleAttr + ` class="grid place-items-center h-4 w-4 rounded-full bg-highlight/15 border border-highlight/50"><svg class="h-2.5 w-2.5 text-highlight" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v3.5L8 8"/><circle cx="6" cy="6" r="5"/></svg></span>` +
+				`<span class="text-[9px] text-amber-600 dark:text-amber-400 whitespace-nowrap leading-none mt-0.5">` + html.EscapeString(p.short) + `</span>`)
+		case i == cur:
+			b.WriteString(`<span ` + titleAttr + ` class="grid place-items-center h-4 w-4 rounded-full bg-accent/15 border border-accent/60"><span class="h-2 w-2 rounded-full bg-accent pulse-dot"></span></span>` +
+				`<span class="text-[9px] text-accent whitespace-nowrap leading-none mt-0.5">` + html.EscapeString(p.short) + `</span>`)
+		case p.name == "open_pr" && wf.PRURL != "":
+			b.WriteString(`<span ` + titleAttr + ` class="grid place-items-center h-4 w-4 rounded-full bg-success/15 border border-success/50"><svg class="h-2.5 w-2.5 text-success" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 6l3 3 5-5"/></svg></span>`)
+		case state == memory.WFDone, cur >= 0 && i < cur && state != memory.WFFailed:
+			b.WriteString(`<div class="w-2 h-2 rounded-full bg-emerald-500/80" ` + titleAttr + `></div>`)
+		case cur < 0 && state != memory.WFFailed && wf.Stage == "done":
+			b.WriteString(`<div class="w-2 h-2 rounded-full bg-emerald-500/80" ` + titleAttr + `></div>`)
+		default:
+			b.WriteString(`<div class="w-2 h-2 rounded-full bg-surface-border" ` + titleAttr + `></div>`)
 		}
 		b.WriteString(`</div>`)
 	}
 	b.WriteString(`</div>`)
+	return b.String()
+}
+
+// renderStageRoute renders the full "voyage" strip for the workflow
+// detail panel: every pipeline stage as a labelled island dot on a
+// dotted sea route. The current stage is marked by a small bobbing
+// ship; a waiting gate shows a flag, a failure shows a storm cloud,
+// and an opened PR shows an open chest at the end of the route.
+// Decorative layer only — every label stays the plain stage name, and
+// the animation is pure CSS so SSE fragment re-renders are safe.
+func renderStageRoute(wf memory.Workflow) string {
+	cur := -1
+	for i, p := range wfPipeline {
+		if p.name == wf.Stage {
+			cur = i
+			break
+		}
+	}
+	isGate := wf.Stage == "confirm_repo" || wf.Stage == "approve_plan"
+	allDone := wf.State == memory.WFDone || wf.Stage == "done"
+
+	label := "pipeline complete"
+	if cur >= 0 {
+		label = fmt.Sprintf("pipeline stage %d of %d: %s", cur+1, len(wfPipeline), wf.Stage)
+	}
+
+	var b strings.Builder
+	b.WriteString(`<div class="stage-route" role="img" aria-label="` + html.EscapeString(label) + `">`)
+	b.WriteString(`<div class="relative flex items-start justify-between gap-1 overflow-x-auto pb-1"><div class="route-line"></div>`)
+	for i, p := range wfPipeline {
+		var node, labelCls string
+		ring := `<span class="relative grid place-items-center h-[22px] w-[22px] rounded-full border-2 bg-surface `
+		switch {
+		case i == cur && wf.State == memory.WFFailed:
+			node = ring + `border-danger/60 bg-danger/10"><svg class="h-3 w-3 text-danger" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 10L10 2M2 2l8 8"/></svg></span>`
+			labelCls = "text-rose-600 dark:text-rose-400 font-semibold"
+		case i == cur && wf.State == memory.WFAwaitingApproval && isGate:
+			node = ring + `border-highlight/60 bg-highlight/10"><svg class="h-3 w-3 text-highlight" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 3v3.5L8 8"/><circle cx="6" cy="6" r="5"/></svg></span>`
+			labelCls = "text-amber-700 dark:text-amber-400 font-semibold"
+		case i == cur:
+			node = ring + `border-accent/60 bg-accent/10"><span class="h-2 w-2 rounded-full bg-accent pulse-dot"></span></span>`
+			labelCls = "text-accent font-semibold"
+		case p.name == "open_pr" && wf.PRURL != "":
+			node = ring + `border-success/60 bg-success/10"><svg class="h-3 w-3 text-success" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M2 6l3 3 5-5"/></svg></span>`
+			labelCls = "text-emerald-700 dark:text-emerald-400"
+		case allDone, cur >= 0 && i < cur && wf.State != memory.WFFailed:
+			node = ring + `border-emerald-500"><span class="h-2 w-2 rounded-full bg-emerald-500"></span></span>`
+			labelCls = "text-emerald-700 dark:text-emerald-400"
+		default:
+			node = ring + `border-surface-border"><span class="h-1.5 w-1.5 rounded-full bg-surface-border"></span></span>`
+			labelCls = "text-muted"
+		}
+		b.WriteString(`<div class="flex flex-col items-center gap-1 shrink-0 min-w-[44px]">` + node +
+			`<span class="text-[10px] leading-none ` + labelCls + `">` + html.EscapeString(p.short) + `</span></div>`)
+	}
+	b.WriteString(`</div></div>`)
 	return b.String()
 }
 
@@ -3002,15 +4553,27 @@ func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
 			}
 		}
 
-		// Flat card. No shadow at rest — borders carry the visual weight.
-		// Hover gets the subtle lift so interactivity is still hinted.
-		// The 2px left-edge color is the only chrome that depends on
-		// state; everything else is plain typography.
+		// Card chrome: state-colored left edge, with a soft glow on the
+		// states that want attention (awaiting amber, failed rose, active
+		// indigo). Hover lifts the card slightly — interactivity hint.
+		edgeGlow := ""
+		switch wf.State {
+		case memory.WFAwaitingApproval:
+			edgeGlow = " shadow-[0_0_12px_rgba(245,158,11,0.55)]"
+		case memory.WFFailed:
+			edgeGlow = " shadow-[0_0_12px_rgba(244,63,94,0.55)]"
+		case memory.WFDone:
+			// done rests quietly
+		default:
+			if total > 0 && pct < 100 {
+				edgeGlow = " shadow-[0_0_12px_rgba(99,102,241,0.5)]"
+			}
+		}
 		wfSearch := html.EscapeString(strings.ToLower(wf.TicketKey + " " + wf.Title))
-		fmt.Fprintf(w, `<div data-wf-state="%s" data-wf-search="%s" class="group relative rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
-			<div class="absolute left-0 top-0 bottom-0 w-0.5 %s rounded-l-lg"></div>
+		fmt.Fprintf(w, `<div data-wf-state="%s" data-wf-search="%s" class="group relative rounded-lg border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised hover:border-accent/40 hover:-translate-y-0.5 hover:shadow-lg transition-all duration-150">
+			<div class="absolute left-0 top-0 bottom-0 w-1 %s%s rounded-l-lg"></div>
 			<details>
-				<summary class="cursor-pointer list-none px-4 py-3 select-none">`, workflowStateKey(wf.State), wfSearch, edgeTone)
+				<summary class="cursor-pointer list-none px-4 py-3 select-none">`, workflowStateKey(wf.State), wfSearch, edgeTone, edgeGlow)
 		fmt.Fprintf(w, `<div class="flex items-center justify-between gap-3">
 			<div class="min-w-0 flex-1">
 				<div class="flex items-center gap-2 text-sm font-semibold text-gray-900 dark:text-gray-100">
@@ -3027,7 +4590,19 @@ func (s *Server) fragWorkflows(w http.ResponseWriter, _ *http.Request) {
 			<span class="text-muted/50">·</span>
 			<span class="shrink-0">%s</span>
 		</div>`, stage, html.EscapeString(humanizeSince(wf.UpdatedAt)))
-		fmt.Fprint(w, renderMiniStageFlow(wf.Stage, wf.State))
+		fmt.Fprint(w, renderMiniStageFlow(wf))
+
+		// Plan progress — slim bar + counter, only once a plan exists.
+		if total > 0 {
+			barTone := "bg-accent"
+			if pct >= 100 {
+				barTone = "bg-emerald-500"
+			}
+			fmt.Fprintf(w, `<div class="mt-2 flex items-center gap-2">
+				<div class="h-1 flex-1 rounded-full bg-surface-sunken overflow-hidden"><div class="h-full rounded-full %s transition-all duration-300" style="width:%d%%"></div></div>
+				<span class="text-[10px] font-mono text-muted shrink-0">%d/%d steps</span>
+			</div>`, barTone, pct, done, total)
+		}
 
 		fmt.Fprintf(w, `</summary>
 				<div class="border-t border-gray-100 dark:border-surface-border/60 px-4 py-3"
@@ -3119,6 +4694,12 @@ func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 		html.EscapeString(domID(wf.ID)),
 		html.EscapeString(wf.ID),
 	)
+
+	// Stage route — the full pipeline at a glance (voyage strip). Sits
+	// right under the meta strip so "where is this workflow" is the
+	// first thing the open card answers.
+	fmt.Fprint(w, renderStageRoute(wf))
+
 	if wf.Repo != "" || wf.Branch != "" || len(wf.Repos) > 0 {
 		fmt.Fprint(w, `<div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">`)
 		if wf.Repo != "" && !strings.EqualFold(wf.Repo, projectKeyOf(wf.TicketKey)) {
@@ -3399,8 +4980,9 @@ func (s *Server) fragWorkflowDetail(w http.ResponseWriter, r *http.Request) {
 //   - failed      → rose (universally "stop / broken")
 //   - awaiting_approval → amber highlight (the user must act)
 //   - active phases (executing/testing/verifying/etc) → purple accent
-//                   (live brand state — matches the daemon dot)
+//     (live brand state — matches the daemon dot)
 //   - planning phases (triaging/planning) → soft purple wash
+//
 // titleCaseState converts a snake_case workflow state like "awaiting_approval"
 // to title-cased words with spaces like "Awaiting Approval". Does not use
 // the deprecated strings.Title — instead manually capitalises each word.
@@ -3610,10 +5192,10 @@ func truncateStr(s string, n int) string {
 // renderRepoPickButtons scans the question body for the numbered menu
 // format that buildRepoGateQuestion in internal/workflow emits:
 //
-//	   1. repo-a
-//	 * 2. repo-b              (the "*" marks the suggested one)
-//	   3. repo-c
-//	   4. owner/svc (remote)  (remote-tagged entries)
+//  1. repo-a
+//     * 2. repo-b              (the "*" marks the suggested one)
+//  3. repo-c
+//  4. owner/svc (remote)  (remote-tagged entries)
 //
 // and returns a multi-select panel: a row of checkboxes (so the user
 // can pick more than one), a typeahead filter (essential when an org
@@ -3983,7 +5565,6 @@ func emptyState(title, hint string) string {
 	</div>`, html.EscapeString(title), html.EscapeString(hint))
 }
 
-
 // --- Tab composers ---------------------------------------------------------
 //
 // Each tab is a small wrapper that sets the section heading + spacing,
@@ -4146,6 +5727,11 @@ func (s *Server) fragTabWorkflows(w http.ResponseWriter, _ *http.Request) {
 	</div>`)
 	fmt.Fprint(w, `<div hx-get="/fragments/workflows" hx-trigger="load, workflowsChanged from:body" hx-swap="morph">
 		<div class="space-y-2"><div class="skel h-4 w-40"></div><div class="skel h-20 w-full"></div><div class="skel h-20 w-full"></div></div>
+	</div>`)
+	// Scheduled automations fleet — user-added workflows that run on a timer
+	// (digests, health checks, anything), separate from the board pipeline above.
+	fmt.Fprint(w, `<div class="mt-7" hx-get="/fragments/automations" hx-trigger="load, automationsChanged from:body" hx-swap="innerHTML">
+		<div class="space-y-2"><div class="skel h-4 w-44"></div><div class="skel h-16 w-full"></div></div>
 	</div>`)
 }
 
@@ -4335,10 +5921,10 @@ func (s *Server) fragUsage(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `<section class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4">
 		<div class="flex items-center justify-between mb-3">
 			<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
-				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 16l4-6 4 3 4-7"/></svg>
+				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
 				Token usage
 			</h3>
-			<span class="text-[11px] text-muted font-mono">` + html.EscapeString(humanizeSince(meter.UpdatedAt())) + `</span>
+			<span class="text-[11px] text-muted font-mono">`+html.EscapeString(humanizeSince(meter.UpdatedAt()))+`</span>
 		</div>`)
 
 	if total == 0 {
@@ -4391,7 +5977,7 @@ func (s *Server) fragSessions(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `<section class="rounded-xl border border-gray-200 dark:border-surface-border bg-white dark:bg-surface-raised p-4">
 		<div class="flex items-center justify-between mb-3">
 			<h3 class="text-sm font-semibold text-gray-700 dark:text-gray-300 flex items-center gap-2">
-				<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+			<svg class="h-4 w-4 text-accent" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.9 4.9l2.8 2.8M16.3 16.3l2.8 2.8M1 12h4M19 12h4M4.9 19.1l2.8-2.8M16.3 7.7l2.8-2.8"/></svg>
 				Live sessions
 			</h3>
 		</div>`)
@@ -4512,22 +6098,29 @@ func errorClassHint(class string) string {
 }
 
 // healthPill renders one status chip for the Home health widget. tone is
-// one of green/amber/red/gray.
+// one of green/amber/red/gray. Each tone carries a small nautical glyph
+// (ship = healthy, flag = needs attention, storm = down, anchor = idle)
+// next to the unchanged plain-text state, so the meaning never relies on
+// color alone.
 func healthPill(label, state, tone string) string {
-	var border, bg, text, dot string
+	var border, bg, text, glyph string
 	switch tone {
 	case "green":
-		border, bg, text, dot = "border-emerald-500/40", "bg-emerald-500/10", "text-emerald-700 dark:text-emerald-400", "bg-emerald-500"
+		border, bg, text = "border-emerald-500/40", "bg-emerald-500/10", "text-emerald-700 dark:text-emerald-400"
+		glyph = `<span class="h-1.5 w-1.5 rounded-full bg-emerald-500 shrink-0"></span>`
 	case "amber":
-		border, bg, text, dot = "border-amber-500/40", "bg-amber-500/10", "text-amber-700 dark:text-amber-400", "bg-amber-500"
+		border, bg, text = "border-amber-500/40", "bg-amber-500/10", "text-amber-700 dark:text-amber-400"
+		glyph = `<span class="h-1.5 w-1.5 rounded-full bg-amber-500 shrink-0"></span>`
 	case "red":
-		border, bg, text, dot = "border-rose-500/40", "bg-rose-500/10", "text-rose-700 dark:text-rose-400", "bg-rose-500"
+		border, bg, text = "border-rose-500/40", "bg-rose-500/10", "text-rose-700 dark:text-rose-400"
+		glyph = `<span class="h-1.5 w-1.5 rounded-full bg-rose-500 shrink-0"></span>`
 	default:
-		border, bg, text, dot = "border-surface-border", "bg-surface-raised", "text-muted", "bg-surface-border"
+		border, bg, text = "border-surface-border", "bg-surface-raised", "text-muted"
+		glyph = `<span class="h-1.5 w-1.5 rounded-full bg-surface-border shrink-0"></span>`
 	}
 	return fmt.Sprintf(`<span class="inline-flex items-center gap-1.5 rounded-full border %s %s px-2.5 py-1 text-[11px] %s">
-		<span class="inline-block h-1.5 w-1.5 rounded-full %s"></span>%s <span class="opacity-70">%s</span></span>`,
-		border, bg, text, dot, html.EscapeString(label), html.EscapeString(state))
+		%s%s <span class="opacity-70">%s</span></span>`,
+		border, bg, text, glyph, html.EscapeString(label), html.EscapeString(state))
 }
 
 // firstTicketHint returns the contextual sub-label for the readiness
@@ -4686,7 +6279,7 @@ func (s *Server) fragTabDashboard(w http.ResponseWriter, _ *http.Request) {
 			actionBtn = `<form hx-post="/api/daemon/resume" hx-swap="none" class="m-0 shrink-0"><button type="submit" class="rounded-lg bg-emerald-500 text-white px-3 py-1.5 text-xs font-semibold hover:bg-emerald-600 transition">Resume daemon</button></form>` + actionBtn
 		}
 		fmt.Fprintf(w, `<div class="mb-6 flex flex-wrap items-start gap-3 rounded-xl border border-rose-500/40 bg-rose-500/10 px-4 py-3">
-			<span class="text-rose-700 dark:text-rose-400 text-lg leading-none">⚠</span>
+			<svg class="h-5 w-5 text-rose-700 dark:text-rose-400 mt-0.5 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
 			<div class="flex-1 min-w-0">
 				<div class="text-sm font-semibold text-rose-700 dark:text-rose-300">%s%s</div>
 				<div class="text-xs text-rose-700/80 dark:text-rose-300/80 mt-0.5 break-words">%s</div>

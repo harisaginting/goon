@@ -1,33 +1,44 @@
 {
   "version": 2,
   "name": "marketing-brief",
-  "description": "Brief → review → publish pipeline for marketing campaigns. Skips PR creation.",
+  "description": "Brief → review → publish for marketing campaigns. The executor drafts the brief + channel messages, a human reviewer approves, then publish + notify run on approval. No PR is opened.",
   "branch_prefix": "campaign/",
   "pr_title_template": "",
   "pr_body_template": "",
   "stages": [
     {
-      "name": "brief",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.4,
-      "max_tokens": 1200,
-      "prompt": "You are a marketing strategist. Turn this campaign request into a structured brief.\n\nReply with EXACTLY ONE JSON object:\n{\n  \"audience\": \"...\",\n  \"value_prop\": \"...\",\n  \"channels\": [\"...\"],\n  \"messages\": [{\"channel\":\"...\",\"hook\":\"...\",\"body\":\"...\"}]\n}\n\nREQUEST:\ntitle: {{.Title}}\ndescription: {{.Description}}"
+      "name": "draft",
+      "type": "executor",
+      "task": "Draft a marketing brief and channel messages for {{.Key}} ({{.Title}}).\nContext: {{.Description}}\nSave the brief to ./campaigns/{{.Key}}/brief.md and call finish when done.",
+      "on_next": "review"
     },
     {
       "name": "review",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.0,
-      "prompt": "You are a brand-voice reviewer. The proposed brief is below. Reply JSON {\"approved\": true|false, \"notes\":\"...\"}.\n\nBRIEF:\n{{json .Stages.brief}}"
+      "type": "reviewer",
+      "mode": "human",
+      "task": "Review the campaign brief for {{.Key}} — brand voice, accuracy, and channel fit.",
+      "on_approve": ["publish", "notify"],
+      "on_reject": "rework",
+      "max_loops": 3
+    },
+    {
+      "name": "rework",
+      "type": "loop",
+      "max_loops": 3,
+      "on_next": "draft",
+      "on_done": "end"
     },
     {
       "name": "publish",
-      "type": "agent",
-      "task": "Publish the approved campaign for {{.Key}}.\n\nBrief: {{json .Stages.brief}}\nReviewer notes: {{get .Stages.review \"notes\"}}\nApproved: {{get .Stages.review \"approved\"}}\n\nSave the final assets to ./campaigns/{{.Key}}/ and call finish when done. If review was not approved, revise the body and try once more before finishing."
+      "type": "executor",
+      "task": "Publish the approved campaign for {{.Key}}: finalise the assets under ./campaigns/{{.Key}}/ and call finish.",
+      "on_next": "end"
+    },
+    {
+      "name": "notify",
+      "type": "notify",
+      "message": "📣 Campaign {{.Key}} approved & published — {{.Title}}"
     }
   ],
-  "hooks": {
-    "after_execute": ["echo 'campaign {{.Key}} published' >> ~/.goon/campaigns.log"]
-  }
+  "hooks": {}
 }

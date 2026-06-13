@@ -1,5 +1,5 @@
 {
   "version": 1,
   "name": "minimal",
-  "description": "Smallest working workflow. Everything not set inherits from goon's built-in defaults: 9-phase pipeline with two approval gates, branch_prefix=goon/, verify_runs=3."
+  "description": "Smallest working workflow. Everything not set inherits goon's defaults — including the role-graph (execute → human reviewer → on approve: open PR + notify; on reject: rework loop) that LoadConfig injects when no stages are declared. branch_prefix=goon/, verify_runs=3."
 }

@@ -31,6 +31,16 @@ var ReadonlyScopes = []string{
 	"https://www.googleapis.com/auth/logging.read",
 }
 
+// PersonalScopes are the minimal read-only scopes for personal Gmail +
+// Calendar access. Used by the web UI "Connect Google" button — narrower
+// than ReadonlyScopes (no Tasks or Cloud Logging, both of which require
+// extra Google Cloud setup). Upgrade to ReadonlyScopes when log search
+// is needed.
+var PersonalScopes = []string{
+	"https://www.googleapis.com/auth/gmail.readonly",
+	"https://www.googleapis.com/auth/calendar.readonly",
+}
+
 // Config holds the OAuth client credentials + the long-lived refresh
 // token (obtained once via `goon google auth`).
 type Config struct {

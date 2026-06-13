@@ -102,7 +102,24 @@ func Read() ([]Entry, error) {
 		}
 		return nil, fmt.Errorf("repository: read %s: %w", Filename, err)
 	}
-	return Parse(body), nil
+	return dedup(Parse(body)), nil
+}
+
+// dedup removes entries with identical Remote+Local pairs, keeping the first
+// occurrence. This prevents duplicate rows in the UI when REPOSITORY.md has
+// been written twice (e.g. after auto-clone runs twice on the same repo).
+func dedup(entries []Entry) []Entry {
+	seen := map[string]bool{}
+	out := entries[:0:len(entries)]
+	for _, e := range entries {
+		key := strings.ToLower(strings.TrimSpace(e.Remote)) + "\x00" + strings.TrimSpace(e.Local)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, e)
+	}
+	return out
 }
 
 // RawBody returns the file as a string for prompt injection. Empty
