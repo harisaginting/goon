@@ -1,36 +1,57 @@
 {
   "version": 2,
   "name": "engineering-stages",
-  "description": "Engineering pipeline expressed as declarative stages — same end state as the built-in 9-phase pipeline but with prompts you can edit. Copy this when you want to A/B-test triage prompts or insert custom LLM passes between phases.",
+  "description": "Engineering pipeline as an editable role-graph. An executor implements the ticket and may ASK the Spec analyst when requirements are unclear; a human reviewer approves (or rejects into a rework loop); on approval it fans out to open the PR + notify. Same end state as the built-in pipeline, but every prompt + wire is yours to edit — copy this to insert custom analyst passes or extra reviewers.",
   "branch_prefix": "goon/",
   "test_command": "make test",
   "verify_runs": 3,
   "pr_title_template": "[{{.Key}}] {{.Title}}",
-  "pr_body_template": "Resolves {{.Key}}.\n\nPlan:\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
-  "extra_labels": ["auto"],
+  "pr_body_template": "Resolves {{.Key}}.\n\n## Plan\n{{range .Plan}}- {{if .Done}}✓{{else}}✗{{end}} {{.Title}}\n{{end}}\n— opened by goon 🤖",
+  "extra_labels": ["goon", "auto"],
   "stages": [
     {
-      "name": "triage",
-      "type": "llm",
-      "json_mode": true,
-      "temperature": 0.1,
-      "max_tokens": 800,
-      "prompt": "You are GOON's planner. Break this ticket into 3-7 ordered atomic engineering steps that an autonomous agent can do one-by-one. Each step must finish in <= 5 tool calls.\n\nReply with EXACTLY ONE JSON object: {\"steps\":[{\"title\":\"...\"}, ...]}.\nNo prose, no fences, no comments.\n\nTICKET:\nkey: {{.Key}}\ntitle: {{.Title}}\nproject: {{.Project}}"
-    },
-    {
       "name": "execute",
-      "type": "agent",
-      "task": "Implement ticket {{.Key}} ({{.Title}}). Plan:\n{{range .Stages.triage.steps}}- {{.title}}\n{{end}}"
+      "type": "executor",
+      "on_next": "review",
+      "ask": "spec",
+      "max_loops": 3,
+      "task": "Implement ticket {{.Key}} ({{.Title}}). Write the code + tests and make them pass.\nIf the requirements are unclear, finish your turn with a single line 'ASK: <your question>' to consult the Spec analyst, then continue once you have the answer."
     },
     {
-      "name": "verify",
-      "type": "agent",
-      "repeat": 3,
-      "task": "Verify the implementation for ticket {{.Key}} ({{.Title}}) is correct. List any defects via finish."
+      "name": "review",
+      "type": "reviewer",
+      "mode": "human",
+      "on_approve": ["open_pr", "notify"],
+      "on_reject": "rework",
+      "max_loops": 3,
+      "task": "Review the executor's changes for {{.Key}} ({{.Title}}): correctness, regressions, test coverage, missing edge cases. Approve to ship or reject to send it back for rework."
+    },
+    {
+      "name": "rework",
+      "type": "loop",
+      "max_loops": 3,
+      "on_next": "execute",
+      "on_done": "end"
+    },
+    {
+      "name": "open_pr",
+      "type": "executor",
+      "do": "open_pr",
+      "on_next": "end"
+    },
+    {
+      "name": "notify",
+      "type": "notify",
+      "message": "✅ {{.Key}} approved & shipped — {{.Title}}{{if .PRURL}}\nPR: {{.PRURL}}{{end}}"
+    },
+    {
+      "name": "spec",
+      "type": "analyst",
+      "prompt": "You are the Spec / Product analyst for {{.Key}} ({{.Title}}). A team member has a question. Answer it precisely and decisively using the ticket and product context: scope, acceptance criteria, and trade-offs.\n\nQuestion:\n{{.AskQuestion}}"
     }
   ],
   "hooks": {
     "before_pr": ["go fmt ./...", "go vet ./..."],
-    "on_failure": ["echo 'workflow failed for {{.Key}}: $(date)' >> ~/.goon/failures.log"]
+    "on_failure": ["echo 'workflow failed for {{.Key}}' >&2"]
   }
 }

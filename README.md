@@ -35,7 +35,7 @@ Goon is a **general-purpose AI automation daemon**. The built-in pipeline ships 
 | 📋 **Daily standup** | Fetch yesterday's commits + tickets → draft standup → send to Slack |
 | 🔍 **Log monitoring** | Search GCP logs for errors → triage → open incident ticket |
 | 📊 **Weekly report** | Aggregate metrics → write Markdown report → email to team |
-| 🤖 **Any custom job** | Chain LLM, HTTP, agent, notify, and loop stages however you need |
+| 🤖 **Any custom job** | Wire executor, analyst, reviewer, loop, and notify nodes into any role-graph |
 
 Two gates pause workflows until **you say yes** — via web UI, Telegram, or terminal. Reject with feedback and goon re-plans from scratch.
 
@@ -182,27 +182,29 @@ Drop `workflow.json` in your project directory. Goon picks it up on the next pol
 }
 ```
 
-**Daily email digest** — reads Gmail, summarizes, sends to Telegram every morning:
+**Daily email digest** — reads Gmail, summarizes, sends to Telegram. (The **Automations** tab builds this kind of scheduled job for you — see below.)
 
 ```jsonc
 {
   "name": "email-digest",
-  "auto_approve": true,
+  "trigger": { "type": "schedule", "cron": "0 8 * * *" },
   "stages": [
     {
-      "name": "fetch_emails",
-      "type": "agent",
-      "task": "Search Gmail for unread emails from the last 24 hours. Return a JSON list of {from, subject, summary}."
+      "name": "fetch",
+      "type": "executor",
+      "on_next": "summarize",
+      "task": "Search Gmail for unread emails from the last 24 hours. List each one's from, subject, and a one-line summary."
     },
     {
       "name": "summarize",
-      "type": "llm",
-      "prompt": "Given these emails: {{.Stages.fetch_emails.result}}\n\nWrite a concise daily digest grouped by topic. Plain text, bullet points."
+      "type": "analyst",
+      "on_next": "send",
+      "prompt": "Given these emails:\n{{.Stages.fetch}}\n\nWrite a concise daily digest grouped by topic. Plain text, bullet points."
     },
     {
       "name": "send",
       "type": "notify",
-      "message": "📬 Daily digest:\n\n{{.Stages.summarize.result}}"
+      "message": "📬 Daily digest:\n\n{{.Stages.summarize}}"
     }
   ]
 }
@@ -213,65 +215,63 @@ Drop `workflow.json` in your project directory. Goon picks it up on the next pol
 ```jsonc
 {
   "name": "log-monitor",
-  "auto_approve": true,
+  "trigger": { "type": "schedule", "every": "1h" },
   "stages": [
     {
       "name": "scan",
-      "type": "agent",
-      "task": "Search GCP logs for ERROR severity in the last hour. Return JSON {has_errors, count, samples[]}."
+      "type": "executor",
+      "on_next": "triage",
+      "task": "Search GCP logs for ERROR severity in the last hour. Report whether there are errors, the count, and a few samples."
     },
     {
       "name": "triage",
-      "type": "llm",
+      "type": "analyst",
       "json_mode": true,
-      "prompt": "Logs: {{.Stages.scan.result}}\nDecide: should_alert (bool), severity (low/medium/high), summary (string).",
-      "reject_if": "{{eq .Stages.triage.should_alert false}}",
-      "on_reject": "end"
+      "on_next": "alert",
+      "prompt": "Logs:\n{{.Stages.scan}}\nReply JSON {\"should_alert\":bool,\"severity\":\"low|medium|high\",\"summary\":\"...\"}."
     },
     {
       "name": "alert",
       "type": "notify",
+      "if": "{{.Stages.triage.should_alert}}",
       "message": "🚨 {{.Stages.triage.severity}} alert: {{.Stages.triage.summary}}"
     }
   ]
 }
 ```
 
-**Replace the built-in pipeline entirely with custom stages:**
+**A custom engineering role-graph** — executor → human review → rework loop → ship:
 
 ```jsonc
 {
   "stages": [
-    {
-      "name": "plan",
-      "type": "llm",
-      "json_mode": true,
-      "prompt": "Break {{.Key}} into steps. Reply JSON {\"steps\":[...]}."
-    },
-    {
-      "name": "execute",
-      "type": "agent",
-      "task": "Implement: {{index .Stages.plan.steps 0}}"
-    },
-    {
-      "name": "verify",
-      "type": "agent",
-      "repeat": 3,
-      "reject_if": "{{eq .Stages.verify.ok false}}",
-      "on_reject": "execute",
-      "task": "Verify {{.Key}} is complete. List any defects."
-    }
+    { "name": "execute", "type": "executor", "on_next": "review", "ask": "spec" },
+    { "name": "review",  "type": "reviewer", "mode": "human",
+      "on_approve": ["open_pr", "notify"], "on_reject": "rework", "max_loops": 3 },
+    { "name": "rework",  "type": "loop", "on_next": "execute", "on_done": "end", "max_loops": 3 },
+    { "name": "open_pr", "type": "executor", "do": "open_pr", "on_next": "notify" },
+    { "name": "notify",  "type": "notify", "message": "✅ {{.Key}} shipped" },
+    { "name": "spec",    "type": "analyst",
+      "prompt": "Answer the engineer's question about {{.Key}}.\n\n{{.AskQuestion}}" }
   ]
 }
 ```
 
-Stage types: `llm` · `agent` · `notify` · `http` · `loop`
+**Roles:** `executor` (does the work / opens PRs, can `ask` an analyst) · `analyst` (answers with a single LLM call; reached via `ask` or wired forward) · `reviewer` (human or `llm` approval gate) · `loop` (bounded rework) · `notify` (sends a message).
 
-Routing fields: `on_next` · `on_reject` · `reject_if` · `ask_stage` · `max_loops` · `on_done`
+**Routing:** `on_next` · `on_approve` · `on_reject` · `ask` · `on_done` · `max_loops` · `if` · `reject_if` · `repeat`.
 
-- `on_next` accepts a single stage name **or an array** for fan-out — `"on_next": ["review", "docs"]` runs both branches sequentially.
-- `on_reject` can point at the stage itself for a bounded retry (capped by `max_loops`, default 3).
-- `type: "loop"` is a pure routing node: loops back to `on_next` until `max_loops` iterations, then exits via `on_done`. Build review → fix cycles with a hard cap.
+- `on_next` / `on_approve` accept a single stage name **or an array** for fan-out — `"on_approve": ["open_pr", "docs"]` launches both branches.
+- `reviewer` pauses for a human by default (`"mode": "llm"` lets the model decide); reject routes to `on_reject`, usually a `loop`.
+- `type: "loop"` repeats `on_next` up to `max_loops`, then exits via `on_done` — review → fix cycles with a hard cap.
+- Edit all of this visually in **Workflows → Pipeline editor** (drag the islands, draw the wave-wires, watch the fleet sail).
+
+### Scheduled automations
+
+Add a `"trigger"` to run a workflow on a timer instead of off the board —
+`{"type":"schedule","every":"15m"}` or `{"type":"schedule","cron":"0 9 * * 1-5"}`.
+The **Workflows → Automations** panel creates, runs, enables/pauses, and edits
+these for you: daily digests, health checks, log sweeps, anything.
 
 ---
 

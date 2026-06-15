@@ -46,6 +46,11 @@ type Options struct {
 	Stdout   io.Writer
 	Stderr   io.Writer
 	Debug    bool
+	// MaxSteps optionally overrides the package-level MaxSteps for this
+	// agent only (clamped to 50). Zero means "use the global default".
+	// Lets a long-running surface (e.g. the web Code tab) raise the cap
+	// without mutating the process-wide var that the daemon also reads.
+	MaxSteps int
 }
 
 // Agent runs the multi-step loop.
@@ -77,10 +82,20 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 	system := SystemPrompt(a.opts.Tools)
 	chat := []llm.Message{{Role: llm.RoleSystem, Content: system}}
 
+	// Per-run step cap: the agent's own override wins (clamped to 50),
+	// else the package-level default (env GOON_MAX_STEPS).
+	maxSteps := MaxSteps
+	if a.opts.MaxSteps > 0 {
+		maxSteps = a.opts.MaxSteps
+		if maxSteps > 50 {
+			maxSteps = 50
+		}
+	}
+
 	var lastOutput string
 	var lastErr error
 
-	for step := 0; step < MaxSteps; step++ {
+	for step := 0; step < maxSteps; step++ {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -145,7 +160,7 @@ func (a *Agent) Run(ctx context.Context, task string) error {
 
 		// Print intent before executing.
 		fmt.Fprintf(a.opts.Stdout, "→ step %d/%d  tool=%s  args=%v\n",
-			step+1, MaxSteps, call.Tool, call.Args)
+			step+1, maxSteps, call.Tool, call.Args)
 		if call.Rationale != "" && a.opts.Debug {
 			fmt.Fprintf(a.opts.Stderr, "  [rationale] %s\n", call.Rationale)
 		}

@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "name": "super-intern-backend",
+  "name": "software development",
   "description": "Backend software-factory team. A Product Owner (analyst/consultant) is the shared brain every worker can ASK. Work flows Architect -> Backend Engineer (executors/implementers) -> Code Review -> IT Security -> QA (reviewers). Any reviewer REJECT loops back through Rework to the engineer; the final QA approval ships the PR and notifies. Mirrors the multi-agent backend team graph.",
   "branch_prefix": "goon/",
   "pr_title_template": "[{{.Key}}] {{.Title}}",

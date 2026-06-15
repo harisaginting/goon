@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -49,17 +50,27 @@ import (
 // Generous because real multi-step coding takes minutes.
 const codeRunTimeout = 15 * time.Minute
 
+// codeDefaultSteps is the per-run step cap the Code tab uses when the
+// user doesn't pick one. Higher than the daemon's default (5) because
+// building or iterating on a project takes many turns. Clamped to 50.
+const codeDefaultSteps = 25
+
 // codeDir is one selectable working directory in the picker.
 type codeDir struct {
 	Label string // human label, e.g. "backend-api (repo)"
 	Path  string // absolute path on disk
 }
 
-// codeWorkdirs returns the whitelist of directories the agent may run
-// in: the workspace root (filesRoot) first, then every local checkout
-// mapped in REPOSITORY.md that still exists on disk. Deduped by
-// absolute path. This list is the security boundary — handleCodeRun
-// only accepts a workdir that appears here.
+// codeWorkdirs returns the convenience "quick pick" directories shown
+// in the Code tab's dropdown: the current working directory (where goon
+// was launched — usually the goon checkout itself), the configured
+// workspace root, then every local checkout mapped in REPOSITORY.md
+// that still exists on disk. Deduped by absolute path.
+//
+// This list is for convenience only — it is NOT the access gate. The
+// user may also type any directory path (see resolveCodeWorkdir), so
+// they can code in goon's own root, a subdirectory, or any project on
+// the machine without first mapping it.
 func codeWorkdirs() []codeDir {
 	var out []codeDir
 	seen := map[string]bool{}
@@ -83,6 +94,11 @@ func codeWorkdirs() []codeDir {
 		out = append(out, codeDir{Label: label, Path: abs})
 	}
 
+	// Current working dir first — this is goon's own root in the common
+	// "launched from the repo" setup, and a sensible default to code in.
+	if cwd, err := os.Getwd(); err == nil {
+		add("current directory — "+filepath.Base(cwd), cwd)
+	}
 	if root := filesRoot(); root != "" {
 		add("workspace root — "+filepath.Base(root), root)
 	}
@@ -98,30 +114,57 @@ func codeWorkdirs() []codeDir {
 	return out
 }
 
-// resolveCodeWorkdir validates a user-supplied workdir against the
-// whitelist and returns the matched absolute path. Empty input falls
-// back to the first candidate (the workspace root). An error means the
-// path isn't an allowed directory.
+// resolveCodeWorkdir turns a user-supplied workdir into an absolute
+// directory path. Accepts:
+//
+//   - empty → the first quick-pick (current dir / goon root)
+//   - an absolute path to any existing directory (full freedom — this
+//     is a local, single-operator tool with the same trust level as the
+//     `goon "task"` CLI, which already runs in the cwd)
+//   - a path starting with ~ → home-expanded, then treated as absolute
+//   - a relative path → resolved under the workspace root, with no ".."
+//     escape, so the convenience field can target a subdirectory
+//
+// The directory must exist. Command safety is still enforced downstream
+// by safety.Default() on the executor, and run_command is confined to
+// this directory via tools.WithWorkDir.
 func resolveCodeWorkdir(raw string) (string, error) {
-	dirs := codeWorkdirs()
-	if len(dirs) == 0 {
-		return "", fmt.Errorf("no working directory available — set GOON_WORKSPACE_DIR or map a repo in Repositories")
-	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
+		dirs := codeWorkdirs()
+		if len(dirs) == 0 {
+			return "", fmt.Errorf("no working directory available — type a path, set GOON_WORKSPACE_DIR, or map a repo in Repositories")
+		}
 		return dirs[0].Path, nil
 	}
-	abs, err := filepath.Abs(raw)
-	if err != nil {
-		return "", fmt.Errorf("invalid path")
-	}
-	abs = strings.TrimRight(abs, string(os.PathSeparator))
-	for _, d := range dirs {
-		if d.Path == abs {
-			return abs, nil
+
+	// ~ expansion.
+	if raw == "~" || strings.HasPrefix(raw, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			raw = filepath.Join(home, strings.TrimPrefix(strings.TrimPrefix(raw, "~"), "/"))
 		}
 	}
-	return "", fmt.Errorf("directory not allowed — pick one from the list")
+
+	var abs string
+	if filepath.IsAbs(raw) {
+		abs = filepath.Clean(raw)
+	} else {
+		// Relative → under the workspace root, no escape.
+		root := filesRoot()
+		if root == "" {
+			return "", fmt.Errorf("relative path needs a workspace root — set GOON_WORKSPACE_DIR or type an absolute path")
+		}
+		abs = filepath.Clean(filepath.Join(root, raw))
+		if rel, err := filepath.Rel(root, abs); err != nil || strings.HasPrefix(rel, "..") {
+			return "", fmt.Errorf("path escapes the workspace (%q) — type an absolute path instead", raw)
+		}
+	}
+	abs = strings.TrimRight(abs, string(os.PathSeparator))
+	fi, err := os.Stat(abs)
+	if err != nil || !fi.IsDir() {
+		return "", fmt.Errorf("not an existing directory: %s", raw)
+	}
+	return abs, nil
 }
 
 // flushWriter wraps an http.ResponseWriter so each Write is pushed to
@@ -168,6 +211,17 @@ func (s *Server) handleCodeRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Per-run step cap. Default higher than the daemon's (real coding
+	// needs more turns); clamp 1..50. Zero/blank → codeDefaultSteps.
+	steps := codeDefaultSteps
+	if v := strings.TrimSpace(r.FormValue("max_steps")); v != "" {
+		if n, e := strconv.Atoi(v); e == nil && n > 0 {
+			steps = n
+		}
+	}
+	if steps > 50 {
+		steps = 50
+	}
 
 	// Stream as plain text. Clear the server's 30s WriteTimeout for
 	// this connection — coding sessions run for minutes and there's no
@@ -183,7 +237,7 @@ func (s *Server) handleCodeRun(w http.ResponseWriter, r *http.Request) {
 
 	fmt.Fprintf(fw, "▶ workdir : %s\n", workdir)
 	fmt.Fprintf(fw, "▶ task    : %s\n", task)
-	fmt.Fprintf(fw, "▶ steps   : capped at %d (raise GOON_MAX_STEPS in Setup)\n", agent.MaxSteps)
+	fmt.Fprintf(fw, "▶ steps   : capped at %d\n", steps)
 	fmt.Fprint(fw, strings.Repeat("─", 56)+"\n\n")
 
 	// Build the agent stack — same wiring as the CLI one-shot agent.
@@ -202,6 +256,7 @@ func (s *Server) handleCodeRun(w http.ResponseWriter, r *http.Request) {
 		Memory:   s.opts.Memory,
 		Stdout:   fw,
 		Stderr:   fw,
+		MaxSteps: steps,
 	})
 
 	// Context: tie to the request (so the browser's Stop/abort cancels
@@ -249,12 +304,6 @@ func (s *Server) fragTabCode(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	dirs := codeWorkdirs()
-	if len(dirs) == 0 {
-		fmt.Fprint(w, `<div class="rounded-md bg-amber-500/10 border border-amber-500/30 px-3 py-2 text-sm text-amber-700 dark:text-amber-400">
-			No working directory available. Set <code class="font-mono">GOON_WORKSPACE_DIR</code> (or <code class="font-mono">GOON_WORKDIR</code>), or map a repo to a local checkout in <button type="button" class="underline" onclick="showPage('prs')">Repositories</button>.
-		</div>`)
-		return
-	}
 
 	// Picker + task + controls.
 	fmt.Fprint(w, `<div class="grid grid-cols-1 xl:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)] gap-4">`)
@@ -263,15 +312,24 @@ func (s *Server) fragTabCode(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprint(w, `<div class="space-y-3">`)
 	fmt.Fprint(w, `<div class="rounded-xl border border-surface-border bg-surface-raised p-4 space-y-3">`)
 
-	// Workdir select.
+	// Workdir: optional quick-pick dropdown + a free-form path field so
+	// the user can code in goon's own root, a subdirectory, or any
+	// project on the machine without mapping it first.
 	fmt.Fprint(w, `<div>
-		<label for="code-workdir" class="block text-xs font-medium text-muted mb-1">Working directory</label>
-		<select id="code-workdir" class="block w-full rounded-md border border-surface-border bg-surface text-ink text-sm px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-accent/40">`)
-	for _, d := range dirs {
-		fmt.Fprintf(w, `<option value="%s">%s</option>`,
-			html.EscapeString(d.Path), html.EscapeString(d.Label))
+		<label for="code-workdir" class="block text-xs font-medium text-muted mb-1">Working directory</label>`)
+	if len(dirs) > 0 {
+		fmt.Fprint(w, `<select id="code-workdir" class="block w-full rounded-md border border-surface-border bg-surface text-ink text-sm px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-accent/40">`)
+		for _, d := range dirs {
+			fmt.Fprintf(w, `<option value="%s">%s</option>`,
+				html.EscapeString(d.Path), html.EscapeString(d.Label))
+		}
+		fmt.Fprint(w, `</select>`)
+	} else {
+		fmt.Fprint(w, `<input type="hidden" id="code-workdir" value="">`)
 	}
-	fmt.Fprint(w, `</select>
+	fmt.Fprint(w, `<input id="code-workdir-manual" type="text" spellcheck="false" autocapitalize="off" autocomplete="off"
+			placeholder="…or type any directory (absolute, ~/path, or relative to workspace)"
+			class="block w-full mt-2 rounded-md border border-surface-border bg-surface text-ink text-xs font-mono px-2.5 py-1.5 focus:outline-none focus:ring-2 focus:ring-accent/40">
 		<p id="code-workdir-path" class="mt-1 text-[11px] font-mono text-muted truncate"></p>
 	</div>`)
 
@@ -283,17 +341,21 @@ func (s *Server) fragTabCode(w http.ResponseWriter, _ *http.Request) {
 	</div>`)
 
 	// Controls + warning.
-	fmt.Fprintf(w, `<div class="flex items-center gap-2">
+	fmt.Fprintf(w, `<div class="flex flex-wrap items-center gap-2">
 		<button type="button" id="code-run" onclick="goonCodeRun()"
 			class="rounded-md bg-accent text-surface text-sm px-4 py-1.5 font-semibold hover:brightness-110 transition disabled:opacity-50 disabled:cursor-not-allowed">Run</button>
 		<button type="button" id="code-stop" onclick="goonCodeStop()" style="display:none"
 			class="rounded-md bg-rose-600 text-white text-sm px-4 py-1.5 font-semibold hover:brightness-110 transition">Stop</button>
+		<label for="code-steps" class="text-xs text-muted flex items-center gap-1 ml-1">steps
+			<input id="code-steps" type="number" min="1" max="50" value="%d"
+				class="w-16 rounded-md border border-surface-border bg-surface text-ink text-xs px-2 py-1 focus:outline-none focus:ring-2 focus:ring-accent/40">
+		</label>
 		<span id="code-status" class="text-xs text-muted"></span>
 	</div>
 	<p class="text-[11px] text-amber-700 dark:text-amber-400 flex items-start gap-1.5">
 		<svg class="w-3.5 h-3.5 shrink-0 mt-px" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-		<span>This runs shell commands and edits files in the selected directory. Steps are capped at %d and each run times out after %d min.</span>
-	</p>`, agent.MaxSteps, int(codeRunTimeout.Minutes()))
+		<span>This runs shell commands and edits files in the chosen directory. Each run is capped at the step count above (max 50) and times out after %d min.</span>
+	</p>`, codeDefaultSteps, int(codeRunTimeout.Minutes()))
 
 	fmt.Fprint(w, `</div></div>`) // close card + left column
 
@@ -314,19 +376,28 @@ func (s *Server) fragTabCode(w http.ResponseWriter, _ *http.Request) {
 (function(){
   var ctrl = null;
   function el(id){ return document.getElementById(id); }
+  function chosenDir(){
+    var manual = el('code-workdir-manual');
+    if (manual && manual.value.trim()) return manual.value.trim();
+    var sel = el('code-workdir');
+    return sel ? sel.value : '';
+  }
   function syncPath(){
-    var sel = el('code-workdir'); var p = el('code-workdir-path');
-    if (sel && p) p.textContent = sel.value || '';
+    var p = el('code-workdir-path');
+    if (p) p.textContent = chosenDir() || '';
   }
   window.goonCodeRun = function(){
-    var sel = el('code-workdir'), task = el('code-task'), out = el('code-transcript');
+    var task = el('code-task'), out = el('code-transcript');
     var runBtn = el('code-run'), stopBtn = el('code-stop'), status = el('code-status');
     if (!task.value.trim()) { task.focus(); return; }
+    var dir = chosenDir();
+    if (!dir) { var m = el('code-workdir-manual'); if (m) m.focus(); status.textContent = 'pick or type a directory'; return; }
     runBtn.disabled = true; stopBtn.style.display = '';
     status.textContent = 'running…';
     out.textContent = '';
     ctrl = new AbortController();
-    var body = new URLSearchParams({ workdir: sel.value, task: task.value });
+    var steps = el('code-steps') ? el('code-steps').value : '';
+    var body = new URLSearchParams({ workdir: dir, task: task.value, max_steps: steps });
     fetch('/api/code/run', { method:'POST', body: body, signal: ctrl.signal })
       .then(function(resp){
         if (!resp.ok) { return resp.text().then(function(t){ throw new Error(t || ('HTTP '+resp.status)); }); }
@@ -353,8 +424,9 @@ func (s *Server) fragTabCode(w http.ResponseWriter, _ *http.Request) {
       });
   };
   window.goonCodeStop = function(){ if (ctrl) ctrl.abort(); };
-  var sel = el('code-workdir');
-  if (sel && !sel.dataset.bound) { sel.dataset.bound = '1'; sel.addEventListener('change', syncPath); }
+  var sel = el('code-workdir'), manual = el('code-workdir-manual');
+  if (sel && sel.tagName === 'SELECT' && !sel.dataset.bound) { sel.dataset.bound = '1'; sel.addEventListener('change', syncPath); }
+  if (manual && !manual.dataset.bound) { manual.dataset.bound = '1'; manual.addEventListener('input', syncPath); }
   syncPath();
 })();
 </script>`)

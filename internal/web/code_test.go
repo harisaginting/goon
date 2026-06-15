@@ -12,28 +12,58 @@ import (
 	"github.com/harisaginting/goon/internal/memory"
 )
 
-// TestResolveCodeWorkdir is the security boundary: only directories in
-// the whitelist (workspace root + mapped local checkouts) are accepted;
-// everything else — parent dirs, absolute escapes — is refused.
+// TestResolveCodeWorkdir covers the (intentionally permissive) workdir
+// rules: any existing directory is allowed (absolute, or relative to the
+// workspace root with no ".." escape); non-existent paths and files are
+// refused. The whitelist is only a UI convenience, not the gate.
 func TestResolveCodeWorkdir(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GOON_WORKSPACE_DIR", dir)
 	t.Setenv("GOON_STORAGE_DIR", t.TempDir()) // isolate REPOSITORY.md
 
-	abs, _ := filepath.Abs(dir)
-	abs = strings.TrimRight(abs, string(os.PathSeparator))
+	absDir, _ := filepath.Abs(dir)
+	absDir = strings.TrimRight(absDir, string(os.PathSeparator))
 
-	if got, err := resolveCodeWorkdir(""); err != nil || got != abs {
-		t.Fatalf("empty input: got %q err %v, want %q", got, err, abs)
+	// empty → first quick-pick, which must be an existing directory.
+	got, err := resolveCodeWorkdir("")
+	if err != nil {
+		t.Fatalf("empty: unexpected err %v", err)
 	}
-	if got, err := resolveCodeWorkdir(abs); err != nil || got != abs {
-		t.Fatalf("exact path: got %q err %v, want %q", got, err, abs)
+	if fi, e := os.Stat(got); e != nil || !fi.IsDir() {
+		t.Fatalf("empty returned non-dir %q (err %v)", got, e)
 	}
-	if _, err := resolveCodeWorkdir(filepath.Join(dir, "..")); err == nil {
-		t.Errorf("expected rejection for parent directory")
+
+	// absolute existing directory → accepted as-is (full freedom, incl.
+	// goon's own root and any project on the machine).
+	if got, err := resolveCodeWorkdir(absDir); err != nil || got != absDir {
+		t.Fatalf("abs dir: got %q err %v, want %q", got, err, absDir)
 	}
-	if _, err := resolveCodeWorkdir("/etc"); err == nil {
-		t.Errorf("expected rejection for /etc (not in whitelist)")
+
+	// relative path under the workspace root → accepted.
+	sub := filepath.Join(dir, "pkg")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	absSub := strings.TrimRight(sub, string(os.PathSeparator))
+	if got, err := resolveCodeWorkdir("pkg"); err != nil || got != absSub {
+		t.Fatalf("relative subdir: got %q err %v, want %q", got, err, absSub)
+	}
+
+	// non-existent → rejected.
+	if _, err := resolveCodeWorkdir(filepath.Join(dir, "nope")); err == nil {
+		t.Errorf("expected rejection for non-existent directory")
+	}
+	// relative ".." escape beyond the workspace root → rejected.
+	if _, err := resolveCodeWorkdir("../escape"); err == nil {
+		t.Errorf("expected rejection for relative .. escape")
+	}
+	// a file (not a directory) → rejected.
+	f := filepath.Join(dir, "file.txt")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveCodeWorkdir(f); err == nil {
+		t.Errorf("expected rejection for a file path")
 	}
 }
 
@@ -81,7 +111,7 @@ func TestHandleCodeRun_StreamsAndFinishes(t *testing.T) {
 		LLM:    llm.NewMock([]string{`{"tool":"finish","args":{"message":"all done"}}`}),
 	})
 	rr := httptest.NewRecorder()
-	form := url.Values{"task": {"do a thing"}, "workdir": {dir}}
+	form := url.Values{"task": {"do a thing"}, "workdir": {dir}, "max_steps": {"7"}}
 	req := httptest.NewRequest("POST", "/api/code/run", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	s.mux().ServeHTTP(rr, req)
@@ -90,7 +120,7 @@ func TestHandleCodeRun_StreamsAndFinishes(t *testing.T) {
 		t.Fatalf("code = %d, want 200", rr.Code)
 	}
 	body := rr.Body.String()
-	for _, want := range []string{"workdir", "task", "do a thing", "✓ done", "all done"} {
+	for _, want := range []string{"workdir", "task", "do a thing", "capped at 7", "✓ done", "all done"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("transcript missing %q in:\n%s", want, body)
 		}

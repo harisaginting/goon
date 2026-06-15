@@ -129,7 +129,10 @@ func TestConfigGET_MasksSensitive(t *testing.T) {
 }
 
 func TestFragSetup_BannerShowsWhenUnconfigured(t *testing.T) {
+	// No LLM key set → banner must appear.
 	s, _ := newServer(t)
+	t.Setenv("GOON_LLM_PROVIDER", "")
+	t.Setenv("OPENAI_API_KEY", "")
 	mux := s.mux()
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/fragments/setup", nil))
@@ -139,8 +142,10 @@ func TestFragSetup_BannerShowsWhenUnconfigured(t *testing.T) {
 }
 
 func TestFragSetup_HiddenWhenConfigured(t *testing.T) {
-	s, d := newServer(t)
-	d.configured = true
+	// Both LLM and board set → banner must disappear.
+	s, _ := newServer(t)
+	t.Setenv("GOON_LLM_PROVIDER", "ollama") // ollama needs no key
+	t.Setenv("GOON_BOARD", "github")
 	mux := s.mux()
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/fragments/setup", nil))

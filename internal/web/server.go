@@ -1804,30 +1804,36 @@ func (s *Server) fragWorkflowConfig(w http.ResponseWriter, r *http.Request) {
 	/* Graph-canvas editor styles. Pure CSS so re-renders are free. */
 	#wg-canvas { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab;
 		background-color: #2E8FC9;
-		background-image: radial-gradient(rgb(255 255 255 / 0.16) 1.5px, transparent 1.7px);
-		background-size: 26px 26px; }
+		background-image: linear-gradient(#5FB8E6 0%, #2E8FC9 52%, #1F6FA9 100%);
+		background-size: 100% 100%; background-repeat: no-repeat; }
+	/* flat-cel wave bands anchored to the bottom of the sea (decorative backdrop) */
+	.wg-wave { position: absolute; left: -2%; width: 104%; height: 74px; pointer-events: none; }
 	#wg-canvas.wg-panning { cursor: grabbing; }
 	#wg-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; }
-	#wg-world .wg-step, #wg-world .wg-life { transition: box-shadow 150ms, border-color 150ms;
-		box-shadow: 0 8px 16px -10px rgb(0 0 0 / 0.5); }
-	#wg-world .wg-step:hover { box-shadow: 0 14px 30px -8px rgb(0 0 0 / 0.45); }
-	#wg-world .wg-step.wg-sel { box-shadow: 0 0 0 3px #FFD66B, 0 16px 34px -8px rgb(0 0 0 / 0.55); }
+	#wg-world .wg-life { transition: box-shadow 150ms, border-color 150ms; box-shadow: 0 8px 16px -10px rgb(0 0 0 / 0.5); }
+	/* Island nodes: the .wg-step box is transparent — the SVG ellipse + name-plate ARE the art. */
+	#wg-world .wg-step { background: transparent; }
+	#wg-world .wg-step .wg-isle { transition: stroke 120ms; }
+	#wg-world .wg-step .wg-plate { transition: transform 120ms, border-color 120ms, box-shadow 120ms; }
+	#wg-world .wg-step:hover .wg-plate { transform: translateY(-2px); }
+	#wg-world .wg-step.wg-sel .wg-isle { stroke: #6366F1; stroke-width: 5; }
+	#wg-world .wg-step.wg-sel .wg-plate { border-color: #6366F1; box-shadow: 0 0 0 2px #6366F1, 0 3px 0 -1px rgba(20,70,110,0.5); }
 	#wg-world .wg-dragging { z-index: 30; cursor: grabbing;
 		box-shadow: 0 18px 40px -12px rgb(0 0 0 / 0.5); }
 	#wg-edges { position: absolute; left: 0; top: 0; width: 8px; height: 8px; overflow: visible; pointer-events: none; }
 	#wg-edges path { pointer-events: stroke; cursor: pointer; }
 	#wg-edges path#wg-ghost { pointer-events: none; }
-	.wg-edge { fill: none; stroke-linecap: round; stroke-dasharray: 9 6; animation: wgDash 1s linear infinite; }
-	.wg-edge-case { fill: none; stroke: rgb(13 27 42 / 0.55); pointer-events: none; }
+	.wg-edge { fill: none; stroke-linecap: round; stroke-dasharray: 2 8; animation: wgDash 1.4s linear infinite; }
+	.wg-edge-case { fill: none; stroke: rgb(13 27 42 / 0.32); pointer-events: none; }
 	.wg-edge-sel { filter: drop-shadow(0 0 4px rgb(var(--c-accent))); }
 	/* fat invisible hit area so thin wires are easy to click + select */
 	.wg-hit { fill: none; stroke: transparent; stroke-width: 18; cursor: pointer; }
 	/* delete badge shown on the selected wire */
 	#wg-edges .wg-del { pointer-events: auto; cursor: pointer; }
 	#wg-edges .wg-del circle:hover { fill: rgb(244 63 94 / 0.18); }
-	@keyframes wgDash { to { stroke-dashoffset: -15; } }
-	.wg-port { position: absolute; width: 11px; height: 11px; border-radius: 9999px; z-index: 12;
-		border: 2px solid rgb(var(--c-muted)); background: rgb(var(--c-surface));
+	@keyframes wgDash { to { stroke-dashoffset: -10; } }
+	.wg-port { position: absolute; width: 12px; height: 12px; border-radius: 9999px; z-index: 12;
+		border: 2.5px solid #1E2433; background: #FBF2DF;
 		cursor: crosshair; transition: transform 120ms; }
 	.wg-port:hover { transform: scale(1.4); }
 	.wg-pal-item { cursor: grab; transition: transform 120ms, border-color 120ms; }
@@ -2066,7 +2072,7 @@ function renderAll(){
 // on_next / on_reject / ask_stage props. Layout persists per-pipeline in
 // localStorage. CRITICAL (history): selection must NEVER rebuild node
 // DOM mid-pointer interaction — wgSelectStep only toggles classes.
-var NODE_W=232, NODE_H=86, LIFE_W=132, LIFE_H=48;
+var NODE_W=150, NODE_H=126, LIFE_W=120, LIFE_H=46;
 var WORLD={x:60,y:40,k:1};
 var NODEPOS={};   // node id (or '__start'/'__finish') -> {x,y} world coords
 var selEdge=null; // selected explicit wire key, deletable via Delete key
@@ -2082,11 +2088,11 @@ function persistPos(){
 		localStorage.setItem(posStoreKey(), JSON.stringify(o));
 	}catch(err){}
 }
-function spinePos(i){ return {x:40+LIFE_W+60+i*(NODE_W+52), y:250}; }
+function spinePos(i){ return {x:40+LIFE_W+60+i*(NODE_W+118), y:250}; }
 // autoLayout: forward spine in a row, analysts floated ABOVE it, loops BELOW
 // it, Start at the left and Finish at the right — readable, room for wires.
 function autoLayout(){
-	var COLW=NODE_W+120, ROWY=320, baseX=210;
+	var COLW=NODE_W+118, ROWY=330, baseX=210;
 	var byName={}; STEPS.forEach(function(s,j){ byName[s.name]=j; });
 	var order=[], seen={}, cur=STEPS[0], guard=0;
 	while(cur && guard<STEPS.length+2){ guard++; if(seen[cur.id]) break; seen[cur.id]=true; order.push(cur); var pr=cur.props||{}; var nx=nextList(pr)[0]; if(!nx) nx=approveList(pr)[0]; if(!nx||nx==='end'||byName[nx]==null) break; cur=STEPS[byName[nx]]; }
@@ -2098,8 +2104,8 @@ function autoLayout(){
 	var midX=baseX+(Math.max(0,spine.length-1)/2)*COLW;
 	var an=STEPS.filter(function(s){return s.type==='analyst';});
 	var lp=STEPS.filter(function(s){return s.type==='loop';});
-	an.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(an.length-1)/2)*COLW), y:ROWY-215}; });
-	lp.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(lp.length-1)/2)*COLW), y:ROWY+225}; });
+	an.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(an.length-1)/2)*COLW), y:ROWY-255}; });
+	lp.forEach(function(s,i){ pos[s.id]={x:Math.round(midX+(i-(lp.length-1)/2)*COLW), y:ROWY+260}; });
 	pos.__start={x:baseX-LIFE_W-60, y:ROWY+(NODE_H-LIFE_H)/2};
 	pos.__finish={x:baseX+spine.length*COLW, y:ROWY+(NODE_H-LIFE_H)/2};
 	return pos;
@@ -2112,12 +2118,17 @@ function ensureLayout(){
 	if(!NODEPOS.__finish) NODEPOS.__finish=shared.__finish||saved.__finish||auto.__finish||{x:700,y:289};
 }
 
+// waveBand / waveDeco draw the landing-page cel sea: flat blue wave bands with
+// a bold ink crest, anchored to the bottom of the canvas as a fixed backdrop.
+function waveBand(fill,bottom){ return '<svg class="wg-wave" style="bottom:'+bottom+'px" viewBox="0 0 1200 90" preserveAspectRatio="none" aria-hidden="true"><path d="M0 50 Q75 18 150 50 T300 50 T450 50 T600 50 T750 50 T900 50 T1050 50 T1200 50 V90 H0 Z" fill="'+fill+'" stroke="#1E2433" stroke-width="4"></path></svg>'; }
+function waveDeco(){ return '<div style="position:absolute;left:0;right:0;bottom:0;height:200px;pointer-events:none;overflow:hidden">'+waveBand('#2E8FC9',120)+waveBand('#1F6FA9',55)+waveBand('#175A8C',-8)+'</div>'; }
 function renderSteps(){
 	var body=document.getElementById('wg-body');
 	if(!body) return;
 	renderPalette();
 	ensureLayout();
 	var h='<div id="wg-canvas" class="select-none">';
+	h+=waveDeco();
 	h+='<div id="wg-world">';
 	h+='<svg id="wg-edges" aria-hidden="true"></svg>';
 	h+=lifeNode('__start');
@@ -2130,7 +2141,7 @@ function renderSteps(){
 	h+='<button type="button" onclick="wgZoomBtn(1)" title="Zoom in" aria-label="Zoom in" class="'+tb+'">+</button>';
 	h+='<button type="button" onclick="wgZoomBtn(-1)" title="Zoom out" aria-label="Zoom out" class="'+tb+'">&minus;</button>';
 	h+='<button type="button" onclick="wgFit()" title="Fit view" class="'+tb+'">fit</button>';
-	h+='<button type="button" onclick="wgTidy()" title="Auto-arrange nodes" class="'+tb+'">tidy</button>';
+	h+='<button type="button" onclick="wgTidy()" title="Auto-organize the islands into a clean map" class="'+tb+'">organize</button>';
 	h+='<span class="w-px h-4 mx-0.5" style="background:rgb(var(--c-border))"></span>';
 	h+='<button type="button" onclick="wgTogglePalette()" title="Hide / show steps panel (left)" aria-label="Toggle left panel" class="'+tb+'">◧</button>';
 	h+='<button type="button" onclick="wgTogglePanel()" title="Hide / show editor panel (right)" aria-label="Toggle right panel" class="'+tb+'">◨</button>';
@@ -2168,6 +2179,19 @@ function roleGlyph(t,ship){
 	if(t==='loop') return GLYPH_LOOP;
 	return '<svg class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg>';
 }
+// islandObject draws the role's landmark (drawn relative to the island's centre,
+// rising above the sandy ellipse) — matching the landing-page voyage art:
+// analyst=palm+note, executor=hut, reviewer=document+check, loop=mountain,
+// notify=flag, open_pr ship=treasure chest.
+function islandObject(t,ship){
+	if(ship) return '<rect x="-26" y="-14" width="52" height="28" rx="5" fill="#A9713F" stroke="#1E2433" stroke-width="4"></rect><path d="M-26 -14 q0 -18 26 -18 q26 0 26 18 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="4"></path><rect x="-5" y="-4" width="10" height="12" rx="2" fill="#FFD66B" stroke="#1E2433" stroke-width="3"></rect>';
+	if(t==='analyst') return '<path d="M-12 10 L-12 -24 q-24 -12 -38 2 q18 -2 24 8 M-12 -24 q22 -14 36 0 q-17 -3 -24 9" fill="none" stroke="#2C6E47" stroke-width="6" stroke-linecap="round"></path><rect x="6" y="-12" width="26" height="22" rx="3" fill="#FBF2DF" stroke="#1E2433" stroke-width="3.5"></rect><line x1="11" y1="-4" x2="27" y2="-4" stroke="#1E2433" stroke-width="2"></line><line x1="11" y1="2" x2="23" y2="2" stroke="#1E2433" stroke-width="2"></line>';
+	if(t==='executor') return '<path d="M-22 14 L-22 -18 L18 -18 L18 14" fill="#A9713F" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"></path><path d="M-30 -18 L26 -18 L20 -32 L-24 -32 Z" fill="#8A5A33" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"></path><rect x="-10" y="-6" width="18" height="20" rx="2" fill="#FBF2DF" stroke="#1E2433" stroke-width="3"></rect>';
+	if(t==='reviewer') return '<rect x="-28" y="-24" width="44" height="34" rx="4" fill="#FBF2DF" stroke="#1E2433" stroke-width="4"></rect><line x1="-20" y1="-12" x2="8" y2="-12" stroke="#1E2433" stroke-width="2.5"></line><line x1="-20" y1="-4" x2="4" y2="-4" stroke="#1E2433" stroke-width="2.5"></line><line x1="-20" y1="4" x2="8" y2="4" stroke="#1E2433" stroke-width="2.5"></line><path d="M18 2 l7 7 l14 -16" fill="none" stroke="#1E8E5A" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"></path>';
+	if(t==='loop') return '<path d="M-26 12 L-8 -30 L4 -8 L16 -34 L34 12 Z" fill="#7BA05B" stroke="#1E2433" stroke-width="4" stroke-linejoin="round"></path><path d="M-14 -14 l8 -8 M22 -20 l-6 -8" stroke="#1E2433" stroke-width="3" stroke-linecap="round"></path>';
+	if(t==='notify') return '<line x1="0" y1="14" x2="0" y2="-34" stroke="#1E2433" stroke-width="4" stroke-linecap="round"></line><path d="M0 -34 L26 -27 L0 -19 Z" fill="#E8833A" stroke="#1E2433" stroke-width="3.5" stroke-linejoin="round"></path>';
+	return '<rect x="-20" y="-20" width="40" height="40" rx="6" fill="#FBF2DF" stroke="#1E2433" stroke-width="4"></rect>';
+}
 // SHIP_SVG is goon's voyage ship (from the landing page), scaled + centred on
 // its origin so animateMotion can sail it along the spine path.
 var SHIP_SVG='<g transform="translate(-15.6,-13) scale(0.13)">'
@@ -2179,38 +2203,38 @@ var SHIP_SVG='<g transform="translate(-15.6,-13) scale(0.13)">'
 function graphNode(st,i){
 	var m=typeMeta(st.type), on=(st.id===selId);
 	var p=NODEPOS[st.id]||spinePos(i);
-	var preview=stepPreview(st);
-	// Each node is a sandy ISLAND (tan body, dark outline) with a role glyph
-	// and a sea-blue shoreline along the bottom — matching goon's voyage-map
-	// art. Decorative layer is clipped to the rounded shape; ports sit OUTSIDE
-	// it (direct children) so they are never clipped.
+	// Each node is a voyage-map ISLAND: a sandy ellipse landmass carrying the
+	// role's landmark (palm+note / hut / document+check / mountain / flag /
+	// treasure chest) with a cream name-plate label below it. The .wg-step box
+	// is transparent — the art is the SVG; ports sit on the box edges.
 	var isShip=!!(st.type==='executor' && st.props && st.props.do==='open_pr');
-	var glyphCol=isShip?'#8A5A33':m.color;
+	var cx=NODE_W/2;
 	var h='<div class="wg-step absolute cursor-grab '+(on?'wg-sel':'')+'"'
 	  +' data-id="'+st.id+'" tabindex="0" role="button"'
 	  +' aria-label="Step '+(i+1)+': '+escX(st.name||'unnamed')+' ('+escX(m.label)+')"'
 	  +' onkeydown="if(event.key===\'Enter\'||event.key===\' \'){event.preventDefault();wgSelectStep(\''+st.id+'\');}"'
-	  +' style="left:'+p.x+'px;top:'+p.y+'px;width:'+NODE_W+'px;height:'+NODE_H+'px;background:#EFD9A0;border:3px solid #1E2433;border-radius:20px">';
-	h+='<div class="absolute inset-0 pointer-events-none" style="border-radius:17px;overflow:hidden">';
-	h+='<svg class="absolute inset-x-0 bottom-0 w-full" height="13" viewBox="0 0 '+NODE_W+' 13" preserveAspectRatio="none" aria-hidden="true"><path d="M0 8 Q '+(NODE_W/8)+' 2 '+(NODE_W/4)+' 8 T '+(NODE_W/2)+' 8 T '+(NODE_W*3/4)+' 8 T '+NODE_W+' 8 V13 H0 Z" fill="#2E8FC9"></path></svg>';
-	h+='</div>';
-	h+='<div class="relative flex items-start gap-2 px-2.5 pt-2 pointer-events-none">';
-	h+='<span class="w-8 h-8 rounded-full flex items-center justify-center shrink-0" style="background:#FBF2DF;color:'+glyphCol+';border:2.5px solid #1E2433">'+roleGlyph(st.type,isShip)+'</span>';
-	h+='<div class="flex-1 min-w-0 pr-11">';
-	h+='<div class="text-[14px] font-bold truncate" style="color:#1E2433" data-stepname="'+st.id+'">'+escX(st.name||'(unnamed)')+'</div>';
-	h+='<div class="text-[9.5px] uppercase tracking-wider font-bold" style="color:'+glyphCol+'">'+escX(isShip?'ship · open PR':m.label)+'</div>';
-	if(preview) h+='<div class="text-[10px] truncate font-mono mt-0.5" style="color:#1E2433;opacity:.7">'+escX(preview)+'</div>';
+	  +' style="left:'+p.x+'px;top:'+p.y+'px;width:'+NODE_W+'px;height:'+NODE_H+'px">';
+	// island illustration (sandy ellipse + role landmark)
+	h+='<svg class="absolute left-0 top-0 pointer-events-none" width="'+NODE_W+'" height="96" viewBox="0 0 '+NODE_W+' 96" style="overflow:visible">';
+	h+='<ellipse class="wg-isle" cx="'+cx+'" cy="72" rx="60" ry="18" fill="#EFD9A0" stroke="#1E2433" stroke-width="4"></ellipse>';
+	h+='<g transform="translate('+cx+',56)">'+islandObject(st.type,isShip)+'</g>';
+	h+='</svg>';
+	// cream name-plate label beneath the island
+	h+='<div class="absolute" style="left:0;right:0;bottom:3px;display:flex;justify-content:center">';
+	h+='<div class="wg-plate flex items-center gap-1.5" style="max-width:'+(NODE_W-4)+'px;background:#FBF2DF;border:2.5px solid #1E2433;border-radius:10px;padding:2px 9px;box-shadow:0 3px 0 -1px rgba(20,70,110,0.5)">';
+	h+='<span class="shrink-0" style="width:9px;height:9px;border-radius:99px;background:'+m.color+';border:1.5px solid #1E2433"></span>';
+	h+='<span class="truncate" title="'+escX(st.name||'')+'" style="font-size:12.5px;font-weight:800;color:#1E2433;line-height:1.35" data-stepname="'+st.id+'">'+escX(st.name||'(unnamed)')+'</span>';
 	h+='</div></div>';
-	h+='<div class="absolute left-2.5 bottom-1 text-[9px] font-mono pointer-events-none" style="color:#1E2433;opacity:.5;z-index:1">'+(i+1)+'</div>';
+	h+='<div class="absolute pointer-events-none" style="left:2px;top:0;font-size:9px;font-family:monospace;color:#1E2433;opacity:.45">'+(i+1)+'</div>';
 	// ports: input (left) + typed outputs (right). Normal steps get
 	// ask/next/reject; loop nodes get LOOP (the body, repeats) + DONE
 	// (the exit once max loops is spent). NEXT supports several wires —
 	// drop on more nodes to fan out.
 	var inLoop=(st.type==='loop');
-	h+='<span class="wg-port" data-node="'+st.id+'" data-port="in" style="'+(inLoop?'right:-7px;top:18px':'left:-7px;top:'+(NODE_H/2-6)+'px')+'" title="arrival"></span>';
+	h+='<span class="wg-port" data-node="'+st.id+'" data-port="in" style="'+(inLoop?'right:-7px;top:40px':'left:-7px;top:64px')+'" title="arrival"></span>';
 	// ports are data-driven per role (TYPES[type].ports): executor ask+next,
 	// reviewer ask+approve+reject, loop loop+done, notify next, analyst none.
-	var PORTY={ask:14, next:NODE_H/2-6, approve:NODE_H/2-6, reject:NODE_H-26, done:NODE_H-26};
+	var PORTY={ask:40, next:64, approve:64, reject:86, done:86};
 	(m.ports||[]).forEach(function(pc){
 		var active=false;
 		if(pc.port==='next') active=nextList(st.props).length>0;
@@ -2219,7 +2243,7 @@ function graphNode(st,i){
 		else if(pc.port==='reject') active=!!(st.props&&st.props.on_reject);
 		else if(pc.port==='done') active=!!(st.props&&st.props.on_done);
 		var pTop=PORTY[pc.port], pSide='r';
-		if(st.type==='loop'){ if(pc.port==='next'){ pSide='l'; pTop=NODE_H/2-6; } else if(pc.port==='done'){ pTop=NODE_H-26; } }
+		if(st.type==='loop'){ if(pc.port==='next'){ pSide='l'; pTop=64; } else if(pc.port==='done'){ pTop=86; } }
 		h+=outPort(st.id, pc.port, pTop, pc.label, pc.color, active, pSide);
 	});
 	h+='</div>';
@@ -2343,11 +2367,11 @@ function edgeDefs(){
 	return '<defs>'+mk('seq','rgb(var(--c-muted) / 0.8)')+mk('next','rgb(var(--c-accent))')+mk('reject','rgb(244 63 94 / 0.9)')+mk('ask','rgb(245 158 11 / 0.9)')+mk('approve','rgb(34 197 94 / 0.9)')+mk('loop','rgb(244 63 94 / 0.9)')+mk('done','rgb(34 197 94 / 0.9)')+'</defs>';
 }
 function edgeColor(kind,sel){
-	if(kind==='reject'||kind==='loop') return sel?'rgb(244 63 94)':'rgb(244 63 94 / 0.7)';
-	if(kind==='ask')    return sel?'rgb(245 158 11)':'rgb(245 158 11 / 0.3)';
-	if(kind==='approve'||kind==='done') return sel?'rgb(34 197 94)':'rgb(34 197 94 / 0.75)';
-	if(kind==='next')   return sel?'rgb(var(--c-accent))':'rgb(var(--c-accent) / 0.8)';
-	return 'rgb(var(--c-muted) / 0.5)';
+	if(kind==='reject'||kind==='loop') return sel?'rgb(244 63 94)':'rgb(244 63 94 / 0.9)';
+	if(kind==='ask')    return sel?'rgb(245 158 11)':'rgb(245 158 11 / 0.85)';
+	if(kind==='approve'||kind==='done') return sel?'rgb(34 197 94)':'rgb(34 197 94 / 0.9)';
+	if(kind==='next')   return sel?'rgb(var(--c-accent))':'rgb(var(--c-accent) / 0.9)';
+	return 'rgb(var(--c-muted) / 0.55)';
 }
 function edgeKey(e){ return e.src+'|'+(e.prop||'seq')+'|'+e.dst; }
 function edgeList(){
@@ -2406,17 +2430,17 @@ function outAnchor(id,port){
 	var p=NODEPOS[id]; if(!p) return {x:0,y:0};
 	if(id==='__start') return {x:p.x+LIFE_W, y:p.y+LIFE_H/2};
 	if(isLoopNode(id)){
-		if(port==='next') return {x:p.x, y:p.y+NODE_H/2};        // LOOP exits LEFT
-		return {x:p.x+NODE_W, y:p.y+NODE_H-20};                  // DONE exits RIGHT
+		if(port==='next') return {x:p.x, y:p.y+69};        // LOOP exits LEFT (island mid)
+		return {x:p.x+NODE_W, y:p.y+91};                   // DONE exits RIGHT (lower)
 	}
-	var t = port==='ask'?20 : (port==='reject'||port==='done')?(NODE_H-20) : NODE_H/2;
+	var t = port==='ask'?45 : (port==='reject'||port==='done')?91 : 69;
 	return {x:p.x+NODE_W, y:p.y+t};
 }
 function inAnchor(id){
 	var p=NODEPOS[id]; if(!p) return {x:0,y:0};
 	if(id==='__finish') return {x:p.x, y:p.y+LIFE_H/2};
-	if(isLoopNode(id)) return {x:p.x+NODE_W, y:p.y+22};          // loop ARRIVAL on the RIGHT
-	return {x:p.x, y:p.y+NODE_H/2};
+	if(isLoopNode(id)) return {x:p.x+NODE_W, y:p.y+45};          // loop ARRIVAL on the RIGHT (upper)
+	return {x:p.x, y:p.y+69};
 }
 // ── Wave wires ───────────────────────────────────────────────────────
 // Each connection is drawn as a gentle sine ripple riding the routing
@@ -2479,7 +2503,7 @@ function wgDrawEdges(){
 		h+='<g class="wg-wire" data-esrc="'+e.src+'" data-edst="'+e.dst+'">';
 		h+='<path class="wg-edge-case" d="'+d+'" style="pointer-events:none" stroke-width="'+(sel?8:6)+'"></path>';
 		h+='<path class="wg-edge'+(sel?' wg-edge-sel':'')+'" d="'+d+'"'
-		  +' style="stroke:'+edgeColor(e.kind,sel)+';pointer-events:none" stroke-width="'+(sel?4:3)+'" marker-end="url(#wg-arr-'+e.kind+')"></path>';
+		  +' style="stroke:'+edgeColor(e.kind,sel)+';pointer-events:none" stroke-width="'+(sel?5.5:4.5)+'" marker-end="url(#wg-arr-'+e.kind+')"></path>';
 		var mid=cubicAt({x:a.x,y:a.y},{x:a.x+dx,y:a.y},{x:b.x-dx,y:b.y},{x:b.x,y:b.y},0.5);
 		if(e.kind==='reject'||e.kind==='ask'||e.kind==='loop'||e.kind==='done'||e.kind==='approve'){
 			var mx=mid.x, my=mid.y, lw=e.kind.length*6+16;
@@ -3653,24 +3677,41 @@ func (s *Server) handleAutomationRun(w http.ResponseWriter, r *http.Request) {
 		fragErr(w, "start the daemon to run automations on demand (run: goon start)")
 		return
 	}
+	if s.opts.Memory != nil && s.opts.Memory.GetStatus().Paused {
+		fragErr(w, "goon is paused — resume it first, then run this automation")
+		return
+	}
 	runner.RunAutomationNow(cfg.Name)
 	fragOK(w, fmt.Sprintf("running “%s” now — watch your notify channel / logs", cfg.Name))
 }
 
-// fragSetup renders a banner if the daemon isn't fully configured yet.
+// fragSetup renders a banner only when critical configuration is missing:
+// no LLM provider or no board/local tickets. Hidden once both are set.
 func (s *Server) fragSetup(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	configured := s.opts.Daemon == nil || s.opts.Daemon.Configured()
-	if configured {
+	llmReady := llmConfigured()
+	mem := s.opts.Memory
+	st := mem.GetStatus()
+	localCount := len(mem.ListLocalTickets())
+	boardReady := strings.TrimSpace(getenv("GOON_BOARD")) != "" || st.BoardName != "" || localCount > 0
+	if llmReady && boardReady {
 		_, _ = io.WriteString(w, ``)
 		return
 	}
-	_, _ = io.WriteString(w, `<div class="mt-4 rounded-lg border border-accent/40 bg-accent-soft p-4 text-sm">
-  <strong class="text-accent">👋 Welcome to goon.</strong>
-  Configure your LLM provider and ticket board on the
+	missing := ""
+	if !llmReady && !boardReady {
+		missing = "an LLM provider and a ticket board"
+	} else if !llmReady {
+		missing = "an LLM provider"
+	} else {
+		missing = "a ticket board (or create a local ticket)"
+	}
+	fmt.Fprintf(w, `<div class="mt-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4 text-sm text-amber-700 dark:text-amber-300">
+  <strong>👋 Welcome to goon.</strong>
+  Configure %s on the
   <button type="button" onclick="document.querySelector('button[data-tab=config]').click()" class="underline hover:text-accent font-medium">Configuration</button>
-  tab to start auto-engineering.
-</div>`)
+  tab to get started.
+</div>`, missing)
 }
 
 func groupKeys(keys []configKey) map[string][]configKey {
